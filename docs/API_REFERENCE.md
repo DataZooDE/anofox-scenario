@@ -713,6 +713,45 @@ INSERT INTO _scen_q5_planning._delta_sales (_op, region, amount) VALUES ('U', 'w
 
 ---
 
+### snapshot_drop
+
+Deletes a snapshot and its associated data.
+
+**Syntax:**
+```sql
+SELECT snapshot_drop(snapshot_name);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| snapshot_name | VARCHAR | Name of the snapshot to drop (required) |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Drop an unused snapshot
+SELECT snapshot_drop('old_snapshot');
+
+-- First check if any scenarios depend on it
+SELECT scenario_name FROM _scenario_registry WHERE base_schema = '_snap_old_snapshot';
+-- If empty, safe to drop
+SELECT snapshot_drop('old_snapshot');
+```
+
+**Notes:**
+- Drops the snapshot metadata from `_scenario_snapshots`
+- Drops the snapshot schema (`_snap_<snapshot_name>`) and all its data
+- Cannot drop a snapshot if any scenarios depend on it (created via `scenario_from_snapshot`)
+- Operation is irreversible - snapshot data cannot be recovered
+
+**Errors:**
+- `Snapshot '%s' does not exist` - No snapshot with this name
+- `Cannot drop snapshot '%s': scenario '%s' depends on it` - A scenario uses this snapshot as its base
+
+---
+
 ## Metadata Tables
 
 ### _scenario_registry

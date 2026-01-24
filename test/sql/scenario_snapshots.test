@@ -339,9 +339,99 @@ SELECT scenario_drop('from_snap_scenario');
 ----
 true
 
-# Drop snapshot schema manually for cleanup
+# ===== Test: snapshot_drop() =====
+
+# Verify snapshot still exists before dropping
+query I
+SELECT COUNT(*) FROM snapshot_list() WHERE snapshot_name = 'compare_snapshot';
+----
+1
+
+# Verify snapshot schema exists
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_snap_compare_snapshot';
+----
+1
+
+# Drop the snapshot
+query T
+SELECT snapshot_drop('compare_snapshot');
+----
+true
+
+# Verify snapshot is gone from list
+query I
+SELECT COUNT(*) FROM snapshot_list() WHERE snapshot_name = 'compare_snapshot';
+----
+0
+
+# Verify snapshot schema is gone
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_snap_compare_snapshot';
+----
+0
+
+# Test: Cannot drop non-existent snapshot
+statement error
+SELECT snapshot_drop('nonexistent_snapshot');
+----
+Snapshot 'nonexistent_snapshot' does not exist
+
+# Test: Cannot drop snapshot with dependent scenario
+# First create a new snapshot and scenario that depends on it
 statement ok
-DROP SCHEMA _snap_compare_snapshot CASCADE;
+CREATE TABLE drop_test (id INTEGER PRIMARY KEY, val VARCHAR);
+
+statement ok
+INSERT INTO drop_test VALUES (1, 'test');
+
+query T
+SELECT scenario_create('drop_test_scenario');
+----
+true
+
+query T
+SELECT delta_create('drop_test_scenario', 'drop_test');
+----
+true
+
+query T
+SELECT snapshot_create('drop_test_scenario', 'drop_test_snap');
+----
+true
+
+# Create scenario from snapshot
+query T
+SELECT scenario_from_snapshot('drop_test_snap', 'depends_on_snap');
+----
+true
+
+# Try to drop snapshot - should fail because scenario depends on it
+statement error
+SELECT snapshot_drop('drop_test_snap');
+----
+Cannot drop snapshot 'drop_test_snap': scenario 'depends_on_snap' depends on it
+
+# Clean up the dependent scenario first
+query T
+SELECT scenario_drop('depends_on_snap');
+----
+true
+
+# Now we can drop the snapshot
+query T
+SELECT snapshot_drop('drop_test_snap');
+----
+true
+
+# Clean up
+query T
+SELECT scenario_drop('drop_test_scenario');
+----
+true
+
+statement ok
+DROP TABLE drop_test;
 
 # Test empty snapshot_list after cleanup (at end of file)
 

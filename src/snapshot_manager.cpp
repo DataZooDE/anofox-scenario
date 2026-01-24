@@ -739,6 +739,89 @@ static void ScenarioFromSnapshotFunction(DataChunk &args, ExpressionState &state
 	*ConstantVector::GetData<bool>(result) = true;
 }
 
+// ===== snapshot_drop Implementation =====
+
+struct SnapshotDropBindData : public FunctionData {
+	string snapshot_name;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<SnapshotDropBindData>();
+		result->snapshot_name = snapshot_name;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<SnapshotDropBindData>();
+		return snapshot_name == other.snapshot_name;
+	}
+};
+
+static unique_ptr<FunctionData> SnapshotDropBind(ClientContext &context, ScalarFunction &bound_function,
+                                                  vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<SnapshotDropBindData>();
+
+	if (arguments.size() < 1 || arguments[0]->return_type != LogicalType::VARCHAR) {
+		throw InvalidInputException("snapshot_drop requires a snapshot name as argument");
+	}
+	if (!arguments[0]->IsFoldable()) {
+		throw InvalidInputException("snapshot_drop snapshot name must be a constant");
+	}
+	bind_data->snapshot_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	// Validate snapshot name
+	if (!SnapshotManager::ValidateName(bind_data->snapshot_name)) {
+		throw InvalidInputException("Invalid snapshot name '%s'", bind_data->snapshot_name);
+	}
+
+	// Check if snapshot exists
+	if (!SnapshotManager::SnapshotExists(context, bind_data->snapshot_name)) {
+		throw InvalidInputException("Snapshot '%s' does not exist", bind_data->snapshot_name);
+	}
+
+	// Check if any scenarios depend on this snapshot
+	Connection con(context.db->GetDatabase(context));
+	string snapshot_schema = "_snap_" + bind_data->snapshot_name;
+	auto dep_result = con.Query(StringUtil::Format(
+	    "SELECT scenario_name FROM _scenario_registry WHERE base_schema = '%s'",
+	    snapshot_schema));
+	if (!dep_result->HasError() && dep_result->RowCount() > 0) {
+		string dep_scenario = dep_result->GetValue(0, 0).ToString();
+		throw InvalidInputException("Cannot drop snapshot '%s': scenario '%s' depends on it",
+		                            bind_data->snapshot_name, dep_scenario);
+	}
+
+	return std::move(bind_data);
+}
+
+static void SnapshotDropFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<SnapshotDropBindData>();
+	auto &context = state.GetContext();
+
+	Connection con(context.db->GetDatabase(context));
+
+	string snapshot_schema = "_snap_" + bind_data.snapshot_name;
+
+	// Delete from _scenario_snapshots
+	auto delete_result = con.Query(StringUtil::Format(
+	    "DELETE FROM _scenario_snapshots WHERE snapshot_name = '%s'",
+	    bind_data.snapshot_name));
+	if (delete_result->HasError()) {
+		throw InvalidInputException("Failed to delete snapshot metadata: %s", delete_result->GetError());
+	}
+
+	// Drop the snapshot schema
+	auto drop_result = con.Query("DROP SCHEMA IF EXISTS " + snapshot_schema + " CASCADE");
+	if (drop_result->HasError()) {
+		throw InvalidInputException("Failed to drop snapshot schema: %s", drop_result->GetError());
+	}
+
+	// Return true
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
 // ===== Function Registration =====
 
 void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -788,6 +871,13 @@ void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
 	scenario_from_snapshot_set.AddFunction(scenario_from_snapshot_2);
 
 	loader.RegisterFunction(scenario_from_snapshot_set);
+
+	// snapshot_drop(snapshot_name) - delete a snapshot
+	ScalarFunction snapshot_drop("snapshot_drop", {LogicalType::VARCHAR},
+	                              LogicalType::BOOLEAN,
+	                              SnapshotDropFunction, SnapshotDropBind, nullptr, nullptr, nullptr,
+	                              LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	loader.RegisterFunction(snapshot_drop);
 }
 
 } // namespace duckdb
