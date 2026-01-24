@@ -1,0 +1,444 @@
+# name: test/sql/scenario_integration.test
+# description: End-to-end integration tests for main use cases
+# group: [anofox_scenario]
+#
+# Use Cases from requirements:
+# UC-01: What-if analysis (price increase impact)
+# UC-02: Supplier risk analysis (supply disruption)
+# UC-03: Baseline capture (point-in-time snapshot)
+# UC-04: Branching (optimistic vs pessimistic scenarios)
+
+require anofox_scenario
+
+# ============================================================================
+# UC-01: What-If Analysis - Price Increase Impact
+# ============================================================================
+# Scenario: Analyze the impact of a 10% price increase on revenue
+
+# Cleanup from prior tests if needed
+statement ok
+DROP TABLE IF EXISTS products;
+
+statement ok
+DROP TABLE IF EXISTS inventory;
+
+statement ok
+DROP TABLE IF EXISTS metrics;
+
+statement ok
+DROP TABLE IF EXISTS forecast;
+
+# Setup: Create a products table with sales data
+statement ok
+CREATE TABLE products (
+    product_id INTEGER PRIMARY KEY,
+    name VARCHAR,
+    category VARCHAR,
+    price DECIMAL(10,2),
+    units_sold INTEGER
+);
+
+statement ok
+INSERT INTO products VALUES
+    (1, 'Widget A', 'Hardware', 29.99, 1000),
+    (2, 'Widget B', 'Hardware', 49.99, 500),
+    (3, 'Gadget X', 'Electronics', 199.99, 200),
+    (4, 'Gadget Y', 'Electronics', 299.99, 100),
+    (5, 'Service Plan', 'Services', 9.99, 2000);
+
+# Step 1: Create a scenario for the what-if analysis
+query T
+SELECT scenario_create('price_increase_10pct', 'Analyze 10% price increase impact');
+----
+true
+
+# Step 2: Document why we're doing this analysis
+query T
+SELECT protocol_set_why('price_increase_10pct', 'Q4 pricing review: evaluate revenue impact of 10% across-the-board price increase');
+----
+true
+
+# Step 3: Register the products table for modification
+query T
+SELECT delta_create('price_increase_10pct', 'products');
+----
+true
+
+# Step 4: Apply the 10% price increase in the scenario (via delta table)
+statement ok
+INSERT INTO _scen_price_increase_10pct._delta_products (_op, product_id, name, category, price, units_sold)
+SELECT 'U', product_id, name, category, price * 1.10, units_sold FROM products;
+
+# Step 5: Log the change
+query T
+SELECT protocol_log_change('price_increase_10pct', 'Applied 10% price increase to all products');
+----
+true
+
+# Step 6: Compare scenario to baseline
+query RR
+SELECT
+    (SELECT SUM(price * units_sold) FROM products) as baseline_revenue,
+    (SELECT SUM(price * units_sold) FROM _scen_price_increase_10pct.products) as scenario_revenue;
+----
+144962.00	159462.00
+
+# Step 7: Record findings
+query T
+SELECT protocol_add_finding('price_increase_10pct', 'Revenue would increase by $14,500 (10%) with price increase');
+----
+true
+
+# Step 8: Verify scenario vs base differences
+query I
+SELECT COUNT(*) FROM scenario_compare('price_increase_10pct', 'products') WHERE diff_type = 'changed';
+----
+5
+
+# Step 9: Make a decision
+query T
+SELECT protocol_set_decision('price_increase_10pct', 'Approved: Implement 10% increase for Hardware category only in Q4');
+----
+true
+
+# Verify the complete protocol
+query I
+SELECT COUNT(*) FROM protocol_read('price_increase_10pct');
+----
+4
+
+# Cleanup UC-01
+query T
+SELECT scenario_drop('price_increase_10pct');
+----
+true
+
+# ============================================================================
+# UC-02: Supplier Risk Analysis - Supply Disruption
+# ============================================================================
+# Scenario: Analyze impact if a key supplier can't deliver
+
+# Setup: Create inventory with supplier info
+statement ok
+CREATE TABLE inventory (
+    item_id INTEGER PRIMARY KEY,
+    product_name VARCHAR,
+    supplier VARCHAR,
+    quantity INTEGER,
+    reorder_point INTEGER
+);
+
+statement ok
+INSERT INTO inventory VALUES
+    (1, 'Component A', 'SupplierX', 500, 100),
+    (2, 'Component B', 'SupplierX', 300, 50),
+    (3, 'Component C', 'SupplierY', 1000, 200),
+    (4, 'Component D', 'SupplierY', 400, 100),
+    (5, 'Component E', 'SupplierZ', 200, 50);
+
+# Step 1: Create scenario for supplier disruption analysis
+query T
+SELECT scenario_create('supplierx_disruption', 'Analyze SupplierX supply chain disruption');
+----
+true
+
+query T
+SELECT protocol_set_why('supplierx_disruption', 'Risk assessment: SupplierX has reported potential production issues');
+----
+true
+
+query T
+SELECT delta_create('supplierx_disruption', 'inventory');
+----
+true
+
+# Step 2: Simulate SupplierX inventory going to zero
+statement ok
+INSERT INTO _scen_supplierx_disruption._delta_inventory (_op, item_id, product_name, supplier, quantity, reorder_point)
+SELECT 'U', item_id, product_name, supplier, 0, reorder_point FROM inventory WHERE supplier = 'SupplierX';
+
+query T
+SELECT protocol_log_change('supplierx_disruption', 'Set SupplierX components (A, B) to zero quantity');
+----
+true
+
+# Step 3: Analyze the impact
+query I
+SELECT COUNT(*) FROM _scen_supplierx_disruption.inventory WHERE quantity < reorder_point;
+----
+2
+
+query T
+SELECT protocol_add_finding('supplierx_disruption', '2 components would fall below reorder point');
+----
+true
+
+# Step 4: Check which components are affected
+query TI
+SELECT product_name, quantity FROM _scen_supplierx_disruption.inventory WHERE supplier = 'SupplierX' ORDER BY item_id;
+----
+Component A	0
+Component B	0
+
+# Verify comparison shows changes
+query TI
+SELECT diff_type, COUNT(*) FROM scenario_compare('supplierx_disruption', 'inventory') GROUP BY diff_type;
+----
+changed	2
+
+# Cleanup UC-02
+query T
+SELECT scenario_drop('supplierx_disruption');
+----
+true
+
+statement ok
+DROP TABLE inventory;
+
+# ============================================================================
+# UC-03: Baseline Capture - Point-in-Time Snapshot
+# ============================================================================
+# Scenario: Capture baseline before major changes, compare later
+
+# Setup: Metrics table that changes over time
+statement ok
+CREATE TABLE metrics (
+    metric_id INTEGER PRIMARY KEY,
+    metric_name VARCHAR,
+    current_value DECIMAL(10,2),
+    target_value DECIMAL(10,2)
+);
+
+statement ok
+INSERT INTO metrics VALUES
+    (1, 'Customer Satisfaction', 85.5, 90.0),
+    (2, 'Net Promoter Score', 42.0, 50.0),
+    (3, 'Churn Rate', 2.5, 2.0),
+    (4, 'Revenue Growth', 12.3, 15.0);
+
+# Step 1: Create scenario for analysis
+query T
+SELECT scenario_create('q3_baseline', 'Q3 2024 baseline metrics');
+----
+true
+
+query T
+SELECT delta_create('q3_baseline', 'metrics');
+----
+true
+
+# Step 2: Take a snapshot of current state
+query T
+SELECT snapshot_create('q3_baseline', 'q3_baseline_snap', 'Q3 2024 baseline before optimization project');
+----
+true
+
+# Verify snapshot exists
+query I
+SELECT COUNT(*) FROM snapshot_list() WHERE snapshot_name = 'q3_baseline_snap';
+----
+1
+
+# Step 3: Simulate time passing - update base table (real-world changes)
+statement ok
+UPDATE metrics SET current_value = 87.0 WHERE metric_id = 1;
+
+statement ok
+UPDATE metrics SET current_value = 45.0 WHERE metric_id = 2;
+
+statement ok
+UPDATE metrics SET current_value = 2.3 WHERE metric_id = 3;
+
+# Step 4: Compare current state to baseline snapshot
+query TI
+SELECT diff_type, COUNT(*) FROM snapshot_compare('q3_baseline_snap', 'metrics') GROUP BY diff_type ORDER BY diff_type;
+----
+changed	3
+
+# Step 5: Show detailed changes from baseline (pk column is metric_id)
+query ITR
+SELECT metric_id, column_name, CAST(old_value AS DECIMAL(10,2)) FROM snapshot_compare('q3_baseline_snap', 'metrics') WHERE column_name = 'current_value' ORDER BY metric_id;
+----
+1	current_value	85.50
+2	current_value	42.00
+3	current_value	2.50
+
+# Cleanup UC-03
+query T
+SELECT scenario_drop('q3_baseline');
+----
+true
+
+query T
+SELECT snapshot_drop('q3_baseline_snap');
+----
+true
+
+statement ok
+DROP TABLE metrics;
+
+# ============================================================================
+# UC-04: Branching - Optimistic vs Pessimistic Scenarios
+# ============================================================================
+# Scenario: Create two branches from a base scenario to compare forecasts
+
+# Setup: Financial forecast table
+statement ok
+CREATE TABLE forecast (
+    quarter VARCHAR PRIMARY KEY,
+    revenue DECIMAL(12,2),
+    costs DECIMAL(12,2),
+    profit DECIMAL(12,2)
+);
+
+statement ok
+INSERT INTO forecast VALUES
+    ('Q1', 1000000.00, 800000.00, 200000.00),
+    ('Q2', 1100000.00, 850000.00, 250000.00),
+    ('Q3', 1200000.00, 900000.00, 300000.00),
+    ('Q4', 1300000.00, 950000.00, 350000.00);
+
+# Step 1: Create base scenario
+query T
+SELECT scenario_create('forecast_base', 'Base forecast for FY2024');
+----
+true
+
+query T
+SELECT delta_create('forecast_base', 'forecast');
+----
+true
+
+# Step 2: Branch to create optimistic scenario
+query T
+SELECT scenario_branch('forecast_base', 'forecast_optimistic', 'Optimistic growth assumptions');
+----
+true
+
+# Register table for branched scenario
+query T
+SELECT delta_create('forecast_optimistic', 'forecast');
+----
+true
+
+# Step 3: Branch to create pessimistic scenario
+query T
+SELECT scenario_branch('forecast_base', 'forecast_pessimistic', 'Pessimistic/conservative assumptions');
+----
+true
+
+# Register table for branched scenario
+query T
+SELECT delta_create('forecast_pessimistic', 'forecast');
+----
+true
+
+# Verify both scenarios exist with correct parent
+query TT
+SELECT scenario_name, parent_scenario FROM scenario_list() WHERE scenario_name LIKE 'forecast_%' ORDER BY scenario_name;
+----
+forecast_base	NULL
+forecast_optimistic	forecast_base
+forecast_pessimistic	forecast_base
+
+# Step 4: Apply optimistic adjustments (+20% revenue, -5% costs)
+statement ok
+INSERT INTO _scen_forecast_optimistic._delta_forecast (_op, quarter, revenue, costs, profit)
+SELECT 'U', quarter, revenue * 1.20, costs * 0.95, (revenue * 1.20) - (costs * 0.95) FROM forecast;
+
+query T
+SELECT protocol_log_change('forecast_optimistic', 'Applied +20% revenue growth, -5% cost reduction');
+----
+true
+
+# Step 5: Apply pessimistic adjustments (-10% revenue, +10% costs)
+statement ok
+INSERT INTO _scen_forecast_pessimistic._delta_forecast (_op, quarter, revenue, costs, profit)
+SELECT 'U', quarter, revenue * 0.90, costs * 1.10, (revenue * 0.90) - (costs * 1.10) FROM forecast;
+
+query T
+SELECT protocol_log_change('forecast_pessimistic', 'Applied -10% revenue decline, +10% cost increase');
+----
+true
+
+# Step 6: Compare the three scenarios
+# Optimistic: revenue*1.2 - costs*0.95 = 2195000
+# Pessimistic: revenue*0.9 - costs*1.1 = 290000
+query TR
+SELECT 'Base' as scenario, SUM(profit) as total_profit FROM forecast
+UNION ALL
+SELECT 'Optimistic', SUM(profit) FROM _scen_forecast_optimistic.forecast
+UNION ALL
+SELECT 'Pessimistic', SUM(profit) FROM _scen_forecast_pessimistic.forecast
+ORDER BY scenario;
+----
+Base	1100000.00
+Optimistic	2195000.00
+Pessimistic	290000.00
+
+# Verify optimistic changes
+query I
+SELECT COUNT(*) FROM scenario_compare('forecast_optimistic', 'forecast') WHERE diff_type = 'changed';
+----
+12
+
+# Verify pessimistic changes
+query I
+SELECT COUNT(*) FROM scenario_compare('forecast_pessimistic', 'forecast') WHERE diff_type = 'changed';
+----
+12
+
+# Step 7: Compare scenarios to each other (3-arg compare)
+query I
+SELECT COUNT(*) FROM scenario_compare('forecast_optimistic', 'forecast_pessimistic', 'forecast') WHERE diff_type = 'changed';
+----
+12
+
+# Record findings in both scenarios
+query T
+SELECT protocol_add_finding('forecast_optimistic', 'Best case: $2.195M annual profit (+100% vs base)');
+----
+true
+
+query T
+SELECT protocol_add_finding('forecast_pessimistic', 'Conservative case: $290K annual profit (-74% vs base)');
+----
+true
+
+# Cleanup UC-04
+query T
+SELECT scenario_drop('forecast_pessimistic');
+----
+true
+
+query T
+SELECT scenario_drop('forecast_optimistic');
+----
+true
+
+query T
+SELECT scenario_drop('forecast_base');
+----
+true
+
+# ============================================================================
+# Final Cleanup
+# ============================================================================
+
+statement ok
+DROP TABLE products;
+
+statement ok
+DROP TABLE forecast;
+
+# Verify all scenarios cleaned up
+query I
+SELECT COUNT(*) FROM scenario_list();
+----
+0
+
+# Verify all snapshots cleaned up
+query I
+SELECT COUNT(*) FROM snapshot_list();
+----
+0
