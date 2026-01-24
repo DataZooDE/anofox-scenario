@@ -212,6 +212,109 @@ static void ProtocolLogChangeFunction(DataChunk &args, ExpressionState &state, V
 	*ConstantVector::GetData<bool>(result) = true;
 }
 
+// ===== protocol_add_finding Implementation =====
+
+struct ProtocolAddFindingBindData : public FunctionData {
+	string scenario_name;
+	string finding_text;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ProtocolAddFindingBindData>();
+		result->scenario_name = scenario_name;
+		result->finding_text = finding_text;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ProtocolAddFindingBindData>();
+		return scenario_name == other.scenario_name && finding_text == other.finding_text;
+	}
+};
+
+static unique_ptr<FunctionData> ProtocolAddFindingBind(ClientContext &context, ScalarFunction &bound_function,
+                                                        vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<ProtocolAddFindingBindData>();
+
+	if (arguments.size() < 2) {
+		throw InvalidInputException("protocol_add_finding requires two arguments: scenario_name and finding_text");
+	}
+
+	if (arguments[0]->return_type != LogicalType::VARCHAR) {
+		throw InvalidInputException("protocol_add_finding: scenario_name must be a VARCHAR");
+	}
+	if (!arguments[0]->IsFoldable()) {
+		throw InvalidInputException("protocol_add_finding: scenario_name must be a constant");
+	}
+	bind_data->scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	if (arguments[1]->return_type != LogicalType::VARCHAR) {
+		throw InvalidInputException("protocol_add_finding: finding_text must be a VARCHAR");
+	}
+	if (!arguments[1]->IsFoldable()) {
+		throw InvalidInputException("protocol_add_finding: finding_text must be a constant");
+	}
+	bind_data->finding_text = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).GetValue<string>();
+
+	// Validate scenario exists
+	if (!ProtocolManager::ScenarioExists(context, bind_data->scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data->scenario_name);
+	}
+
+	return std::move(bind_data);
+}
+
+static void ProtocolAddFindingFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ProtocolAddFindingBindData>();
+	auto &context = state.GetContext();
+
+	Connection con(context.db->GetDatabase(context));
+
+	// Escape single quotes in the finding_text
+	string escaped_finding = bind_data.finding_text;
+	size_t pos = 0;
+	while ((pos = escaped_finding.find('\'', pos)) != string::npos) {
+		escaped_finding.replace(pos, 1, "''");
+		pos += 2;
+	}
+
+	// Check if 'findings' section already exists
+	auto check_result = con.Query(StringUtil::Format(
+	    "SELECT content FROM _scenario_protocols WHERE entity_type = 'scenario' AND entity_name = '%s' AND section = 'findings'",
+	    bind_data.scenario_name));
+
+	string new_content;
+	if (!check_result->HasError() && check_result->RowCount() > 0 && !check_result->GetValue(0, 0).IsNull()) {
+		// Append to existing content with newline separator
+		string existing = check_result->GetValue(0, 0).GetValue<string>();
+		pos = 0;
+		while ((pos = existing.find('\'', pos)) != string::npos) {
+			existing.replace(pos, 1, "''");
+			pos += 2;
+		}
+		new_content = existing + "\n" + escaped_finding;
+	} else {
+		// First entry
+		new_content = escaped_finding;
+	}
+
+	// Upsert the findings section
+	auto upsert_sql = StringUtil::Format(
+	    "INSERT OR REPLACE INTO _scenario_protocols (entity_type, entity_name, section, content, updated_at) "
+	    "VALUES ('scenario', '%s', 'findings', '%s', current_timestamp)",
+	    bind_data.scenario_name, new_content);
+
+	auto upsert_result = con.Query(upsert_sql);
+	if (upsert_result->HasError()) {
+		throw InvalidInputException("Failed to add finding for scenario '%s': %s",
+		                            bind_data.scenario_name, upsert_result->GetError());
+	}
+
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
 // ===== Function Registration =====
 
 void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -226,6 +329,12 @@ void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
 	                                    ProtocolLogChangeFunction, ProtocolLogChangeBind, nullptr, nullptr, nullptr,
 	                                    LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
 	loader.RegisterFunction(protocol_log_change);
+
+	// protocol_add_finding(scenario_name, finding_text) - returns boolean
+	ScalarFunction protocol_add_finding("protocol_add_finding", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                     ProtocolAddFindingFunction, ProtocolAddFindingBind, nullptr, nullptr, nullptr,
+	                                     LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	loader.RegisterFunction(protocol_add_finding);
 }
 
 } // namespace duckdb

@@ -932,3 +932,39 @@ SELECT protocol_log_change('pricing_analysis', 'Removed discontinued products fr
 
 **Errors:**
 - `Scenario '%s' does not exist` - No scenario with this name
+
+---
+
+### protocol_add_finding
+
+Appends an entry to the "findings" section of a scenario's protocol, documenting insights and observations.
+
+**Syntax:**
+```sql
+SELECT protocol_add_finding(scenario_name, finding_text);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario (required) |
+| finding_text | VARCHAR | Description of the finding to record (required) |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Record findings as you analyze the scenario
+SELECT protocol_add_finding('pricing_analysis', 'Revenue increased by 5% with new pricing');
+SELECT protocol_add_finding('pricing_analysis', 'Customer churn remained stable at 2.3%');
+SELECT protocol_add_finding('pricing_analysis', 'Premium tier showed strongest response (+12%)');
+```
+
+**Notes:**
+- Appends to existing findings (does not replace)
+- Each entry is separated by a newline
+- Creates the "findings" section if it doesn't exist
+- Useful for documenting insights discovered during scenario analysis
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name

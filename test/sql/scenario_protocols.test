@@ -156,6 +156,63 @@ SELECT section, CASE WHEN LENGTH(content) > 0 THEN 'has content' ELSE 'empty' EN
 changes	has content
 why	has content
 
+# ===== Test: protocol_add_finding =====
+
+# First finding entry
+query T
+SELECT protocol_add_finding('protocol_test', 'Revenue increased by 5% with new pricing');
+----
+true
+
+# Verify finding was logged
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'findings';
+----
+Revenue increased by 5% with new pricing
+
+# Second finding entry (should append with newline)
+query T
+SELECT protocol_add_finding('protocol_test', 'Customer churn remained stable');
+----
+true
+
+# Verify both findings are present
+query I
+SELECT content LIKE '%Revenue increased%' AND content LIKE '%churn remained%' FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'findings';
+----
+true
+
+# Third finding entry
+query T
+SELECT protocol_add_finding('protocol_test', 'Competitor analysis shows favorable positioning');
+----
+true
+
+# Verify all three findings present
+query I
+SELECT content LIKE '%Revenue%' AND content LIKE '%churn%' AND content LIKE '%Competitor%' FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'findings';
+----
+true
+
+# Test: protocol_add_finding with non-existent scenario
+statement error
+SELECT protocol_add_finding('nonexistent_scenario', 'This should fail');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Verify 'findings' section is separate from 'why' and 'changes' sections
+query I
+SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'protocol_test';
+----
+3
+
+query T
+SELECT section FROM _scenario_protocols WHERE entity_name = 'protocol_test' ORDER BY section;
+----
+changes
+findings
+why
+
 # Cleanup: Drop the test scenario
 query T
 SELECT scenario_drop('protocol_test');
