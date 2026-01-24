@@ -316,6 +316,58 @@ findings
 plan
 why
 
+# ===== Test: protocol_read =====
+
+# protocol_read should return all protocol sections as a table
+query I
+SELECT COUNT(*) FROM protocol_read('protocol_test');
+----
+5
+
+# Verify columns returned
+query TI
+SELECT section, LENGTH(content) > 0 AS has_content FROM protocol_read('protocol_test') ORDER BY section;
+----
+changes	true
+decision	true
+findings	true
+plan	true
+why	true
+
+# Verify updated_at is not null
+query I
+SELECT COUNT(*) FROM protocol_read('protocol_test') WHERE updated_at IS NOT NULL;
+----
+5
+
+# Verify content matches what we set
+query TT
+SELECT section, content FROM protocol_read('protocol_test') WHERE section = 'decision';
+----
+decision	Revised decision: delay rollout pending further analysis.
+
+# Test: protocol_read with non-existent scenario
+statement error
+SELECT * FROM protocol_read('nonexistent_scenario');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Test: protocol_read on scenario with no protocols
+query T
+SELECT scenario_create('empty_protocol_test');
+----
+true
+
+query I
+SELECT COUNT(*) FROM protocol_read('empty_protocol_test');
+----
+0
+
+query T
+SELECT scenario_drop('empty_protocol_test');
+----
+true
+
 # Cleanup: Drop the test scenario
 query T
 SELECT scenario_drop('protocol_test');

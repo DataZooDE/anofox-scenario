@@ -1040,3 +1040,46 @@ SELECT protocol_set_decision('pricing_analysis', 'Revised: delay rollout pending
 
 **Errors:**
 - `Scenario '%s' does not exist` - No scenario with this name
+
+---
+
+### protocol_read
+
+Reads all protocol sections for a scenario as a table. Returns all sections that have been set (why, changes, findings, plan, decision).
+
+**Syntax:**
+```sql
+SELECT * FROM protocol_read(scenario_name);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario (required) |
+
+**Returns:** Table with columns:
+| Column | Type | Description |
+|--------|------|-------------|
+| section | VARCHAR | The section name (why, changes, findings, plan, decision) |
+| content | VARCHAR | The content of the section |
+| updated_at | TIMESTAMP | When the section was last updated |
+
+**Example:**
+```sql
+-- Read all protocol sections for a scenario
+SELECT * FROM protocol_read('pricing_analysis');
+
+-- Get specific sections
+SELECT section, content FROM protocol_read('pricing_analysis') WHERE section IN ('why', 'decision');
+
+-- Check when sections were last updated
+SELECT section, updated_at FROM protocol_read('pricing_analysis') ORDER BY updated_at DESC;
+```
+
+**Notes:**
+- Returns only sections that have been set (empty sections are not returned)
+- Sections are returned in alphabetical order by section name
+- Useful for reviewing the complete documentation of a scenario
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name

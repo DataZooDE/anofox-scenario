@@ -463,6 +463,85 @@ static void ProtocolSetDecisionFunction(DataChunk &args, ExpressionState &state,
 	*ConstantVector::GetData<bool>(result) = true;
 }
 
+// ===== protocol_read Implementation (Table Function) =====
+
+struct ProtocolReadBindData : public TableFunctionData {
+	string scenario_name;
+};
+
+struct ProtocolReadGlobalState : public GlobalTableFunctionState {
+	idx_t current_row = 0;
+	vector<vector<Value>> rows;
+};
+
+static unique_ptr<FunctionData> ProtocolReadBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<ProtocolReadBindData>();
+
+	if (input.inputs.empty()) {
+		throw InvalidInputException("protocol_read requires scenario_name argument");
+	}
+
+	bind_data->scenario_name = input.inputs[0].GetValue<string>();
+
+	// Validate scenario exists
+	if (!ProtocolManager::ScenarioExists(context, bind_data->scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data->scenario_name);
+	}
+
+	// Define output columns
+	names.emplace_back("section");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("content");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("updated_at");
+	return_types.emplace_back(LogicalType::TIMESTAMP);
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> ProtocolReadInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<ProtocolReadGlobalState>();
+	auto &bind_data = input.bind_data->Cast<ProtocolReadBindData>();
+
+	// Query all protocol sections for this scenario
+	Connection con(context.db->GetDatabase(context));
+	auto result = con.Query(StringUtil::Format(
+	    "SELECT section, content, updated_at FROM _scenario_protocols "
+	    "WHERE entity_type = 'scenario' AND entity_name = '%s' ORDER BY section",
+	    bind_data.scenario_name));
+
+	if (!result->HasError()) {
+		for (idx_t i = 0; i < result->RowCount(); i++) {
+			vector<Value> row;
+			row.push_back(result->GetValue(0, i)); // section
+			row.push_back(result->GetValue(1, i)); // content
+			row.push_back(result->GetValue(2, i)); // updated_at
+			state->rows.push_back(std::move(row));
+		}
+	}
+
+	return std::move(state);
+}
+
+static void ProtocolReadFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<ProtocolReadGlobalState>();
+
+	idx_t count = 0;
+	while (state.current_row < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.current_row];
+		output.SetValue(0, count, row[0]); // section
+		output.SetValue(1, count, row[1]); // content
+		output.SetValue(2, count, row[2]); // updated_at
+		state.current_row++;
+		count++;
+	}
+
+	output.SetCardinality(count);
+}
+
 // ===== Function Registration =====
 
 void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -495,6 +574,10 @@ void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
 	                                      ProtocolSetDecisionFunction, ProtocolSetDecisionBind, nullptr, nullptr, nullptr,
 	                                      LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
 	loader.RegisterFunction(protocol_set_decision);
+
+	// protocol_read(scenario_name) - table function returning all protocol sections
+	TableFunction protocol_read("protocol_read", {LogicalType::VARCHAR}, ProtocolReadFunction, ProtocolReadBind, ProtocolReadInit);
+	loader.RegisterFunction(protocol_read);
 }
 
 } // namespace duckdb
