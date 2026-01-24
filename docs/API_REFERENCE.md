@@ -220,6 +220,48 @@ SELECT scenario_unarchive('q4_final_analysis');
 
 ---
 
+### scenario_schema
+
+Returns the schema name for a scenario. Use this helper to construct the correct search_path for transparent scenario access.
+
+**Syntax:**
+```sql
+SELECT scenario_schema(scenario_name);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario (required) |
+
+**Returns:** VARCHAR (the schema name, e.g., `_scen_myscenario`)
+
+**Example:**
+```sql
+-- Get schema name for a scenario
+SELECT scenario_schema('pricing_analysis');
+-- Returns: _scen_pricing_analysis
+
+-- Use with SET search_path for transparent access
+SET search_path = '_scen_pricing_analysis,main';
+
+-- Now unqualified queries use the scenario view
+SELECT * FROM products;  -- Uses scenario view with deltas applied
+
+-- Reset to main schema
+SET search_path = 'main';
+```
+
+**Notes:**
+- The search_path should include both the scenario schema and `main` to resolve tables
+- When search_path is set, unqualified table names resolve to scenario views first
+- Base tables in main schema can still be accessed with explicit `main.tablename` qualification
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name
+
+---
+
 ## Delta Storage Functions
 
 ### delta_create

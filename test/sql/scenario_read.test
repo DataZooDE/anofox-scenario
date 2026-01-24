@@ -109,6 +109,65 @@ WHERE table_schema = '_scen_read_test' AND table_name = 'products' AND table_typ
 ----
 0
 
+# ===== Test 7: scenario_schema helper function =====
+
+# Create a fresh scenario for testing schema helper
+query T
+SELECT scenario_create('schema_test', 'Testing scenario_schema helper');
+----
+true
+
+query T
+SELECT delta_create('schema_test', 'products');
+----
+true
+
+# scenario_schema should return the schema name
+query T
+SELECT scenario_schema('schema_test');
+----
+_scen_schema_test
+
+# Add some delta data to the scenario
+statement ok
+INSERT INTO _scen_schema_test._delta_products (_op, id, name, price) VALUES ('U', 1, 'Widget Pro', 14.99);
+
+# User can manually SET search_path using the returned schema name
+statement ok
+SET search_path = '_scen_schema_test,main';
+
+# Now unqualified query should use scenario view
+query ITR
+SELECT id, name, price FROM products ORDER BY id;
+----
+1	Widget Pro	14.99
+2	Gadget	19.99
+3	Thingamajig	29.99
+
+# Reset search_path to main
+statement ok
+SET search_path = 'main';
+
+# Now unqualified query should use main table
+query ITR
+SELECT id, name, price FROM products ORDER BY id;
+----
+1	Widget	9.99
+2	Gadget	19.99
+3	Thingamajig	29.99
+
+# Error for non-existent scenario
+statement error
+SELECT scenario_schema('nonexistent');
+----
+does not exist
+
+# Cleanup schema_test scenario
+query T
+SELECT scenario_drop('schema_test');
+----
+true
+
 # ===== Cleanup =====
 
 query T

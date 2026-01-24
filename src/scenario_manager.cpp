@@ -967,6 +967,24 @@ void ScenarioManager::RegisterFunctions(ExtensionLoader &loader) {
 	// scenario_stats(name) - returns table with statistics
 	TableFunction scenario_stats("scenario_stats", {LogicalType::VARCHAR}, ScenarioStatsFunction, ScenarioStatsBind, ScenarioStatsInit);
 	loader.RegisterFunction(scenario_stats);
+
+	// scenario_schema(name) - returns the schema name for a scenario (for use with SET search_path)
+	ScalarFunction scenario_schema("scenario_schema", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
+	    [](DataChunk &args, ExpressionState &state, Vector &result) {
+	        auto &context = state.GetContext();
+	        auto scenario_name = args.data[0].GetValue(0).ToString();
+
+	        // Validate scenario exists
+	        if (!ScenarioManager::ScenarioExists(context, scenario_name)) {
+	            throw InvalidInputException("Scenario '%s' does not exist", scenario_name);
+	        }
+
+	        string schema_name = ScenarioManager::GetSchemaName(context, scenario_name);
+	        result.SetValue(0, Value(schema_name));
+	    },
+	    nullptr, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
+	    FunctionNullHandling::SPECIAL_HANDLING);
+	loader.RegisterFunction(scenario_schema);
 }
 
 } // namespace duckdb
