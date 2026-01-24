@@ -39,10 +39,12 @@ This architecture delivers O(1) branch creation, storage proportional to modific
 | Decision | Rationale | Req Reference |
 | ----- | ----- | ----- |
 | Delta-Main over Prolly Trees | Columnar write amplification makes row-level versioning prohibitive | REQ-NFR-001 |
-| StorageExtension for write interception | Only DuckDB mechanism supporting transparent INSERT/UPDATE/DELETE | REQ-COW-002/003/004 |
+| OptimizerExtension for write interception | `pre_optimize_function` intercepts LogicalInsert/Update/Delete for transparent SQL | REQ-COW-002/003/004 |
+| PK-first row identification | PKs are stable across VACUUM; rowids are physical locators that can shift | REQ-NFR-004 |
 | Row versioning via delta tables | Enables snapshot isolation without base table locking | REQ-NFR-004 |
 | Hash-based anti-join for merge-on-read | O(N+D) performance vs O(N×D) for subquery approach | REQ-COW-001 |
 | Embedded protocol storage | Ensures database portability without external dependencies | REQ-NFR-006 |
+| ParserExtension for VACUUM detection | Intercept invalidating operations to mark scenarios for validation | REQ-NFR-004 |
 
 ---
 
@@ -416,6 +418,70 @@ void RowVersionManager::SetStart(idx_t new_start) {
 | DELETE | Gap created, others unchanged | Safe — captured rowids still valid |
 | VACUUM / CHECKPOINT | May reorganize, shifting rowids | **Unsafe — captured set invalidated** |
 
+#### **PK-First Strategy (Recommended)**
+
+**Key insight from Codex analysis:** Rowid is a hidden physical locator, not a logical ID. Scenario correctness should NOT depend on rowid stability.
+
+**Recommended approach:**
+
+| Table Type | Row Identification | Merge-on-Read Join | Storage |
+| ---------- | ------------------ | ------------------ | ------- |
+| Has PK | Primary key columns | Anti-join on PK | Store only PK in delta |
+| No PK | Rowid (fallback) | Anti-join on rowid | Capture rowids + validation |
+
+For tables **with PKs** (the common case in S&OP):
+- Use PK equality for UPDATE/DELETE targeting in scenarios
+- Use anti-join on PK for merge-on-read, not rowid
+- Store only PKs in delta tables — decouples from storage reorganization
+- **No O(N) rowid capture needed**
+
+For tables **without PKs** (fallback mode):
+- Capture rowids at scenario creation (O(N))
+- Flag as "unstable" in `_scenario_tables.has_primary_key = false`
+- Require validation before use after VACUUM/CHECKPOINT
+- Warn users about brittleness
+
+#### **ParserExtension for VACUUM/CHECKPOINT Detection**
+
+Automatically mark scenarios as needing validation when invalidating operations occur:
+
+```cpp
+class ScenarioParserExtension : public ParserExtension {
+public:
+    ScenarioParserExtension() {
+        parse_function = &InterceptInvalidatingStatements;
+        plan_function = &PlanInvalidatingStatements;
+    }
+
+    static ParserExtensionParseResult InterceptInvalidatingStatements(
+            ParserExtensionInfo *info, const string &query) {
+        // Check if query is VACUUM or CHECKPOINT
+        auto upper = StringUtil::Upper(query);
+        if (StringUtil::StartsWith(upper, "VACUUM") ||
+            StringUtil::StartsWith(upper, "CHECKPOINT")) {
+            // Return custom parse data to mark scenarios
+            return ParserExtensionParseResult(
+                make_uniq<InvalidationParseData>(query));
+        }
+        // Let DuckDB handle normally
+        return ParserExtensionParseResult();
+    }
+
+    static ParserExtensionPlanResult PlanInvalidatingStatements(
+            ParserExtensionInfo *info, ClientContext &context,
+            unique_ptr<ParserExtensionParseData> parse_data) {
+        // Mark all active scenarios as needing validation
+        MarkScenariosForValidation(context);
+        // Return table function that executes original statement
+        // ... (implementation details)
+    }
+};
+```
+
+**Alternative:** Hook `StorageExtension.OnCheckpointStart/End` for checkpoint-specific detection (see `storage_extension.hpp:40-47`).
+
+#### **Validation Metadata**
+
 **Solution:** Add validation metadata to detect stale scenarios:
 
 ```sql
@@ -472,13 +538,23 @@ bool ScenarioValidateBase(ClientContext &context, const string &scenario_name) {
 
 ### **5.1 Integration Strategy**
 
-Based on research of DuckDB internals and extension patterns (Delta, Iceberg, SQLite scanner), we adopt a **Catalog-based integration** using DuckDB's `Catalog` and `CatalogEntry` APIs rather than `StorageExtension`.
+Based on research of DuckDB internals and extension patterns (Delta, Iceberg, SQLite scanner, DuckLake), we adopt a **multi-extension integration** approach:
+
+**Primary extension points:**
+
+1. **Catalog API** — Schema creation for scenario isolation, view management
+2. **OptimizerExtension** — Transparent write interception via `pre_optimize_function`
+3. **ParserExtension** — Intercept VACUUM/CHECKPOINT for scenario validation marking
+4. **Table Functions** — `scenario_list()`, `scenario_compare()`, `scenario_changes()`
 
 **Rationale:** Full `StorageExtension` (as used by Iceberg for external catalogs) is designed for attaching external databases. Our scenarios live within the same DuckDB file. The lighter-weight approach uses:
 
-1. **Schema creation** via Catalog API for scenario isolation  
-2. **View replacement** for transparent reads  
-3. **Trigger-like functions** for write redirection (called explicitly or via wrapper)
+1. **Schema creation** via Catalog API for scenario isolation
+2. **View replacement** for transparent reads (merge-on-read)
+3. **OptimizerExtension** for transparent write interception (no wrapper procedures needed)
+4. **ParserExtension** for detecting invalidating operations (VACUUM/CHECKPOINT)
+
+**Future (v0.2):** Add `StorageExtension` for `ATTACH 'scenario:name'` syntax.
 
 ### **5.2 Write Interception Options**
 
@@ -980,13 +1056,54 @@ WHERE b._modified_at <= (SELECT base_captured_at FROM scenario_meta)  -- O(1) wi
 
 | Approach | Scenario Creation | Storage Overhead | Requirements |
 | -------- | ----------------- | ---------------- | ------------ |
-| Rowid capture (MVP) | O(N) | O(N × 8 bytes) per table | None |
+| PK-based (recommended) | O(1) | O(delta) | Table has PK |
+| Rowid capture | O(N) | O(N × 8 bytes) per table | None (fallback for no-PK) |
 | Timestamp-based | O(1) | O(1) | `_modified_at` column + index |
+| Materialized | O(N × row_size) | O(N × row_size) | None (full isolation) |
 
 **Recommendation:**
-- MVP uses rowid capture for zero-configuration compatibility
+- MVP uses PK-based for tables with PKs (most S&OP tables)
+- MVP uses rowid capture as fallback for tables without PKs
 - v0.2 adds timestamp mode via `scenario_create(..., isolation_mode := 'timestamp')`
-- Auto-detect: if table has `_modified_at` column, default to timestamp mode
+- v0.2 adds materialized mode for users needing ironclad isolation
+
+#### **Materialized Scenario Mode (v0.2)**
+
+For users who need **guaranteed isolation** regardless of base table structure or VACUUM operations:
+
+```sql
+-- Create a materialized scenario (full table copy)
+CALL scenario_create('critical_analysis',
+    'Board presentation scenario',
+    isolation_mode := 'materialized');
+
+-- Implementation: copies base tables into scenario schema
+-- INSERT INTO _scen_critical_analysis.forecast
+-- SELECT * FROM main.forecast;
+```
+
+**Characteristics:**
+- **O(N × row_size)** storage per table — full copy, not delta
+- **Complete isolation** — no dependency on base table state or rowids
+- **No validation needed** — scenario is self-contained
+- **Writes go directly to copied tables** — no delta indirection
+
+**Use cases:**
+- Tables without primary keys that need stable scenarios
+- Critical analyses where VACUUM/CHECKPOINT cannot be controlled
+- Long-lived scenarios spanning weeks/months
+- Regulatory/audit scenarios requiring immutable snapshots
+
+**SQL syntax:**
+```sql
+-- Explicit materialized mode
+CALL scenario_create('audit_q4', 'Q4 audit baseline',
+    isolation_mode := 'materialized',
+    tables := ['forecast', 'supply_plan']);  -- Optional: specify subset
+
+-- Check isolation mode
+SELECT scenario_name, isolation_mode FROM scenario_list();
+```
 
 ### **7.3 No Cell-Level Merge**
 
