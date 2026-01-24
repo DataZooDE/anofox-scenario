@@ -608,6 +608,60 @@ SELECT snapshot_name, created_at FROM snapshot_list() ORDER BY created_at DESC;
 
 ---
 
+### snapshot_compare
+
+Compares the current state of a table against a snapshot, showing row-level differences.
+
+**Syntax:**
+```sql
+SELECT * FROM snapshot_compare(snapshot_name, table_name);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| snapshot_name | VARCHAR | Name of the snapshot to compare against (required) |
+| table_name | VARCHAR | Name of the table to compare (required) |
+
+**Returns:** Table with columns:
+| Column | Type | Description |
+|--------|------|-------------|
+| diff_type | VARCHAR | Type of change: 'added', 'removed', or 'changed' |
+| <pk_columns> | varies | Primary key column(s) identifying the row |
+| column_name | VARCHAR | Name of changed column (NULL for added/removed) |
+| old_value | VARCHAR | Value at snapshot time (NULL for added rows) |
+| new_value | VARCHAR | Current value in main (NULL for removed rows) |
+
+**Example:**
+```sql
+-- Create a scenario, make changes, and snapshot
+SELECT scenario_create('pricing_analysis');
+SELECT delta_create('pricing_analysis', 'products');
+INSERT INTO _scen_pricing_analysis._delta_products (_op, id, name, price) VALUES ('U', 1, 'Widget Pro', 14.99);
+SELECT snapshot_create('pricing_analysis', 'q4_prices', 'Q4 pricing snapshot');
+
+-- Later, compare current main state against the snapshot
+SELECT * FROM snapshot_compare('q4_prices', 'products');
+-- Returns:
+-- diff_type | id  | column_name | old_value  | new_value
+-- changed   | 1   | name        | Widget Pro | Widget
+-- changed   | 1   | price       | 14.99      | 9.99
+```
+
+**Notes:**
+- For 'added' rows: one row per PK, column_name/old_value/new_value are NULL (row added to main since snapshot)
+- For 'removed' rows: one row per PK, column_name/old_value/new_value are NULL (row was in snapshot but not in current main)
+- For 'changed' rows: one row per changed column with old/new values
+- Unchanged rows are excluded from output
+- The snapshot captures the scenario's merged view (base + deltas) at snapshot time
+- Supports compound primary keys (multiple PK columns in output)
+
+**Errors:**
+- `Snapshot '%s' does not exist` - No snapshot with this name
+- `Table '%s' not found in snapshot '%s'` - Table wasn't registered in the scenario when snapshot was created
+
+---
+
 ## Metadata Tables
 
 ### _scenario_registry

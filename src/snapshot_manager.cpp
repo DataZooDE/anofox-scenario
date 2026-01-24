@@ -2,6 +2,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -139,9 +140,49 @@ static void SnapshotCreateFunction(DataChunk &args, ExpressionState &state, Vect
 	// Get the source schema for the scenario
 	string source_schema = SnapshotManager::GetScenarioSchema(context, bind_data.scenario_name);
 
+	// Create snapshot schema
+	string snapshot_schema = "_snap_" + bind_data.snapshot_name;
+	auto create_schema_result = con.Query("CREATE SCHEMA IF NOT EXISTS " + snapshot_schema);
+	if (create_schema_result->HasError()) {
+		throw InvalidInputException("Failed to create snapshot schema: %s", create_schema_result->GetError());
+	}
+
+	// Copy all merged views from source scenario to snapshot schema as materialized tables
+	// This captures the scenario's state at snapshot time, including base data + deltas
+	auto views_result = con.Query(StringUtil::Format(
+	    "SELECT table_name FROM information_schema.tables "
+	    "WHERE table_schema = '%s' AND table_type = 'VIEW' AND table_name NOT LIKE '_delta_%%'",
+	    source_schema));
+
+	int64_t total_size = 0;
+	if (!views_result->HasError()) {
+		for (idx_t i = 0; i < views_result->RowCount(); i++) {
+			string view_name = views_result->GetValue(0, i).ToString();
+
+			// Materialize the merged view into a table in snapshot schema
+			auto copy_sql = StringUtil::Format(
+			    "CREATE TABLE %s.%s AS SELECT * FROM %s.%s",
+			    snapshot_schema, view_name, source_schema, view_name);
+			auto copy_result = con.Query(copy_sql);
+			if (copy_result->HasError()) {
+				// Rollback: drop the schema
+				con.Query("DROP SCHEMA " + snapshot_schema + " CASCADE");
+				throw InvalidInputException("Failed to snapshot table '%s': %s", view_name, copy_result->GetError());
+			}
+
+			// Get size of copied table for size tracking
+			auto size_result = con.Query(StringUtil::Format(
+			    "SELECT COUNT(*) * 100 FROM %s.%s", snapshot_schema, view_name)); // rough estimate
+			if (!size_result->HasError() && size_result->RowCount() > 0) {
+				total_size += size_result->GetValue(0, 0).GetValue<int64_t>();
+			}
+		}
+	}
+
 	// Get next snapshot_id
 	auto id_result = con.Query("SELECT COALESCE(MAX(snapshot_id), 0) + 1 FROM _scenario_snapshots");
 	if (id_result->HasError()) {
+		con.Query("DROP SCHEMA " + snapshot_schema + " CASCADE");
 		throw InvalidInputException("Failed to get next snapshot ID: %s", id_result->GetError());
 	}
 	int64_t snapshot_id = id_result->GetValue(0, 0).GetValue<int64_t>();
@@ -149,12 +190,13 @@ static void SnapshotCreateFunction(DataChunk &args, ExpressionState &state, Vect
 	// Insert into _scenario_snapshots table
 	string desc_value = bind_data.description.empty() ? "NULL" : "'" + bind_data.description + "'";
 	auto insert_sql = StringUtil::Format(
-	    "INSERT INTO _scenario_snapshots (snapshot_id, snapshot_name, source_schema, description) "
-	    "VALUES (%d, '%s', '%s', %s)",
-	    snapshot_id, bind_data.snapshot_name, source_schema, desc_value);
+	    "INSERT INTO _scenario_snapshots (snapshot_id, snapshot_name, source_schema, description, size_bytes) "
+	    "VALUES (%d, '%s', '%s', %s, %d)",
+	    snapshot_id, bind_data.snapshot_name, source_schema, desc_value, total_size);
 
 	auto insert_result = con.Query(insert_sql);
 	if (insert_result->HasError()) {
+		con.Query("DROP SCHEMA " + snapshot_schema + " CASCADE");
 		throw InvalidInputException("Failed to create snapshot: %s", insert_result->GetError());
 	}
 
@@ -238,6 +280,258 @@ static void SnapshotListFunction(ClientContext &context, TableFunctionInput &dat
 	output.SetCardinality(count);
 }
 
+// ===== snapshot_compare Implementation =====
+
+struct SnapshotCompareBindData : public TableFunctionData {
+	string snapshot_name;
+	string table_name;
+	string snapshot_schema;
+	string source_schema;
+	vector<string> pk_columns;
+	vector<string> all_columns;
+};
+
+static unique_ptr<FunctionData> SnapshotCompareBind(ClientContext &context, TableFunctionBindInput &input,
+                                                     vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<SnapshotCompareBindData>();
+
+	if (input.inputs.size() < 2) {
+		throw InvalidInputException("snapshot_compare requires snapshot_name and table_name");
+	}
+
+	result->snapshot_name = input.inputs[0].GetValue<string>();
+	result->table_name = input.inputs[1].GetValue<string>();
+
+	Connection con(context.db->GetDatabase(context));
+
+	// Get snapshot metadata
+	auto snap_result = con.Query(StringUtil::Format(
+	    "SELECT source_schema FROM _scenario_snapshots WHERE snapshot_name = '%s'",
+	    result->snapshot_name));
+	if (snap_result->HasError() || snap_result->RowCount() == 0) {
+		throw InvalidInputException("Snapshot '%s' does not exist", result->snapshot_name);
+	}
+	result->source_schema = snap_result->GetValue(0, 0).ToString();
+	result->snapshot_schema = "_snap_" + result->snapshot_name;
+
+	// Check snapshot schema exists
+	auto schema_result = con.Query(StringUtil::Format(
+	    "SELECT 1 FROM information_schema.schemata WHERE schema_name = '%s'",
+	    result->snapshot_schema));
+	if (schema_result->RowCount() == 0) {
+		throw InvalidInputException("Snapshot data not found for '%s'", result->snapshot_name);
+	}
+
+	// Check table exists in snapshot schema (materialized from scenario's merged view)
+	auto table_result = con.Query(StringUtil::Format(
+	    "SELECT 1 FROM information_schema.tables WHERE table_schema = '%s' AND table_name = '%s'",
+	    result->snapshot_schema, result->table_name));
+	if (table_result->RowCount() == 0) {
+		throw InvalidInputException("Table '%s' not found in snapshot '%s'", result->table_name, result->snapshot_name);
+	}
+
+	// Get columns from main table
+	auto cols_result = con.Query(StringUtil::Format(
+	    "SELECT column_name FROM information_schema.columns "
+	    "WHERE table_schema = 'main' AND table_name = '%s' ORDER BY ordinal_position",
+	    result->table_name));
+	if (cols_result->HasError() || cols_result->RowCount() == 0) {
+		throw InvalidInputException("Base table '%s' does not exist in main schema", result->table_name);
+	}
+	for (idx_t i = 0; i < cols_result->RowCount(); i++) {
+		result->all_columns.push_back(cols_result->GetValue(0, i).ToString());
+	}
+
+	// Get primary key columns from source scenario's _scenario_tables
+	auto pk_result = con.Query(StringUtil::Format(
+	    "SELECT primary_key_columns FROM _scenario_tables WHERE "
+	    "scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE schema_name = '%s') "
+	    "AND table_name = '%s'",
+	    result->source_schema, result->table_name));
+	if (!pk_result->HasError() && pk_result->RowCount() > 0 && !pk_result->GetValue(0, 0).IsNull()) {
+		auto pk_list = ListValue::GetChildren(pk_result->GetValue(0, 0));
+		for (auto &pk : pk_list) {
+			result->pk_columns.push_back(pk.ToString());
+		}
+	}
+	// If no PK, use all columns as composite key
+	if (result->pk_columns.empty()) {
+		result->pk_columns = result->all_columns;
+	}
+
+	// Build output schema: diff_type, pk_columns..., column_name, old_value, new_value
+	names.push_back("diff_type");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	for (const auto &pk : result->pk_columns) {
+		names.push_back(pk);
+		// Determine type for PK column
+		auto type_result = con.Query(StringUtil::Format(
+		    "SELECT data_type FROM information_schema.columns WHERE table_schema = 'main' AND table_name = '%s' AND column_name = '%s'",
+		    result->table_name, pk));
+		if (!type_result->HasError() && type_result->RowCount() > 0) {
+			string type_str = type_result->GetValue(0, 0).ToString();
+			if (type_str == "INTEGER" || type_str == "BIGINT" || type_str == "SMALLINT" || type_str == "TINYINT") {
+				return_types.push_back(LogicalType::BIGINT);
+			} else {
+				return_types.push_back(LogicalType::VARCHAR);
+			}
+		} else {
+			return_types.push_back(LogicalType::VARCHAR);
+		}
+	}
+
+	names.push_back("column_name");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	names.push_back("old_value");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	names.push_back("new_value");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	return std::move(result);
+}
+
+struct SnapshotCompareGlobalState : public GlobalTableFunctionState {
+	idx_t current_row = 0;
+	vector<vector<Value>> rows;
+};
+
+static unique_ptr<GlobalTableFunctionState> SnapshotCompareInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<SnapshotCompareGlobalState>();
+	auto &bind_data = input.bind_data->Cast<SnapshotCompareBindData>();
+
+	Connection con(context.db->GetDatabase(context));
+
+	// Snapshot table (materialized from scenario's merged view at snapshot time)
+	string snap_table = bind_data.snapshot_schema + "." + bind_data.table_name;
+
+	// Build PK column list for joins
+	string pk_join;
+	for (size_t i = 0; i < bind_data.pk_columns.size(); i++) {
+		const auto &pk = bind_data.pk_columns[i];
+		if (i > 0) {
+			pk_join += " AND ";
+		}
+		pk_join += "(snap." + pk + " IS NOT DISTINCT FROM curr." + pk + ")";
+	}
+
+	// Non-PK columns for change detection
+	vector<string> non_pk_cols;
+	for (const auto &col : bind_data.all_columns) {
+		bool is_pk = false;
+		for (const auto &pk : bind_data.pk_columns) {
+			if (col == pk) {
+				is_pk = true;
+				break;
+			}
+		}
+		if (!is_pk) {
+			non_pk_cols.push_back(col);
+		}
+	}
+
+	// Find added rows (in current main but not in snapshot)
+	string added_query = StringUtil::Format(
+	    "SELECT 'added' AS diff_type, %s, NULL AS column_name, NULL AS old_value, NULL AS new_value "
+	    "FROM main.%s curr "
+	    "WHERE NOT EXISTS (SELECT 1 FROM %s snap WHERE %s)",
+	    [&]() {
+		    string cols;
+		    for (size_t i = 0; i < bind_data.pk_columns.size(); i++) {
+			    if (i > 0) cols += ", ";
+			    cols += "curr." + bind_data.pk_columns[i];
+		    }
+		    return cols;
+	    }(), bind_data.table_name, snap_table, pk_join);
+
+	auto added_result = con.Query(added_query);
+	if (!added_result->HasError()) {
+		for (idx_t i = 0; i < added_result->RowCount(); i++) {
+			vector<Value> row;
+			for (idx_t c = 0; c < added_result->ColumnCount(); c++) {
+				row.push_back(added_result->GetValue(c, i));
+			}
+			state->rows.push_back(std::move(row));
+		}
+	}
+
+	// Find removed rows (in snapshot but not in current main)
+	string removed_query = StringUtil::Format(
+	    "SELECT 'removed' AS diff_type, %s, NULL AS column_name, NULL AS old_value, NULL AS new_value "
+	    "FROM %s snap "
+	    "WHERE NOT EXISTS (SELECT 1 FROM main.%s curr WHERE %s)",
+	    [&]() {
+		    string cols;
+		    for (size_t i = 0; i < bind_data.pk_columns.size(); i++) {
+			    if (i > 0) cols += ", ";
+			    cols += "snap." + bind_data.pk_columns[i];
+		    }
+		    return cols;
+	    }(), snap_table, bind_data.table_name, pk_join);
+
+	auto removed_result = con.Query(removed_query);
+	if (!removed_result->HasError()) {
+		for (idx_t i = 0; i < removed_result->RowCount(); i++) {
+			vector<Value> row;
+			for (idx_t c = 0; c < removed_result->ColumnCount(); c++) {
+				row.push_back(removed_result->GetValue(c, i));
+			}
+			state->rows.push_back(std::move(row));
+		}
+	}
+
+	// Find changed rows (same PK, different values in non-PK columns)
+	if (!non_pk_cols.empty()) {
+		for (const auto &col : non_pk_cols) {
+			string changed_query = StringUtil::Format(
+			    "SELECT 'changed' AS diff_type, %s, '%s' AS column_name, "
+			    "CAST(snap.%s AS VARCHAR) AS old_value, CAST(curr.%s AS VARCHAR) AS new_value "
+			    "FROM %s snap "
+			    "JOIN main.%s curr ON %s "
+			    "WHERE snap.%s IS DISTINCT FROM curr.%s",
+			    [&]() {
+				    string cols;
+				    for (size_t i = 0; i < bind_data.pk_columns.size(); i++) {
+					    if (i > 0) cols += ", ";
+					    cols += "snap." + bind_data.pk_columns[i];
+				    }
+				    return cols;
+			    }(), col, col, col, snap_table, bind_data.table_name, pk_join, col, col);
+
+			auto changed_result = con.Query(changed_query);
+			if (!changed_result->HasError()) {
+				for (idx_t i = 0; i < changed_result->RowCount(); i++) {
+					vector<Value> row;
+					for (idx_t c = 0; c < changed_result->ColumnCount(); c++) {
+						row.push_back(changed_result->GetValue(c, i));
+					}
+					state->rows.push_back(std::move(row));
+				}
+			}
+		}
+	}
+
+	return std::move(state);
+}
+
+static void SnapshotCompareFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<SnapshotCompareGlobalState>();
+
+	idx_t count = 0;
+	while (state.current_row < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.current_row];
+		for (idx_t c = 0; c < row.size(); c++) {
+			output.SetValue(c, count, row[c]);
+		}
+		state.current_row++;
+		count++;
+	}
+
+	output.SetCardinality(count);
+}
+
 // ===== Function Registration =====
 
 void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -263,6 +557,11 @@ void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
 	// snapshot_list() - returns table of snapshots
 	TableFunction snapshot_list("snapshot_list", {}, SnapshotListFunction, SnapshotListBind, SnapshotListInit);
 	loader.RegisterFunction(snapshot_list);
+
+	// snapshot_compare(snapshot_name, table_name) - compare current state against snapshot
+	TableFunction snapshot_compare("snapshot_compare", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                               SnapshotCompareFunction, SnapshotCompareBind, SnapshotCompareInit);
+	loader.RegisterFunction(snapshot_compare);
 }
 
 } // namespace duckdb

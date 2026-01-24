@@ -128,6 +128,121 @@ SELECT snapshot_name, description FROM snapshot_list() WHERE snapshot_name = 'si
 ----
 simple_snapshot	NULL
 
+# ===== Test: snapshot_compare() =====
+
+# Create fresh scenario and table for comparison tests
+statement ok
+CREATE TABLE compare_data (id INTEGER PRIMARY KEY, name VARCHAR, value INTEGER);
+
+statement ok
+INSERT INTO compare_data VALUES (1, 'alpha', 100), (2, 'beta', 200), (3, 'gamma', 300);
+
+query T
+SELECT scenario_create('compare_scenario', 'Scenario for comparison testing');
+----
+true
+
+query T
+SELECT delta_create('compare_scenario', 'compare_data');
+----
+true
+
+# Modify some data in the scenario (to have non-empty deltas)
+statement ok
+INSERT INTO _scen_compare_scenario._delta_compare_data (_op, id, name, value) VALUES ('U', 1, 'alpha_updated', 150);
+
+statement ok
+INSERT INTO _scen_compare_scenario._delta_compare_data (_op, id, name, value) VALUES ('I', 4, 'delta', 400);
+
+statement ok
+INSERT INTO _scen_compare_scenario._delta_compare_data (_op, id, name, value) VALUES ('D', 3, 'gamma', 300);
+
+# Create snapshot capturing this state
+query T
+SELECT snapshot_create('compare_scenario', 'compare_snapshot', 'Snapshot with modifications');
+----
+true
+
+# Verify snapshot schema was created
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_snap_compare_snapshot';
+----
+1
+
+# Verify materialized table was copied (merged view at snapshot time)
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_snap_compare_snapshot' AND table_name = 'compare_data';
+----
+1
+
+# Verify snapshot data (scenario's merged view: id=1 updated, id=4 inserted, id=3 deleted)
+query I
+SELECT COUNT(*) FROM _snap_compare_snapshot.compare_data;
+----
+3
+
+# Now modify main table (simulating changes since snapshot)
+statement ok
+UPDATE compare_data SET name = 'alpha_main' WHERE id = 1;
+
+statement ok
+INSERT INTO compare_data VALUES (5, 'epsilon', 500);
+
+# snapshot_compare should show differences between snapshot state and current main
+# Snapshot state: id=1 (alpha_updated, 150), id=2 (beta, 200), id=4 (delta, 400)
+# Main state: id=1 (alpha_main, 100), id=2 (beta, 200), id=3 (gamma, 300), id=5 (epsilon, 500)
+
+# Find added rows (in main but not in snapshot): id=3 (was deleted in snapshot), id=5 (new)
+query IT
+SELECT diff_type, id FROM snapshot_compare('compare_snapshot', 'compare_data') WHERE diff_type = 'added' ORDER BY id;
+----
+added	3
+added	5
+
+# Find removed rows (in snapshot but not in main): id=4 (was only in scenario)
+query IT
+SELECT diff_type, id FROM snapshot_compare('compare_snapshot', 'compare_data') WHERE diff_type = 'removed' ORDER BY id;
+----
+removed	4
+
+# Find changed rows: id=1 has different name and value
+query ITT
+SELECT diff_type, id, column_name FROM snapshot_compare('compare_snapshot', 'compare_data') WHERE diff_type = 'changed' ORDER BY id, column_name;
+----
+changed	1	name
+changed	1	value
+
+# Verify old and new values for name change
+query ITTTT
+SELECT diff_type, id, column_name, old_value, new_value FROM snapshot_compare('compare_snapshot', 'compare_data') WHERE id = 1 AND column_name = 'name';
+----
+changed	1	name	alpha_updated	alpha_main
+
+# Test: Cannot compare non-existent snapshot
+statement error
+SELECT * FROM snapshot_compare('nonexistent_snapshot', 'compare_data');
+----
+Snapshot 'nonexistent_snapshot' does not exist
+
+# Test: Cannot compare non-existent table
+statement error
+SELECT * FROM snapshot_compare('compare_snapshot', 'nonexistent_table');
+----
+not found
+
+# Cleanup
+query T
+SELECT scenario_drop('compare_scenario');
+----
+true
+
+statement ok
+DROP TABLE compare_data;
+
+# Drop snapshot schema manually for cleanup
+statement ok
+DROP SCHEMA _snap_compare_snapshot CASCADE;
+
 # Test empty snapshot_list after cleanup (at end of file)
 
 # Cleanup: Delete snapshots for clean state (direct table manipulation for test cleanup)
