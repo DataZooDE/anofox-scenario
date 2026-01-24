@@ -193,3 +193,48 @@ true
 
 statement ok
 DROP TABLE order_items;
+
+# ===== Test 11: DDL blocking in scenarios =====
+
+statement ok
+CREATE TABLE ddl_test (id INTEGER PRIMARY KEY, value VARCHAR);
+
+statement ok
+INSERT INTO ddl_test VALUES (1, 'test');
+
+query T
+SELECT scenario_create('ddl_block_test', 'Testing DDL blocking');
+----
+true
+
+query T
+SELECT delta_create('ddl_block_test', 'ddl_test');
+----
+true
+
+# CREATE TABLE in scenario schema should fail
+statement error
+CREATE TABLE _scen_ddl_block_test.new_table (id INTEGER);
+----
+not permitted in scenario schemas
+
+# ALTER TABLE on scenario view should fail
+statement error
+ALTER TABLE _scen_ddl_block_test.ddl_test ADD COLUMN new_col INTEGER;
+----
+not permitted in scenario schemas
+
+# DROP TABLE on scenario view should fail
+statement error
+DROP TABLE _scen_ddl_block_test.ddl_test;
+----
+not permitted in scenario schemas
+
+# Cleanup
+query T
+SELECT scenario_drop('ddl_block_test');
+----
+true
+
+statement ok
+DROP TABLE ddl_test;

@@ -555,3 +555,44 @@ Stores row identifiers from base tables at scenario creation.
 | scenario_id | INTEGER | Reference to scenario |
 | table_name | VARCHAR | Name of the base table |
 | row_id | BIGINT | Row identifier |
+
+---
+
+## DDL Restrictions
+
+### Schema Modifications Not Permitted
+
+Scenario schemas (`_scen_*`) are managed by the anofox-scenario extension and do not allow direct DDL operations. The following operations are blocked:
+
+**CREATE TABLE:**
+```sql
+-- This will fail with an error
+CREATE TABLE _scen_myscenario.new_table (id INTEGER);
+-- Error: CREATE TABLE is not permitted in scenario schemas
+```
+
+**ALTER TABLE:**
+```sql
+-- This will fail with an error
+ALTER TABLE _scen_myscenario.products ADD COLUMN new_col INTEGER;
+-- Error: ALTER TABLE is not permitted in scenario schemas
+```
+
+**DROP TABLE:**
+```sql
+-- This will fail with an error
+DROP TABLE _scen_myscenario.products;
+-- Error: DROP is not permitted in scenario schemas
+```
+
+### Rationale
+
+Scenarios use a copy-on-write (COW) pattern where:
+- The base table structure remains immutable
+- Modifications are stored in delta tables
+- Merge-on-read views combine base + delta data
+
+Schema modifications would break this pattern and invalidate existing delta data. Instead:
+- Use `delta_create()` to enable modifications on existing tables
+- Use `delta_drop()` to remove delta tables
+- Use `scenario_drop()` to remove an entire scenario

@@ -7,6 +7,7 @@
 #include "protocol_manager.hpp"
 #include "delta_storage_engine.hpp"
 #include "comparison_engine.hpp"
+#include "ddl_blocker.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -34,6 +35,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register comparison engine functions
 	ComparisonEngine::RegisterFunctions(loader);
+
+	// Register DDL blocker to prevent schema modifications in scenarios
+	DDLBlocker::Register(loader.GetDatabaseInstance());
 }
 
 void AnofoxScenarioExtension::Load(ExtensionLoader &loader) {
