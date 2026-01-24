@@ -138,6 +138,49 @@ SELECT delta_drop('delta_test', 'products');
 ----
 Delta table for 'products' does not exist in scenario 'delta_test'
 
+# ===== Test delta_row_count in scenario_stats =====
+
+# Create fresh delta table and insert some rows
+query T
+SELECT delta_create('delta_test', 'products');
+----
+true
+
+statement ok
+INSERT INTO _scen_delta_test._delta_products (_op, id, name, price) VALUES ('I', 10, 'Item1', 10.00);
+
+statement ok
+INSERT INTO _scen_delta_test._delta_products (_op, id, name, price) VALUES ('I', 11, 'Item2', 20.00);
+
+statement ok
+INSERT INTO _scen_delta_test._delta_products (_op, id, name, price) VALUES ('I', 12, 'Item3', 30.00);
+
+# Verify scenario_stats now returns correct delta_row_count
+query I
+SELECT delta_row_count FROM scenario_stats('delta_test');
+----
+3
+
+# Add more delta tables with rows (orders delta already exists from earlier, need to drop first)
+query T
+SELECT delta_drop('delta_test', 'orders');
+----
+true
+
+query T
+SELECT delta_create('delta_test', 'orders');
+----
+true
+
+statement ok
+INSERT INTO _scen_delta_test._delta_orders (_op, order_id, product_id, qty) VALUES ('I', 200, 10, 1);
+
+# Verify total delta_row_count includes all delta tables
+query I
+SELECT delta_row_count FROM scenario_stats('delta_test');
+----
+4
+
 # Cleanup
 query T
 SELECT scenario_drop('delta_test');

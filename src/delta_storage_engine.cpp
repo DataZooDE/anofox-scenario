@@ -146,10 +146,30 @@ static unique_ptr<FunctionData> DeltaCreateBind(ClientContext &context, ScalarFu
 	// Extract constant arguments
 	string scenario_name, table_name;
 	if (arguments[0]->IsFoldable()) {
-		scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).ToString();
+		auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+		if (val.IsNull()) {
+			throw InvalidInputException("delta_create requires a non-NULL scenario_name");
+		}
+		scenario_name = val.ToString();
 	}
 	if (arguments[1]->IsFoldable()) {
-		table_name = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).ToString();
+		auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
+		if (val.IsNull()) {
+			throw InvalidInputException("delta_create requires a non-NULL table_name");
+		}
+		table_name = val.ToString();
+	}
+
+	// Validate scenario name format
+	if (!scenario_name.empty() && !ScenarioManager::ValidateName(scenario_name)) {
+		throw InvalidInputException("Invalid scenario name '%s'. Names must be alphanumeric with underscores, "
+		                            "max 63 characters, and not start with a digit.", scenario_name);
+	}
+
+	// Validate table name format to prevent SQL injection
+	if (!table_name.empty() && !ScenarioManager::ValidateTableName(table_name)) {
+		throw InvalidInputException("Invalid table name '%s'. Names must be alphanumeric with underscores, "
+		                            "max 63 characters, and not start with a digit.", table_name);
 	}
 
 	// Validate scenario exists
@@ -168,12 +188,20 @@ static void DeltaCreateFunction(DataChunk &args, ExpressionState &state, Vector 
 	string scenario_name = bind_data.scenario_name;
 	string table_name = bind_data.table_name;
 
-	// If not bound at compile time, get from arguments
+	// If not bound at compile time, get from arguments and validate
 	if (scenario_name.empty()) {
 		scenario_name = args.data[0].GetValue(0).ToString();
+		if (!ScenarioManager::ValidateName(scenario_name)) {
+			throw InvalidInputException("Invalid scenario name '%s'. Names must be alphanumeric with underscores, "
+			                            "max 63 characters, and not start with a digit.", scenario_name);
+		}
 	}
 	if (table_name.empty()) {
 		table_name = args.data[1].GetValue(0).ToString();
+		if (!ScenarioManager::ValidateTableName(table_name)) {
+			throw InvalidInputException("Invalid table name '%s'. Names must be alphanumeric with underscores, "
+			                            "max 63 characters, and not start with a digit.", table_name);
+		}
 	}
 
 	// Validate scenario exists
@@ -224,10 +252,30 @@ static unique_ptr<FunctionData> DeltaDropBind(ClientContext &context, ScalarFunc
 
 	string scenario_name, table_name;
 	if (arguments[0]->IsFoldable()) {
-		scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).ToString();
+		auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+		if (val.IsNull()) {
+			throw InvalidInputException("delta_drop requires a non-NULL scenario_name");
+		}
+		scenario_name = val.ToString();
 	}
 	if (arguments[1]->IsFoldable()) {
-		table_name = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).ToString();
+		auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
+		if (val.IsNull()) {
+			throw InvalidInputException("delta_drop requires a non-NULL table_name");
+		}
+		table_name = val.ToString();
+	}
+
+	// Validate scenario name format
+	if (!scenario_name.empty() && !ScenarioManager::ValidateName(scenario_name)) {
+		throw InvalidInputException("Invalid scenario name '%s'. Names must be alphanumeric with underscores, "
+		                            "max 63 characters, and not start with a digit.", scenario_name);
+	}
+
+	// Validate table name format to prevent SQL injection
+	if (!table_name.empty() && !ScenarioManager::ValidateTableName(table_name)) {
+		throw InvalidInputException("Invalid table name '%s'. Names must be alphanumeric with underscores, "
+		                            "max 63 characters, and not start with a digit.", table_name);
 	}
 
 	if (!scenario_name.empty() && !ScenarioManager::ScenarioExists(context, scenario_name)) {
@@ -245,11 +293,20 @@ static void DeltaDropFunction(DataChunk &args, ExpressionState &state, Vector &r
 	string scenario_name = bind_data.scenario_name;
 	string table_name = bind_data.table_name;
 
+	// If not bound at compile time, get from arguments and validate
 	if (scenario_name.empty()) {
 		scenario_name = args.data[0].GetValue(0).ToString();
+		if (!ScenarioManager::ValidateName(scenario_name)) {
+			throw InvalidInputException("Invalid scenario name '%s'. Names must be alphanumeric with underscores, "
+			                            "max 63 characters, and not start with a digit.", scenario_name);
+		}
 	}
 	if (table_name.empty()) {
 		table_name = args.data[1].GetValue(0).ToString();
+		if (!ScenarioManager::ValidateTableName(table_name)) {
+			throw InvalidInputException("Invalid table name '%s'. Names must be alphanumeric with underscores, "
+			                            "max 63 characters, and not start with a digit.", table_name);
+		}
 	}
 
 	if (!ScenarioManager::ScenarioExists(context, scenario_name)) {
@@ -281,13 +338,15 @@ void DeltaStorageEngine::RegisterFunctions(ExtensionLoader &loader) {
 	// delta_create(scenario_name, table_name) -> BOOLEAN
 	ScalarFunction delta_create("delta_create", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                            DeltaCreateFunction, DeltaCreateBind, nullptr, nullptr, nullptr,
-	                            LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	                            LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
+	                            FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(delta_create);
 
 	// delta_drop(scenario_name, table_name) -> BOOLEAN
 	ScalarFunction delta_drop("delta_drop", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                          DeltaDropFunction, DeltaDropBind, nullptr, nullptr, nullptr,
-	                          LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	                          LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
+	                          FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(delta_drop);
 }
 

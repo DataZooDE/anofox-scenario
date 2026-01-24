@@ -20,8 +20,17 @@ public:
 	//! Validate scenario name (alphanumeric + underscore, max 63 chars)
 	static bool ValidateName(const string &name);
 
+	//! Validate table name (same rules as scenario name)
+	static bool ValidateTableName(const string &name);
+
 	//! Check if a scenario exists
 	static bool ScenarioExists(ClientContext &context, const string &name);
+
+	//! Escape a string for SQL (doubles single quotes)
+	static string EscapeSQLString(const string &str);
+
+	//! Quote an identifier for SQL (wraps in double quotes, escapes internal quotes)
+	static string QuoteIdentifier(const string &identifier);
 };
 
 } // namespace duckdb
