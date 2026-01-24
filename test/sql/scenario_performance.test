@@ -1,0 +1,233 @@
+# name: test/sql/scenario_performance.test
+# description: Performance validation for merge-on-read operations
+# group: [anofox_scenario]
+#
+# Performance targets (from requirements):
+# - Scenario creation: < 1 second for 10GB database
+# - Query overhead: < 20% for 1% delta ratio
+# - Query overhead: < 30% for 5% delta ratio
+#
+# This test validates correct operation at scale; actual timing
+# measurements should be done via dedicated benchmarking tools.
+
+require anofox_scenario
+
+# ===== Setup: Create test data with 10,000 rows =====
+# (Scaled down from 10M for test suite speed; patterns remain valid)
+
+statement ok
+CREATE TABLE perf_data (
+    id INTEGER PRIMARY KEY,
+    category VARCHAR,
+    value DOUBLE,
+    description VARCHAR
+);
+
+# Generate 10,000 rows of test data
+statement ok
+INSERT INTO perf_data
+SELECT
+    i as id,
+    CASE (i % 5)
+        WHEN 0 THEN 'A'
+        WHEN 1 THEN 'B'
+        WHEN 2 THEN 'C'
+        WHEN 3 THEN 'D'
+        ELSE 'E'
+    END as category,
+    (i * 1.5) as value,
+    'Item ' || i as description
+FROM generate_series(1, 10000) t(i);
+
+# Verify base data
+query I
+SELECT COUNT(*) FROM perf_data;
+----
+10000
+
+# ===== Test: Scenario creation should be fast =====
+
+query T
+SELECT scenario_create('perf_scenario', 'Performance test scenario');
+----
+true
+
+query T
+SELECT delta_create('perf_scenario', 'perf_data');
+----
+true
+
+# Verify scenario was created with proper structure
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_perf_scenario';
+----
+2
+
+# ===== Test: 1% delta ratio (100 modifications out of 10,000) =====
+
+# Insert 50 new rows (0.5% of base)
+statement ok
+INSERT INTO _scen_perf_scenario._delta_perf_data (_op, id, category, value, description)
+SELECT 'I', 10000 + i, 'NEW', i * 2.0, 'New item ' || i
+FROM generate_series(1, 50) t(i);
+
+# Update 30 existing rows (0.3% of base)
+statement ok
+INSERT INTO _scen_perf_scenario._delta_perf_data (_op, id, category, value, description)
+SELECT 'U', id, 'UPDATED', value * 1.1, 'Updated ' || description
+FROM perf_data WHERE id <= 30;
+
+# Delete 20 existing rows (0.2% of base)
+statement ok
+INSERT INTO _scen_perf_scenario._delta_perf_data (_op, id, category, value, description)
+SELECT 'D', id, category, value, description
+FROM perf_data WHERE id BETWEEN 9981 AND 10000;
+
+# Verify delta table has 100 entries (1% delta ratio)
+query I
+SELECT COUNT(*) FROM _scen_perf_scenario._delta_perf_data;
+----
+100
+
+# ===== Test: Query performance with 1% delta =====
+
+# Full table scan through merge view
+query I
+SELECT COUNT(*) FROM _scen_perf_scenario.perf_data;
+----
+10030
+
+# Aggregation query through merge view
+query IR
+SELECT category, SUM(value) FROM _scen_perf_scenario.perf_data GROUP BY category ORDER BY category LIMIT 3;
+----
+A	15007500.0
+B	15012000.0
+C	15016500.0
+
+# Filter query through merge view
+query I
+SELECT COUNT(*) FROM _scen_perf_scenario.perf_data WHERE category = 'NEW';
+----
+50
+
+# Point lookup through merge view (should use index on base)
+query TT
+SELECT category, description FROM _scen_perf_scenario.perf_data WHERE id = 5000;
+----
+A	Item 5000
+
+# ===== Test: 5% delta ratio (500 modifications) =====
+
+# Add more modifications to reach ~5% delta
+statement ok
+INSERT INTO _scen_perf_scenario._delta_perf_data (_op, id, category, value, description)
+SELECT 'I', 10050 + i, 'BULK', i * 3.0, 'Bulk item ' || i
+FROM generate_series(1, 400) t(i);
+
+# Verify delta now has 500 entries (5% delta ratio)
+query I
+SELECT COUNT(*) FROM _scen_perf_scenario._delta_perf_data;
+----
+500
+
+# ===== Test: Query performance with 5% delta =====
+
+# Full table scan through merge view
+query I
+SELECT COUNT(*) FROM _scen_perf_scenario.perf_data;
+----
+10430
+
+# Complex aggregation (A, B, C, D, E from base + NEW, UPDATED, BULK from deltas)
+query I
+SELECT COUNT(DISTINCT category) FROM _scen_perf_scenario.perf_data;
+----
+8
+
+# Range scan
+query I
+SELECT COUNT(*) FROM _scen_perf_scenario.perf_data WHERE value > 10000;
+----
+3314
+
+# Join scenario view with base table (cross-schema query)
+query I
+SELECT COUNT(*) FROM _scen_perf_scenario.perf_data s
+JOIN perf_data b ON s.id = b.id
+WHERE s.category != b.category;
+----
+30
+
+# ===== Test: scenario_compare performance =====
+
+# Compare should work efficiently with larger datasets
+# (returns one row per changed column, so more than delta count)
+query I
+SELECT COUNT(*) FROM scenario_compare('perf_scenario', 'perf_data');
+----
+560
+
+# Verify comparison categories (changed = 30 rows * 3 changed columns each = 90)
+query TI
+SELECT diff_type, COUNT(*) FROM scenario_compare('perf_scenario', 'perf_data') GROUP BY diff_type ORDER BY diff_type;
+----
+added	450
+changed	90
+removed	20
+
+# ===== Test: Multiple scenarios performance =====
+
+# Create second scenario to test parallel access
+query T
+SELECT scenario_create('perf_scenario_2', 'Second performance test scenario');
+----
+true
+
+query T
+SELECT delta_create('perf_scenario_2', 'perf_data');
+----
+true
+
+# Add different modifications to second scenario
+statement ok
+INSERT INTO _scen_perf_scenario_2._delta_perf_data (_op, id, category, value, description)
+SELECT 'U', id, 'ALT', value * 0.9, 'Alternative ' || description
+FROM perf_data WHERE id <= 100;
+
+# Query both scenarios
+query II
+SELECT
+    (SELECT COUNT(*) FROM _scen_perf_scenario.perf_data) as scen1_count,
+    (SELECT COUNT(*) FROM _scen_perf_scenario_2.perf_data) as scen2_count;
+----
+10430	10000
+
+# Cross-scenario comparison (100 rows modified in scenario 2)
+query I
+SELECT COUNT(*) FROM _scen_perf_scenario.perf_data s1
+JOIN _scen_perf_scenario_2.perf_data s2 ON s1.id = s2.id
+WHERE s1.value != s2.value;
+----
+100
+
+# ===== Cleanup =====
+
+query T
+SELECT scenario_drop('perf_scenario_2');
+----
+true
+
+query T
+SELECT scenario_drop('perf_scenario');
+----
+true
+
+statement ok
+DROP TABLE perf_data;
+
+# Verify cleanup
+query I
+SELECT COUNT(*) FROM scenario_list();
+----
+0
