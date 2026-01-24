@@ -99,3 +99,46 @@ query I
 SELECT COUNT(*) FROM _scenario_snapshots WHERE snapshot_name IN ('test_snapshot', 'simple_snapshot', 'valid_name_2');
 ----
 3
+
+# ===== Test: snapshot_list() =====
+
+# snapshot_list should return all snapshots ordered by created_at DESC
+query I
+SELECT COUNT(*) FROM snapshot_list();
+----
+3
+
+# Verify snapshot_list returns correct columns
+query TT
+SELECT snapshot_name, source_schema FROM snapshot_list() ORDER BY snapshot_name;
+----
+simple_snapshot	_scen_snapshot_test_scenario
+test_snapshot	_scen_snapshot_test_scenario
+valid_name_2	_scen_snapshot_test_scenario
+
+# Verify description column
+query TT
+SELECT snapshot_name, description FROM snapshot_list() WHERE snapshot_name = 'test_snapshot';
+----
+test_snapshot	A test snapshot
+
+# Verify NULL description for simple_snapshot
+query TT
+SELECT snapshot_name, description FROM snapshot_list() WHERE snapshot_name = 'simple_snapshot';
+----
+simple_snapshot	NULL
+
+# Test empty snapshot_list after cleanup (at end of file)
+
+# Cleanup: Delete snapshots for clean state (direct table manipulation for test cleanup)
+statement ok
+DELETE FROM _scenario_snapshots;
+
+# Verify empty list
+query I
+SELECT COUNT(*) FROM snapshot_list();
+----
+0
+
+statement ok
+DROP TABLE test_data;

@@ -164,6 +164,80 @@ static void SnapshotCreateFunction(DataChunk &args, ExpressionState &state, Vect
 	*ConstantVector::GetData<bool>(result) = true;
 }
 
+// ===== snapshot_list Implementation =====
+
+struct SnapshotListBindData : public TableFunctionData {
+	bool done = false;
+};
+
+struct SnapshotListGlobalState : public GlobalTableFunctionState {
+	idx_t current_row = 0;
+	vector<vector<Value>> rows;
+};
+
+static unique_ptr<FunctionData> SnapshotListBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	// Define output columns
+	names.emplace_back("snapshot_name");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("source_schema");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("created_at");
+	return_types.emplace_back(LogicalType::TIMESTAMP);
+
+	names.emplace_back("description");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("size_bytes");
+	return_types.emplace_back(LogicalType::BIGINT);
+
+	return make_uniq<SnapshotListBindData>();
+}
+
+static unique_ptr<GlobalTableFunctionState> SnapshotListInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto state = make_uniq<SnapshotListGlobalState>();
+
+	// Query all snapshots ordered by created_at DESC
+	Connection con(context.db->GetDatabase(context));
+	auto result = con.Query(
+	    "SELECT snapshot_name, source_schema, created_at, description, size_bytes "
+	    "FROM _scenario_snapshots ORDER BY created_at DESC");
+
+	if (!result->HasError()) {
+		for (idx_t i = 0; i < result->RowCount(); i++) {
+			vector<Value> row;
+			row.push_back(result->GetValue(0, i)); // snapshot_name
+			row.push_back(result->GetValue(1, i)); // source_schema
+			row.push_back(result->GetValue(2, i)); // created_at
+			row.push_back(result->GetValue(3, i)); // description
+			row.push_back(result->GetValue(4, i)); // size_bytes
+			state->rows.push_back(std::move(row));
+		}
+	}
+
+	return std::move(state);
+}
+
+static void SnapshotListFunction(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<SnapshotListGlobalState>();
+
+	idx_t count = 0;
+	while (state.current_row < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.current_row];
+		output.SetValue(0, count, row[0]); // snapshot_name
+		output.SetValue(1, count, row[1]); // source_schema
+		output.SetValue(2, count, row[2]); // created_at
+		output.SetValue(3, count, row[3]); // description
+		output.SetValue(4, count, row[4]); // size_bytes
+		state.current_row++;
+		count++;
+	}
+
+	output.SetCardinality(count);
+}
+
 // ===== Function Registration =====
 
 void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -185,6 +259,10 @@ void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
 	snapshot_create_set.AddFunction(snapshot_create_2);
 
 	loader.RegisterFunction(snapshot_create_set);
+
+	// snapshot_list() - returns table of snapshots
+	TableFunction snapshot_list("snapshot_list", {}, SnapshotListFunction, SnapshotListBind, SnapshotListInit);
+	loader.RegisterFunction(snapshot_list);
 }
 
 } // namespace duckdb

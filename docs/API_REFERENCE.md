@@ -531,6 +531,83 @@ SELECT * FROM scenario_compare_all('pricing_analysis');
 
 ---
 
+## Snapshot Functions
+
+### snapshot_create
+
+Creates a named snapshot of a scenario's current state for later comparison.
+
+**Syntax:**
+```sql
+SELECT snapshot_create(scenario_name, snapshot_name);
+SELECT snapshot_create(scenario_name, snapshot_name, description);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario to snapshot (required) |
+| snapshot_name | VARCHAR | Name for the snapshot (required). Must be alphanumeric with underscores, max 63 characters, cannot start with a digit. |
+| description | VARCHAR | Optional description of the snapshot |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Create a scenario and make some changes
+SELECT scenario_create('pricing_analysis');
+SELECT delta_create('pricing_analysis', 'products');
+INSERT INTO _scen_pricing_analysis._delta_products (_op, id, name, price) VALUES ('U', 1, 'Widget', 12.99);
+
+-- Create a snapshot to mark this state
+SELECT snapshot_create('pricing_analysis', 'baseline_q4', 'Q4 baseline prices');
+```
+
+**Errors:**
+- `Snapshot '%s' already exists` - A snapshot with this name already exists
+- `Scenario '%s' does not exist` - No scenario with this name
+- `Invalid snapshot name '%s'` - Name validation failed
+
+---
+
+### snapshot_list
+
+Lists all snapshots with their metadata.
+
+**Syntax:**
+```sql
+SELECT * FROM snapshot_list();
+```
+
+**Parameters:** None
+
+**Returns:** Table with columns:
+| Column | Type | Description |
+|--------|------|-------------|
+| snapshot_name | VARCHAR | Name of the snapshot |
+| source_schema | VARCHAR | Schema name of the source scenario |
+| created_at | TIMESTAMP | When the snapshot was created |
+| description | VARCHAR | Optional description |
+| size_bytes | BIGINT | Size of the snapshot (NULL if not computed) |
+
+**Example:**
+```sql
+-- List all snapshots
+SELECT * FROM snapshot_list();
+
+-- Find snapshots for a specific scenario
+SELECT * FROM snapshot_list() WHERE source_schema = '_scen_pricing_analysis';
+
+-- List snapshots by creation time
+SELECT snapshot_name, created_at FROM snapshot_list() ORDER BY created_at DESC;
+```
+
+**Notes:**
+- Results are ordered by `created_at DESC` (newest first)
+- Snapshots persist after scenario deletion (they reference source_schema, not scenario_id)
+
+---
+
 ## Metadata Tables
 
 ### _scenario_registry
@@ -570,6 +647,19 @@ Stores row identifiers from base tables at scenario creation.
 | scenario_id | INTEGER | Reference to scenario |
 | table_name | VARCHAR | Name of the base table |
 | row_id | BIGINT | Row identifier |
+
+### _scenario_snapshots
+
+Stores information about scenario snapshots.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| snapshot_id | INTEGER | Unique identifier |
+| snapshot_name | VARCHAR | Human-readable name |
+| source_schema | VARCHAR | Schema name of the source scenario |
+| created_at | TIMESTAMP | When the snapshot was created |
+| description | VARCHAR | Optional description |
+| size_bytes | BIGINT | Size of the snapshot (NULL if not computed) |
 
 ---
 
