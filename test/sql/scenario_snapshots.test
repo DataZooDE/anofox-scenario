@@ -239,6 +239,106 @@ true
 statement ok
 DROP TABLE compare_data;
 
+# ===== Test: scenario_from_snapshot() =====
+
+# First clean up compare_snapshot for reuse
+# (Don't drop _snap_compare_snapshot yet - we'll use it)
+
+# Create a scenario from the existing compare_snapshot
+query T
+SELECT scenario_from_snapshot('compare_snapshot', 'from_snap_scenario', 'Scenario created from snapshot');
+----
+true
+
+# Verify scenario was created
+query I
+SELECT COUNT(*) FROM scenario_list() WHERE scenario_name = 'from_snap_scenario';
+----
+1
+
+# Verify base_schema is the snapshot schema
+query T
+SELECT base_schema FROM _scenario_registry WHERE scenario_name = 'from_snap_scenario';
+----
+_snap_compare_snapshot
+
+# Verify scenario schema was created
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_from_snap_scenario';
+----
+1
+
+# Verify delta table was created for the compare_data table
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_from_snap_scenario' AND table_name = '_delta_compare_data';
+----
+1
+
+# Verify merge view was created
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_from_snap_scenario' AND table_name = 'compare_data';
+----
+1
+
+# Verify the scenario sees snapshot data as base (not current main)
+# Snapshot had: id=1 (alpha_updated, 150), id=2 (beta, 200), id=4 (delta, 400)
+query I
+SELECT COUNT(*) FROM _scen_from_snap_scenario.compare_data;
+----
+3
+
+# Verify id=1 shows snapshot values (not main values)
+query TI
+SELECT name, value FROM _scen_from_snap_scenario.compare_data WHERE id = 1;
+----
+alpha_updated	150
+
+# Verify id=4 is visible (was only in snapshot, not in main)
+query TI
+SELECT name, value FROM _scen_from_snap_scenario.compare_data WHERE id = 4;
+----
+delta	400
+
+# Verify id=3 and id=5 are NOT visible (they are in main but not in snapshot)
+query I
+SELECT COUNT(*) FROM _scen_from_snap_scenario.compare_data WHERE id IN (3, 5);
+----
+0
+
+# Test: Can modify the new scenario without affecting snapshot
+statement ok
+INSERT INTO _scen_from_snap_scenario._delta_compare_data (_op, id, name, value) VALUES ('I', 5, 'new_in_scen', 500);
+
+# New row should be visible in scenario
+query TI
+SELECT name, value FROM _scen_from_snap_scenario.compare_data WHERE id = 5;
+----
+new_in_scen	500
+
+# But snapshot should be unchanged (still only 3 rows)
+query I
+SELECT COUNT(*) FROM _snap_compare_snapshot.compare_data;
+----
+3
+
+# Test: Cannot create scenario from non-existent snapshot
+statement error
+SELECT scenario_from_snapshot('nonexistent_snap', 'new_scenario');
+----
+Snapshot 'nonexistent_snap' does not exist
+
+# Test: Cannot create scenario with existing name
+statement error
+SELECT scenario_from_snapshot('compare_snapshot', 'from_snap_scenario');
+----
+Scenario 'from_snap_scenario' already exists
+
+# Cleanup
+query T
+SELECT scenario_drop('from_snap_scenario');
+----
+true
+
 # Drop snapshot schema manually for cleanup
 statement ok
 DROP SCHEMA _snap_compare_snapshot CASCADE;

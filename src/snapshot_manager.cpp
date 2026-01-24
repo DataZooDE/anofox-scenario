@@ -532,6 +532,213 @@ static void SnapshotCompareFunction(ClientContext &context, TableFunctionInput &
 	output.SetCardinality(count);
 }
 
+// ===== scenario_from_snapshot Implementation =====
+
+struct ScenarioFromSnapshotBindData : public FunctionData {
+	string snapshot_name;
+	string scenario_name;
+	string description;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ScenarioFromSnapshotBindData>();
+		result->snapshot_name = snapshot_name;
+		result->scenario_name = scenario_name;
+		result->description = description;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ScenarioFromSnapshotBindData>();
+		return snapshot_name == other.snapshot_name &&
+		       scenario_name == other.scenario_name &&
+		       description == other.description;
+	}
+};
+
+static unique_ptr<FunctionData> ScenarioFromSnapshotBind(ClientContext &context, ScalarFunction &bound_function,
+                                                          vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<ScenarioFromSnapshotBindData>();
+
+	if (arguments.size() < 1 || arguments[0]->return_type != LogicalType::VARCHAR) {
+		throw InvalidInputException("scenario_from_snapshot requires a snapshot name as first argument");
+	}
+	if (!arguments[0]->IsFoldable()) {
+		throw InvalidInputException("scenario_from_snapshot snapshot name must be a constant");
+	}
+	bind_data->snapshot_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	if (arguments.size() < 2 || arguments[1]->return_type != LogicalType::VARCHAR) {
+		throw InvalidInputException("scenario_from_snapshot requires a scenario name as second argument");
+	}
+	if (!arguments[1]->IsFoldable()) {
+		throw InvalidInputException("scenario_from_snapshot scenario name must be a constant");
+	}
+	bind_data->scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).GetValue<string>();
+
+	if (arguments.size() > 2 && arguments[2]->IsFoldable()) {
+		bind_data->description = ExpressionExecutor::EvaluateScalar(context, *arguments[2]).GetValue<string>();
+	}
+
+	// Validate snapshot name
+	if (!SnapshotManager::ValidateName(bind_data->snapshot_name)) {
+		throw InvalidInputException("Invalid snapshot name '%s'", bind_data->snapshot_name);
+	}
+
+	// Validate scenario name
+	if (!SnapshotManager::ValidateName(bind_data->scenario_name)) {
+		throw InvalidInputException("Invalid scenario name '%s'. Names must be alphanumeric with underscores, "
+		                            "max 63 characters, and not start with a digit.",
+		                            bind_data->scenario_name);
+	}
+
+	// Check if snapshot exists
+	if (!SnapshotManager::SnapshotExists(context, bind_data->snapshot_name)) {
+		throw InvalidInputException("Snapshot '%s' does not exist", bind_data->snapshot_name);
+	}
+
+	// Check if scenario already exists
+	Connection con(context.db->GetDatabase(context));
+	auto existing = con.Query(StringUtil::Format(
+	    "SELECT 1 FROM _scenario_registry WHERE scenario_name = '%s'",
+	    bind_data->scenario_name));
+	if (existing->RowCount() > 0) {
+		throw InvalidInputException("Scenario '%s' already exists", bind_data->scenario_name);
+	}
+
+	return std::move(bind_data);
+}
+
+static void ScenarioFromSnapshotFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ScenarioFromSnapshotBindData>();
+	auto &context = state.GetContext();
+
+	Connection con(context.db->GetDatabase(context));
+
+	string snapshot_schema = "_snap_" + bind_data.snapshot_name;
+	string scenario_schema = "_scen_" + bind_data.scenario_name;
+
+	// Create the scenario schema
+	auto create_result = con.Query("CREATE SCHEMA " + scenario_schema);
+	if (create_result->HasError()) {
+		throw InvalidInputException("Failed to create scenario schema: %s", create_result->GetError());
+	}
+
+	// Get next scenario_id
+	auto id_result = con.Query("SELECT COALESCE(MAX(scenario_id), 0) + 1 FROM _scenario_registry");
+	if (id_result->HasError()) {
+		con.Query("DROP SCHEMA " + scenario_schema + " CASCADE");
+		throw InvalidInputException("Failed to get next scenario ID: %s", id_result->GetError());
+	}
+	int64_t scenario_id = id_result->GetValue(0, 0).GetValue<int64_t>();
+
+	// Register the scenario with snapshot as base_schema
+	string desc_value = bind_data.description.empty() ? "NULL" : "'" + bind_data.description + "'";
+	auto insert_sql = StringUtil::Format(
+	    "INSERT INTO _scenario_registry (scenario_id, scenario_name, schema_name, base_schema, base_captured_at, description) "
+	    "VALUES (%d, '%s', '%s', '%s', current_timestamp, %s)",
+	    scenario_id, bind_data.scenario_name, scenario_schema, snapshot_schema, desc_value);
+
+	auto insert_result = con.Query(insert_sql);
+	if (insert_result->HasError()) {
+		con.Query("DROP SCHEMA " + scenario_schema + " CASCADE");
+		throw InvalidInputException("Failed to register scenario: %s", insert_result->GetError());
+	}
+
+	// Get all tables in the snapshot schema and create delta tables + merge views for each
+	auto tables_result = con.Query(StringUtil::Format(
+	    "SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_type = 'BASE TABLE'",
+	    snapshot_schema));
+
+	if (!tables_result->HasError()) {
+		for (idx_t i = 0; i < tables_result->RowCount(); i++) {
+			string table_name = tables_result->GetValue(0, i).ToString();
+
+			// Get columns from snapshot table
+			auto cols_result = con.Query(StringUtil::Format(
+			    "SELECT column_name, data_type, is_nullable FROM information_schema.columns "
+			    "WHERE table_schema = '%s' AND table_name = '%s' ORDER BY ordinal_position",
+			    snapshot_schema, table_name));
+
+			if (cols_result->HasError() || cols_result->RowCount() == 0) {
+				continue;
+			}
+
+			// Build column definitions for delta table
+			string col_defs;
+			vector<string> columns;
+			for (idx_t c = 0; c < cols_result->RowCount(); c++) {
+				string col_name = cols_result->GetValue(0, c).ToString();
+				string col_type = cols_result->GetValue(1, c).ToString();
+				string nullable = cols_result->GetValue(2, c).ToString();
+
+				columns.push_back(col_name);
+				if (!col_defs.empty()) col_defs += ", ";
+				col_defs += col_name + " " + col_type;
+				if (nullable == "NO") {
+					col_defs += " NOT NULL";
+				}
+			}
+
+			// Create delta table
+			string delta_table = "_delta_" + table_name;
+			auto delta_sql = StringUtil::Format(
+			    "CREATE TABLE %s.%s (_op VARCHAR NOT NULL CHECK (_op IN ('I', 'U', 'D')), "
+			    "_ts TIMESTAMP DEFAULT current_timestamp, _version INTEGER DEFAULT 1, %s)",
+			    scenario_schema, delta_table, col_defs);
+			con.Query(delta_sql);
+
+			// Build merge view (using snapshot as base instead of main)
+			vector<string> quoted_columns;
+			for (const auto &col : columns) {
+				quoted_columns.push_back(col);
+			}
+			string column_list = StringUtil::Join(quoted_columns, ", ");
+
+			// For now, use all columns as composite key (no PK info in snapshot)
+			vector<string> all_join_conditions;
+			for (const auto &col : columns) {
+				all_join_conditions.push_back("d." + col + " IS NOT DISTINCT FROM base." + col);
+			}
+			string join_condition = StringUtil::Join(all_join_conditions, " AND ");
+
+			vector<string> base_columns;
+			for (const auto &col : columns) {
+				base_columns.push_back("base." + col);
+			}
+			string base_column_list = StringUtil::Join(base_columns, ", ");
+
+			auto view_sql = StringUtil::Format(
+			    "CREATE VIEW %s.%s AS "
+			    "SELECT %s FROM %s.%s base "
+			    "WHERE NOT EXISTS ("
+			    "  SELECT 1 FROM %s.%s d "
+			    "  WHERE %s AND d._op IN ('U', 'D')"
+			    ") "
+			    "UNION ALL "
+			    "SELECT %s FROM %s.%s WHERE _op IN ('I', 'U')",
+			    scenario_schema, table_name,
+			    base_column_list, snapshot_schema, table_name,
+			    scenario_schema, delta_table,
+			    join_condition,
+			    column_list, scenario_schema, delta_table);
+			con.Query(view_sql);
+
+			// Register table
+			auto reg_sql = StringUtil::Format(
+			    "INSERT INTO _scenario_tables (scenario_id, table_name, base_row_count, has_primary_key, primary_key_columns) "
+			    "VALUES (%d, '%s', (SELECT COUNT(*) FROM %s.%s), false, NULL)",
+			    scenario_id, table_name, snapshot_schema, table_name);
+			con.Query(reg_sql);
+		}
+	}
+
+	// Return true
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
 // ===== Function Registration =====
 
 void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -562,6 +769,25 @@ void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
 	TableFunction snapshot_compare("snapshot_compare", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                               SnapshotCompareFunction, SnapshotCompareBind, SnapshotCompareInit);
 	loader.RegisterFunction(snapshot_compare);
+
+	// scenario_from_snapshot(snapshot_name, scenario_name, description) - create scenario from snapshot
+	ScalarFunctionSet scenario_from_snapshot_set("scenario_from_snapshot");
+
+	// 3-argument version: snapshot_name, scenario_name, description
+	ScalarFunction scenario_from_snapshot_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                         LogicalType::BOOLEAN,
+	                                         ScenarioFromSnapshotFunction, ScenarioFromSnapshotBind, nullptr, nullptr, nullptr,
+	                                         LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	scenario_from_snapshot_set.AddFunction(scenario_from_snapshot_3);
+
+	// 2-argument version: snapshot_name, scenario_name (no description)
+	ScalarFunction scenario_from_snapshot_2({LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                         LogicalType::BOOLEAN,
+	                                         ScenarioFromSnapshotFunction, ScenarioFromSnapshotBind, nullptr, nullptr, nullptr,
+	                                         LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	scenario_from_snapshot_set.AddFunction(scenario_from_snapshot_2);
+
+	loader.RegisterFunction(scenario_from_snapshot_set);
 }
 
 } // namespace duckdb

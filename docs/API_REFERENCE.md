@@ -662,6 +662,57 @@ SELECT * FROM snapshot_compare('q4_prices', 'products');
 
 ---
 
+### scenario_from_snapshot
+
+Creates a new scenario using a snapshot as its base. The scenario sees the snapshot data as its baseline instead of current main, allowing branching from historical states.
+
+**Syntax:**
+```sql
+SELECT scenario_from_snapshot(snapshot_name, scenario_name);
+SELECT scenario_from_snapshot(snapshot_name, scenario_name, description);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| snapshot_name | VARCHAR | Name of the snapshot to use as base (required) |
+| scenario_name | VARCHAR | Name for the new scenario (required) |
+| description | VARCHAR | Optional description |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Create a scenario, make changes, and snapshot
+SELECT scenario_create('q4_analysis');
+SELECT delta_create('q4_analysis', 'sales');
+INSERT INTO _scen_q4_analysis._delta_sales (_op, region, amount) VALUES ('U', 'west', 15000);
+SELECT snapshot_create('q4_analysis', 'q4_final', 'Q4 final numbers');
+
+-- Later, create new scenario from that snapshot
+SELECT scenario_from_snapshot('q4_final', 'q5_planning', 'Start Q5 from Q4 final');
+
+-- New scenario sees snapshot data as baseline
+SELECT * FROM _scen_q5_planning.sales;  -- Shows Q4 final data, not current main
+
+-- Modifications are independent
+INSERT INTO _scen_q5_planning._delta_sales (_op, region, amount) VALUES ('U', 'west', 18000);
+-- This doesn't affect the q4_final snapshot
+```
+
+**Notes:**
+- The new scenario's `base_schema` points to the snapshot schema (not main)
+- Delta tables and merge views are auto-created for all tables in the snapshot
+- Modifications in the new scenario don't affect the snapshot
+- Useful for branching from historical states or creating "what-if" scenarios from past baselines
+
+**Errors:**
+- `Snapshot '%s' does not exist` - No snapshot with this name
+- `Scenario '%s' already exists` - A scenario with this name already exists
+- `Invalid scenario name '%s'` - Name validation failed
+
+---
+
 ## Metadata Tables
 
 ### _scenario_registry
