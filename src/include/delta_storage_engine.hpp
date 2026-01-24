@@ -21,6 +21,17 @@ public:
 	//! Check if a delta table exists
 	static bool DeltaTableExists(ClientContext &context, const string &scenario_schema,
 	                             const string &table_name);
+
+	//! Create a merge-on-read view that combines base table with delta modifications
+	static bool CreateMergeView(ClientContext &context, const string &scenario_schema,
+	                            const string &base_table_name, const vector<string> &pk_columns);
+
+	//! Drop a merge-on-read view
+	static bool DropMergeView(ClientContext &context, const string &scenario_schema,
+	                          const string &table_name);
+
+	//! Get the merge view name for a table
+	static string GetMergeViewName(const string &base_table_name);
 };
 
 } // namespace duckdb

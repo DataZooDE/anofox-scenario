@@ -115,6 +115,121 @@ bool DeltaStorageEngine::CreateDeltaTable(ClientContext &context, const string &
 	return true;
 }
 
+string DeltaStorageEngine::GetMergeViewName(const string &base_table_name) {
+	// The merge view uses the same name as the base table (in the scenario schema)
+	return base_table_name;
+}
+
+bool DeltaStorageEngine::CreateMergeView(ClientContext &context, const string &scenario_schema,
+                                         const string &base_table_name, const vector<string> &pk_columns) {
+	Connection con(context.db->GetDatabase(context));
+
+	string delta_table = GetDeltaTableName(base_table_name);
+	string view_name = GetMergeViewName(base_table_name);
+
+	// Get all column names from base table (for SELECT list)
+	auto columns_result = con.Query(StringUtil::Format(
+	    "SELECT column_name FROM information_schema.columns "
+	    "WHERE table_schema = 'main' AND table_name = '%s' "
+	    "ORDER BY ordinal_position",
+	    ScenarioManager::EscapeSQLString(base_table_name).c_str()));
+
+	if (columns_result->RowCount() == 0) {
+		throw InvalidInputException("Base table '%s' not found in main schema", base_table_name);
+	}
+
+	vector<string> columns;
+	for (idx_t i = 0; i < columns_result->RowCount(); i++) {
+		columns.push_back(columns_result->GetValue(0, i).ToString());
+	}
+
+	// Build column list for SELECT (quote each column name)
+	vector<string> quoted_columns;
+	for (const auto &col : columns) {
+		quoted_columns.push_back(ScenarioManager::QuoteIdentifier(col));
+	}
+	string column_list = StringUtil::Join(quoted_columns, ", ");
+
+	// Build the merge view SQL
+	string view_sql;
+
+	if (pk_columns.empty()) {
+		// No PK: Use rowid-based anti-join (fallback, less efficient)
+		// This case is complex - for now, just union all base with delta for tables without PK
+		view_sql = StringUtil::Format(
+		    "CREATE OR REPLACE VIEW %s.%s AS "
+		    "SELECT %s FROM main.%s "
+		    "UNION ALL "
+		    "SELECT %s FROM %s.%s WHERE _op IN ('I', 'U')",
+		    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
+		    ScenarioManager::QuoteIdentifier(view_name).c_str(),
+		    column_list.c_str(),
+		    ScenarioManager::QuoteIdentifier(base_table_name).c_str(),
+		    column_list.c_str(),
+		    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
+		    ScenarioManager::QuoteIdentifier(delta_table).c_str());
+	} else {
+		// With PK: Use anti-join to exclude rows that are updated/deleted in delta
+		vector<string> pk_join_conditions;
+		for (const auto &pk : pk_columns) {
+			string quoted_pk = ScenarioManager::QuoteIdentifier(pk);
+			pk_join_conditions.push_back("d." + quoted_pk + " = base." + quoted_pk);
+		}
+		string join_condition = StringUtil::Join(pk_join_conditions, " AND ");
+
+		// Build base SELECT with prefixed columns
+		vector<string> base_columns;
+		for (const auto &col : columns) {
+			base_columns.push_back("base." + ScenarioManager::QuoteIdentifier(col));
+		}
+		string base_column_list = StringUtil::Join(base_columns, ", ");
+
+		view_sql = StringUtil::Format(
+		    "CREATE OR REPLACE VIEW %s.%s AS "
+		    "SELECT %s FROM main.%s base "
+		    "WHERE NOT EXISTS ("
+		    "  SELECT 1 FROM %s.%s d "
+		    "  WHERE %s AND d._op IN ('U', 'D')"
+		    ") "
+		    "UNION ALL "
+		    "SELECT %s FROM %s.%s WHERE _op IN ('I', 'U')",
+		    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
+		    ScenarioManager::QuoteIdentifier(view_name).c_str(),
+		    base_column_list.c_str(),
+		    ScenarioManager::QuoteIdentifier(base_table_name).c_str(),
+		    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
+		    ScenarioManager::QuoteIdentifier(delta_table).c_str(),
+		    join_condition.c_str(),
+		    column_list.c_str(),
+		    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
+		    ScenarioManager::QuoteIdentifier(delta_table).c_str());
+	}
+
+	auto create_result = con.Query(view_sql);
+	if (create_result->HasError()) {
+		throw InvalidInputException("Failed to create merge view: %s", create_result->GetError().c_str());
+	}
+
+	return true;
+}
+
+bool DeltaStorageEngine::DropMergeView(ClientContext &context, const string &scenario_schema,
+                                       const string &table_name) {
+	Connection con(context.db->GetDatabase(context));
+
+	string view_name = GetMergeViewName(table_name);
+	auto drop_result = con.Query(StringUtil::Format(
+	    "DROP VIEW IF EXISTS %s.%s",
+	    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
+	    ScenarioManager::QuoteIdentifier(view_name).c_str()));
+
+	if (drop_result->HasError()) {
+		throw InvalidInputException("Failed to drop merge view: %s", drop_result->GetError().c_str());
+	}
+
+	return true;
+}
+
 //===--------------------------------------------------------------------===//
 // delta_create Scalar Function
 //===--------------------------------------------------------------------===//
@@ -220,6 +335,26 @@ static void DeltaCreateFunction(DataChunk &args, ExpressionState &state, Vector 
 	// Create the delta table
 	bool success = DeltaStorageEngine::CreateDeltaTable(context, schema_name, table_name);
 
+	// Get PK columns for the merge view
+	Connection con(context.db->GetDatabase(context));
+	auto pk_result = con.Query(StringUtil::Format(
+	    "SELECT kcu.column_name "
+	    "FROM information_schema.table_constraints tc "
+	    "JOIN information_schema.key_column_usage kcu "
+	    "  ON tc.constraint_name = kcu.constraint_name "
+	    "WHERE tc.table_schema = 'main' AND tc.table_name = '%s' "
+	    "  AND tc.constraint_type = 'PRIMARY KEY' "
+	    "ORDER BY kcu.ordinal_position",
+	    ScenarioManager::EscapeSQLString(table_name).c_str()));
+
+	vector<string> pk_columns;
+	for (idx_t i = 0; i < pk_result->RowCount(); i++) {
+		pk_columns.push_back(pk_result->GetValue(0, i).ToString());
+	}
+
+	// Create the merge-on-read view
+	DeltaStorageEngine::CreateMergeView(context, schema_name, table_name, pk_columns);
+
 	result.SetValue(0, Value::BOOLEAN(success));
 }
 
@@ -319,9 +454,16 @@ static void DeltaDropFunction(DataChunk &args, ExpressionState &state, Vector &r
 		throw InvalidInputException("Delta table for '%s' does not exist in scenario '%s'", table_name, scenario_name);
 	}
 
+	// Drop the merge view first (it depends on the delta table)
+	DeltaStorageEngine::DropMergeView(context, schema_name, table_name);
+
+	// Drop the delta table
 	Connection con(context.db->GetDatabase(context));
 	string delta_name = DeltaStorageEngine::GetDeltaTableName(table_name);
-	auto drop_result = con.Query(StringUtil::Format("DROP TABLE %s.%s", schema_name.c_str(), delta_name.c_str()));
+	auto drop_result = con.Query(StringUtil::Format(
+	    "DROP TABLE %s.%s",
+	    ScenarioManager::QuoteIdentifier(schema_name).c_str(),
+	    ScenarioManager::QuoteIdentifier(delta_name).c_str()));
 
 	if (drop_result->HasError()) {
 		throw InvalidInputException("Failed to drop delta table: %s", drop_result->GetError().c_str());
