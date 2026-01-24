@@ -1,0 +1,195 @@
+# name: test/sql/scenario_constraints.test
+# description: Test constraint inheritance and enforcement in scenarios
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# ===== Setup =====
+
+# Create table with various constraints
+statement ok
+CREATE TABLE constrained_products (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    price DECIMAL(10,2) NOT NULL CHECK (price > 0),
+    quantity INTEGER DEFAULT 0 CHECK (quantity >= 0),
+    status VARCHAR CHECK (status IN ('active', 'discontinued', 'pending'))
+);
+
+statement ok
+INSERT INTO constrained_products VALUES
+    (1, 'Widget', 9.99, 100, 'active'),
+    (2, 'Gadget', 19.99, 50, 'active'),
+    (3, 'Thingamajig', 29.99, 25, 'pending');
+
+# Create scenario
+query T
+SELECT scenario_create('constraint_test', 'Testing constraint inheritance');
+----
+true
+
+query T
+SELECT delta_create('constraint_test', 'constrained_products');
+----
+true
+
+# ===== Test 1: NOT NULL constraint inherited =====
+
+# Inserting NULL into NOT NULL column should fail
+statement error
+INSERT INTO _scen_constraint_test._delta_constrained_products (_op, id, name, price)
+VALUES ('I', 10, NULL, 9.99);
+----
+NOT NULL
+
+# ===== Test 2: CHECK constraint inherited (price > 0) =====
+
+# Inserting negative price should fail
+statement error
+INSERT INTO _scen_constraint_test._delta_constrained_products (_op, id, name, price, quantity, status)
+VALUES ('I', 10, 'BadProduct', -5.00, 10, 'active');
+----
+CHECK
+
+# ===== Test 3: CHECK constraint inherited (quantity >= 0) =====
+
+# Inserting negative quantity should fail
+statement error
+INSERT INTO _scen_constraint_test._delta_constrained_products (_op, id, name, price, quantity, status)
+VALUES ('I', 10, 'BadProduct', 9.99, -5, 'active');
+----
+CHECK
+
+# ===== Test 4: CHECK constraint inherited (status enum) =====
+
+# Inserting invalid status should fail
+statement error
+INSERT INTO _scen_constraint_test._delta_constrained_products (_op, id, name, price, quantity, status)
+VALUES ('I', 10, 'BadProduct', 9.99, 10, 'invalid_status');
+----
+CHECK
+
+# ===== Test 5: Valid insert succeeds =====
+
+statement ok
+INSERT INTO _scen_constraint_test._delta_constrained_products (_op, id, name, price, quantity, status)
+VALUES ('I', 10, 'NewProduct', 49.99, 10, 'active');
+
+query ITRII
+SELECT id, name, price, quantity, status FROM _scen_constraint_test.constrained_products
+WHERE id = 10;
+----
+10	NewProduct	49.99	10	active
+
+# ===== Test 6: Valid update succeeds =====
+
+statement ok
+INSERT INTO _scen_constraint_test._delta_constrained_products (_op, id, name, price, quantity, status)
+VALUES ('U', 1, 'Widget Pro', 14.99, 100, 'active');
+
+query ITR
+SELECT id, name, price FROM _scen_constraint_test.constrained_products
+WHERE id = 1;
+----
+1	Widget Pro	14.99
+
+# ===== Test 7: Update violating CHECK fails =====
+
+statement error
+INSERT INTO _scen_constraint_test._delta_constrained_products (_op, id, name, price, quantity, status)
+VALUES ('U', 2, 'Gadget', 0.00, 50, 'active');
+----
+CHECK
+
+# ===== Test 8: scenario_write respects constraints =====
+
+# scenario_write with invalid price should fail
+statement error
+SELECT scenario_write('constraint_test', 'constrained_products', 'I',
+    {id: 20, name: 'BadProduct', price: -10.00, quantity: 5, status: 'active'});
+----
+CHECK
+
+# scenario_write with valid data should succeed
+query T
+SELECT scenario_write('constraint_test', 'constrained_products', 'I',
+    {id: 20, name: 'GoodProduct', price: 29.99, quantity: 5, status: 'active'});
+----
+true
+
+# ===== Test 9: PK uniqueness - cannot insert duplicate in delta =====
+
+# Direct duplicate insert in delta should fail (delta table has PK)
+statement error
+INSERT INTO _scen_constraint_test._delta_constrained_products (_op, id, name, price, quantity, status)
+VALUES ('I', 10, 'DuplicateProduct', 9.99, 5, 'active');
+----
+primary key constraint
+
+# ===== Cleanup =====
+
+query T
+SELECT scenario_drop('constraint_test');
+----
+true
+
+statement ok
+DROP TABLE constrained_products;
+
+# ===== Test 10: Table with compound PK and constraints =====
+
+statement ok
+CREATE TABLE order_items (
+    order_id INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    quantity INTEGER NOT NULL CHECK (quantity > 0),
+    unit_price DECIMAL(10,2) NOT NULL CHECK (unit_price >= 0),
+    PRIMARY KEY (order_id, product_id)
+);
+
+statement ok
+INSERT INTO order_items VALUES (1, 100, 5, 9.99), (1, 101, 3, 19.99), (2, 100, 2, 9.99);
+
+query T
+SELECT scenario_create('compound_pk_test', 'Testing compound PK constraints');
+----
+true
+
+query T
+SELECT delta_create('compound_pk_test', 'order_items');
+----
+true
+
+# NOT NULL on compound PK columns
+statement error
+INSERT INTO _scen_compound_pk_test._delta_order_items (_op, order_id, product_id, quantity, unit_price)
+VALUES ('I', NULL, 102, 1, 5.99);
+----
+NOT NULL
+
+# CHECK constraint on quantity
+statement error
+INSERT INTO _scen_compound_pk_test._delta_order_items (_op, order_id, product_id, quantity, unit_price)
+VALUES ('I', 3, 100, 0, 5.99);
+----
+CHECK
+
+# Valid insert with compound PK
+statement ok
+INSERT INTO _scen_compound_pk_test._delta_order_items (_op, order_id, product_id, quantity, unit_price)
+VALUES ('I', 3, 100, 10, 5.99);
+
+query IIII
+SELECT order_id, product_id, quantity, unit_price FROM _scen_compound_pk_test.order_items
+WHERE order_id = 3;
+----
+3	100	10	5.99
+
+# Cleanup
+query T
+SELECT scenario_drop('compound_pk_test');
+----
+true
+
+statement ok
+DROP TABLE order_items;

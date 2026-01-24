@@ -64,6 +64,20 @@ bool DeltaStorageEngine::CreateDeltaTable(ClientContext &context, const string &
 	column_defs.push_back("_ts TIMESTAMP DEFAULT current_timestamp");
 	column_defs.push_back("_version INTEGER DEFAULT 1");
 
+	// Get CHECK constraints from base table
+	// DuckDB stores check constraints in duckdb_constraints
+	auto check_result = con.Query(StringUtil::Format(
+	    "SELECT constraint_text FROM duckdb_constraints() "
+	    "WHERE schema_name = 'main' AND table_name = '%s' "
+	    "AND constraint_type = 'CHECK'",
+	    base_table_name.c_str()));
+
+	vector<string> check_constraints;
+	for (idx_t i = 0; i < check_result->RowCount(); i++) {
+		string constraint_text = check_result->GetValue(0, i).ToString();
+		check_constraints.push_back(constraint_text);
+	}
+
 	// Add all columns from base table
 	for (idx_t i = 0; i < columns_result->RowCount(); i++) {
 		string col_name = columns_result->GetValue(0, i).ToString();
@@ -73,7 +87,7 @@ bool DeltaStorageEngine::CreateDeltaTable(ClientContext &context, const string &
 
 		string col_def = col_name + " " + data_type;
 
-		// For PK columns, enforce NOT NULL
+		// For PK columns or NOT NULL columns, enforce NOT NULL
 		bool is_pk = std::find(pk_columns.begin(), pk_columns.end(), col_name) != pk_columns.end();
 		if (is_pk || is_nullable == "NO") {
 			col_def += " NOT NULL";
@@ -84,6 +98,12 @@ bool DeltaStorageEngine::CreateDeltaTable(ClientContext &context, const string &
 
 	// Add CHECK constraint for _op
 	column_defs.push_back("CHECK (_op IN ('I', 'U', 'D'))");
+
+	// Add CHECK constraints from base table
+	for (const auto &check : check_constraints) {
+		// constraint_text already includes "CHECK(...)" format
+		column_defs.push_back(check);
+	}
 
 	// Add primary key constraint if base table has one
 	// Delta table PK includes _op to allow multiple versions (Insert, then Update, etc.)

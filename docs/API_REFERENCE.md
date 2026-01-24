@@ -292,7 +292,15 @@ The created delta table (`_delta_<tablename>`) contains:
 - `_op VARCHAR NOT NULL` - Operation type: 'I' (insert), 'U' (update), 'D' (delete)
 - `_ts TIMESTAMP` - Timestamp of the modification
 - `_version INTEGER` - Version counter (default: 1)
-- All columns from the base table with same types and constraints
+- All columns from the base table with same types
+
+**Constraint Inheritance:**
+Delta tables inherit the following constraints from the base table:
+- **NOT NULL**: All NOT NULL columns remain NOT NULL in the delta table
+- **CHECK constraints**: All CHECK constraints are copied to the delta table
+- **PRIMARY KEY**: The delta table uses the same primary key as the base table
+
+This ensures data integrity is maintained within scenarios. Inserting invalid data into a delta table will fail with appropriate constraint violation errors.
 
 **Errors:**
 - `Scenario '%s' does not exist` - No scenario with this name exists
