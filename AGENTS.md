@@ -55,6 +55,7 @@ Track work in beads (`bd`) for cross-session persistence:
 - **Epics:** Map to requirement categories (6 epics)
 - **Tasks:** Individual functions or features within an epic
 - **Dependencies:** Tasks blocked until prerequisites complete
+- **Documentation Tasks:** Every implementation task requires companion doc tasks (API_REFERENCE.md, docs/spec/)
 
 ### Git Worktrees for Parallelism
 
@@ -135,10 +136,16 @@ GEN=ninja make && make test
 # 7. Verify tests still pass
 GEN=ninja make && make test
 
-# 8. Close task
+# 8. Update docs/API_REFERENCE.md if user-facing function
+# Document: function name, parameters, return type, examples
+
+# 9. Update docs/spec/ if architecture changed
+# Keep architecture documentation in sync with implementation
+
+# 10. Close task
 bd close <task-id>
 
-# 9. Sync beads
+# 11. Sync beads
 bd sync
 ```
 
@@ -283,6 +290,16 @@ vcpkg.json                        # Dependencies (currently OpenSSL)
 Makefile                          # Build orchestration
 ```
 
+### Documentation Structure
+
+```
+docs/
+  API_REFERENCE.md                # User-facing SQL API (MUST update per function)
+  spec/                           # Architecture docs (MUST consult before implementing)
+  features/requirements.md        # Requirements specification
+  features/design.md              # High-level design
+```
+
 ---
 
 ## Beads Quick Reference
@@ -297,12 +314,17 @@ bd show <id>                      # Detailed issue view
 
 ### Creating Work
 
+Before creating tasks, consult `docs/spec/` for architecture guidance. Each epic should include documentation tasks for `docs/API_REFERENCE.md` (user-facing API) and `docs/spec/` (architecture updates).
+
 ```bash
 # Create epic
 bd create --title="Scenario Lifecycle" --type=epic --priority=0
 
 # Create task within epic context
 bd create --title="Implement scenario_create" --type=task --priority=1
+
+# Create companion documentation task
+bd create --title="Document scenario_create in API_REFERENCE.md" --type=task --priority=2
 
 # Add dependency (task depends on another)
 bd dep add <task-id> <depends-on-id>
@@ -475,6 +497,7 @@ CREATE TABLE _scenario_protocols (
 1. **Gather context:** Error messages, relevant code, what you tried
 2. **Check logging:** Enable debug logs and analyze output
 3. **Consult references:**
+   - `docs/spec/` - Architecture documentation (consult before implementation)
    - `docs/features/requirements.md` - What should happen
    - `docs/features/design.md` - How it should work
    - DuckDB source: `duckdb/src/include/duckdb/`
@@ -493,6 +516,8 @@ CREATE TABLE _scenario_protocols (
 
 ## References
 
+- **Architecture:** `docs/spec/` - Consult before implementation decisions
+- **API Reference:** `docs/API_REFERENCE.md` - Update per user-facing function
 - **Requirements:** `docs/features/requirements.md`
 - **Design:** `docs/features/design.md`
 - **DuckDB Extension Template:** https://github.com/duckdb/extension-template
