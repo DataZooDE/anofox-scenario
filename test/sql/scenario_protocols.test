@@ -1,0 +1,95 @@
+# name: test/sql/scenario_protocols.test
+# description: Test protocol management operations
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# Setup: Create a scenario for testing protocols
+query T
+SELECT scenario_create('protocol_test', 'Scenario for protocol testing');
+----
+true
+
+# Test: Set the "why" protocol for a scenario
+query T
+SELECT protocol_set_why('protocol_test', 'Testing new pricing strategy for Q2');
+----
+true
+
+# Verify the protocol was stored
+query TTTT
+SELECT entity_type, entity_name, section, content FROM _scenario_protocols WHERE entity_name = 'protocol_test';
+----
+scenario	protocol_test	why	Testing new pricing strategy for Q2
+
+# Test: Update the "why" protocol (should replace existing)
+query T
+SELECT protocol_set_why('protocol_test', 'Updated reason: Exploring cost reduction options');
+----
+true
+
+# Verify the protocol was updated (not duplicated)
+query I
+SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'why';
+----
+1
+
+# Verify the content was updated
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'why';
+----
+Updated reason: Exploring cost reduction options
+
+# Test: protocol_set_why with non-existent scenario
+statement error
+SELECT protocol_set_why('nonexistent_scenario', 'This should fail');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Test: protocol_set_why with text containing single quotes
+query T
+SELECT protocol_set_why('protocol_test', 'Testing what''s possible with "special" characters');
+----
+true
+
+# Verify special characters stored correctly
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'why';
+----
+Testing what's possible with "special" characters
+
+# Test: protocol_set_why with empty string
+query T
+SELECT protocol_set_why('protocol_test', '');
+----
+true
+
+# Verify empty string stored
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'why';
+----
+(empty)
+
+# Test: Set a meaningful why again for final verification
+query T
+SELECT protocol_set_why('protocol_test', 'Final test: documenting the purpose of this scenario');
+----
+true
+
+# Verify updated_at is set (just check it's not null)
+query I
+SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND updated_at IS NOT NULL;
+----
+1
+
+# Cleanup: Drop the test scenario
+query T
+SELECT scenario_drop('protocol_test');
+----
+true
+
+# Verify scenario was dropped (protocol entry remains - orphaned but harmless)
+query I
+SELECT COUNT(*) FROM _scenario_registry WHERE scenario_name = 'protocol_test';
+----
+0

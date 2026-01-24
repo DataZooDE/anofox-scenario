@@ -6,18 +6,6 @@ Version 0.1-DRAFT | January 2026 | DataZoo GmbH
 
 ---
 
-## **Document Information**
-
-| Field | Value |
-| ----- | ----- |
-| Version | 0.1-DRAFT |
-| Date | 2026-01-16 |
-| Status | In Review |
-| Requirements Reference | anofox-scenario Requirements Specification v0.1 |
-| DuckDB Target Version | v1.4.3 |
-
----
-
 ## **1\. Executive Summary**
 
 This document defines the technical architecture for anofox-scenario, a DuckDB extension that enables Git-like branching for analytical databases. The architecture implements copy-on-write (COW) storage with delta-based row versioning, enabling what-if analysis for S\&OP and demand planning workflows.

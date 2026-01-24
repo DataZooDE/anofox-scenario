@@ -1,0 +1,12 @@
+# name: test/sql/anofox_scenario_load.test
+# description: Test anofox_scenario extension loads correctly
+# group: [anofox_scenario]
+
+# Require statement will ensure this test is run with this extension loaded
+require anofox_scenario
+
+# Confirm the extension is loaded by checking it appears in duckdb_extensions
+query I
+SELECT installed FROM duckdb_extensions() WHERE extension_name = 'anofox_scenario';
+----
+true

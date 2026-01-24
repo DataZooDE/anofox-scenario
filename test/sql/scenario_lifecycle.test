@@ -1,0 +1,219 @@
+# name: test/sql/scenario_lifecycle.test
+# description: Test scenario lifecycle operations
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# Setup: Create a test table in main schema
+statement ok
+CREATE TABLE test_data (id INTEGER PRIMARY KEY, value VARCHAR);
+
+statement ok
+INSERT INTO test_data VALUES (1, 'hello'), (2, 'world');
+
+# Test: Create a scenario
+query T
+SELECT scenario_create('test_scenario', 'A test scenario for what-if analysis');
+----
+true
+
+# Verify scenario exists in registry
+query TTT
+SELECT scenario_name, status, description FROM _scenario_registry WHERE scenario_name = 'test_scenario';
+----
+test_scenario	active	A test scenario for what-if analysis
+
+# Verify schema was created with default prefix
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_test_scenario';
+----
+1
+
+# Test: Cannot create scenario with existing name
+statement error
+SELECT scenario_create('test_scenario', 'Duplicate');
+----
+Scenario 'test_scenario' already exists
+
+# Test: Cannot create scenario with invalid name (spaces)
+statement error
+SELECT scenario_create('invalid name', 'Has spaces');
+----
+Invalid scenario name
+
+# Test: Cannot create scenario with invalid name (special chars)
+statement error
+SELECT scenario_create('invalid-name', 'Has dashes');
+----
+Invalid scenario name
+
+# Test: Cannot create scenario with name too long (>63 chars)
+statement error
+SELECT scenario_create('this_name_is_way_too_long_and_exceeds_the_maximum_allowed_length_of_63_characters', 'Too long');
+----
+Invalid scenario name
+
+# Test: Can create scenario with underscore
+query T
+SELECT scenario_create('valid_name_2', 'Valid name with underscore and number');
+----
+true
+
+# Cleanup for other tests
+query T
+SELECT scenario_drop('valid_name_2');
+----
+true
+
+query T
+SELECT scenario_drop('test_scenario');
+----
+true
+
+# Verify scenario was dropped
+query I
+SELECT COUNT(*) FROM _scenario_registry WHERE scenario_name = 'test_scenario';
+----
+0
+
+# Verify schema was dropped
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_test_scenario';
+----
+0
+
+# Test: Cannot drop non-existent scenario
+statement error
+SELECT scenario_drop('nonexistent');
+----
+Scenario 'nonexistent' does not exist
+
+# Test: Create with just name (no description)
+query T
+SELECT scenario_create('simple_scenario');
+----
+true
+
+# Verify null description
+query T
+SELECT description FROM _scenario_registry WHERE scenario_name = 'simple_scenario';
+----
+NULL
+
+# Cleanup
+query T
+SELECT scenario_drop('simple_scenario');
+----
+true
+
+# ===== scenario_list Tests =====
+
+# Test: Create multiple scenarios and list them
+query T
+SELECT scenario_create('list_test_a', 'First for list test');
+----
+true
+
+query T
+SELECT scenario_create('list_test_b', 'Second for list test');
+----
+true
+
+# Verify scenario_list returns all scenarios
+query TT
+SELECT scenario_name, description FROM scenario_list() ORDER BY scenario_name;
+----
+list_test_a	First for list test
+list_test_b	Second for list test
+
+# Verify scenario_list returns correct columns
+query TTTTTT
+SELECT scenario_name, status, description, typeof(created_at), base_schema, parent_scenario
+FROM scenario_list() WHERE scenario_name = 'list_test_a';
+----
+list_test_a	active	First for list test	TIMESTAMP	main	NULL
+
+# Cleanup list test scenarios
+query T
+SELECT scenario_drop('list_test_a');
+----
+true
+
+query T
+SELECT scenario_drop('list_test_b');
+----
+true
+
+# Verify empty list after cleanup
+query I
+SELECT COUNT(*) FROM scenario_list();
+----
+0
+
+# ===== Table Registration Tests (Task 1.3) =====
+
+# Setup: Create tables with various configurations
+statement ok
+CREATE TABLE reg_products (id INTEGER PRIMARY KEY, name VARCHAR, price DECIMAL(10,2));
+
+statement ok
+CREATE TABLE reg_orders (order_id INTEGER PRIMARY KEY, product_id INTEGER);
+
+statement ok
+CREATE TABLE reg_no_pk (col1 VARCHAR, col2 INTEGER);
+
+statement ok
+INSERT INTO reg_products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99), (3, 'Thingamajig', 29.99);
+
+statement ok
+INSERT INTO reg_orders VALUES (100, 1), (101, 2);
+
+statement ok
+INSERT INTO reg_no_pk VALUES ('a', 1), ('b', 2);
+
+# Create scenario (should register all tables)
+query T
+SELECT scenario_create('table_reg_test', 'Test table registration');
+----
+true
+
+# Verify tables were registered with correct metadata (filter to reg_* tables)
+query TIT
+SELECT table_name, base_row_count, has_primary_key FROM _scenario_tables WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'table_reg_test') AND table_name LIKE 'reg_%' ORDER BY table_name;
+----
+reg_no_pk	2	false
+reg_orders	2	true
+reg_products	3	true
+
+# Verify primary key columns were captured (filter to reg_* tables)
+query TT
+SELECT table_name, primary_key_columns FROM _scenario_tables WHERE has_primary_key = true AND scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'table_reg_test') AND table_name LIKE 'reg_%' ORDER BY table_name;
+----
+reg_orders	[order_id]
+reg_products	[id]
+
+# Verify rowids were captured for tables with data
+query I
+SELECT COUNT(*) FROM _scenario_base_rowids WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'table_reg_test') AND table_name = 'reg_products';
+----
+3
+
+query I
+SELECT COUNT(*) FROM _scenario_base_rowids WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'table_reg_test') AND table_name = 'reg_orders';
+----
+2
+
+# Cleanup
+query T
+SELECT scenario_drop('table_reg_test');
+----
+true
+
+statement ok
+DROP TABLE reg_products;
+
+statement ok
+DROP TABLE reg_orders;
+
+statement ok
+DROP TABLE reg_no_pk;

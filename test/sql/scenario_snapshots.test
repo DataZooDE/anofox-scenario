@@ -1,0 +1,101 @@
+# name: test/sql/scenario_snapshots.test
+# description: Test snapshot management operations
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# Setup: Create a scenario to snapshot
+statement ok
+CREATE TABLE test_data (id INTEGER PRIMARY KEY, value VARCHAR);
+
+statement ok
+INSERT INTO test_data VALUES (1, 'hello'), (2, 'world');
+
+query T
+SELECT scenario_create('snapshot_test_scenario', 'Scenario for snapshot testing');
+----
+true
+
+# Test: Create a snapshot with description
+query T
+SELECT snapshot_create('snapshot_test_scenario', 'test_snapshot', 'A test snapshot');
+----
+true
+
+# Verify snapshot exists in registry
+query TTT
+SELECT snapshot_name, source_schema, description FROM _scenario_snapshots WHERE snapshot_name = 'test_snapshot';
+----
+test_snapshot	_scen_snapshot_test_scenario	A test snapshot
+
+# Test: Cannot create snapshot with existing name
+statement error
+SELECT snapshot_create('snapshot_test_scenario', 'test_snapshot', 'Duplicate');
+----
+Snapshot 'test_snapshot' already exists
+
+# Test: Cannot create snapshot for non-existent scenario
+statement error
+SELECT snapshot_create('nonexistent_scenario', 'new_snapshot', 'Should fail');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Test: Cannot create snapshot with invalid name (spaces)
+statement error
+SELECT snapshot_create('snapshot_test_scenario', 'invalid name', 'Has spaces');
+----
+Invalid snapshot name
+
+# Test: Cannot create snapshot with invalid name (special chars)
+statement error
+SELECT snapshot_create('snapshot_test_scenario', 'invalid-name', 'Has dashes');
+----
+Invalid snapshot name
+
+# Test: Cannot create snapshot with name too long (>63 chars)
+statement error
+SELECT snapshot_create('snapshot_test_scenario', 'this_name_is_way_too_long_and_exceeds_the_maximum_allowed_length_of_63_characters', 'Too long');
+----
+Invalid snapshot name
+
+# Test: Cannot create snapshot with name starting with digit
+statement error
+SELECT snapshot_create('snapshot_test_scenario', '1invalid', 'Starts with digit');
+----
+Invalid snapshot name
+
+# Test: Create snapshot without description
+query T
+SELECT snapshot_create('snapshot_test_scenario', 'simple_snapshot');
+----
+true
+
+# Verify null description
+query T
+SELECT description FROM _scenario_snapshots WHERE snapshot_name = 'simple_snapshot';
+----
+NULL
+
+# Test: Create snapshot with underscore in name
+query T
+SELECT snapshot_create('snapshot_test_scenario', 'valid_name_2');
+----
+true
+
+# Verify snapshot was created
+query I
+SELECT COUNT(*) FROM _scenario_snapshots WHERE snapshot_name = 'valid_name_2';
+----
+1
+
+# Cleanup: Drop the scenario (snapshots remain as historical records)
+query T
+SELECT scenario_drop('snapshot_test_scenario');
+----
+true
+
+# Verify snapshots still exist after scenario drop (they reference source_schema, not scenario_id)
+query I
+SELECT COUNT(*) FROM _scenario_snapshots WHERE snapshot_name IN ('test_snapshot', 'simple_snapshot', 'valid_name_2');
+----
+3
