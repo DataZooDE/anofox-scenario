@@ -6,6 +6,7 @@
 #include "snapshot_manager.hpp"
 #include "protocol_manager.hpp"
 #include "delta_storage_engine.hpp"
+#include "comparison_engine.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -30,6 +31,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register delta storage engine functions
 	DeltaStorageEngine::RegisterFunctions(loader);
+
+	// Register comparison engine functions
+	ComparisonEngine::RegisterFunctions(loader);
 }
 
 void AnofoxScenarioExtension::Load(ExtensionLoader &loader) {

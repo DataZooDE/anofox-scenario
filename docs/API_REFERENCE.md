@@ -288,6 +288,112 @@ SELECT delta_drop('pricing_analysis', 'products');
 
 ---
 
+### scenario_write
+
+Writes a row modification (insert, update, or delete) to a scenario's delta table. This is a helper function for programmatic scenario modifications.
+
+**Syntax:**
+```sql
+SELECT scenario_write(scenario_name, table_name, operation, row_data);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario |
+| table_name | VARCHAR | Name of the base table |
+| operation | VARCHAR | 'I' (insert), 'U' (update), or 'D' (delete) |
+| row_data | STRUCT | A struct containing column name/value pairs |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Insert a new row
+SELECT scenario_write('pricing_analysis', 'products', 'I',
+    {id: 100, name: 'New Product', price: 49.99});
+
+-- Update an existing row
+SELECT scenario_write('pricing_analysis', 'products', 'U',
+    {id: 1, name: 'Updated Name', price: 59.99});
+
+-- Delete a row
+SELECT scenario_write('pricing_analysis', 'products', 'D',
+    {id: 2, name: 'Old Product', price: 29.99});
+```
+
+**Notes:**
+- A delta table must already exist for the table (use `delta_create` first)
+- The row_data struct should include all columns, especially primary key columns
+- Changes are visible through the merge-on-read view in the scenario's schema
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name exists
+- `Operation must be 'I', 'U', or 'D'` - Invalid operation type
+
+---
+
+## Comparison Functions
+
+### scenario_compare
+
+Compares a table between a scenario and its base state, returning row-level differences.
+
+**Syntax:**
+```sql
+SELECT * FROM scenario_compare(scenario_name, table_name);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario to compare |
+| table_name | VARCHAR | Name of the table to compare |
+
+**Returns:** Table with columns:
+| Column | Type | Description |
+|--------|------|-------------|
+| diff_type | VARCHAR | Type of change: 'added', 'removed', or 'changed' |
+| <pk_columns> | varies | Primary key column(s) identifying the row |
+| column_name | VARCHAR | Name of changed column (NULL for added/removed) |
+| old_value | VARCHAR | Value in base table (NULL for added rows) |
+| new_value | VARCHAR | Value in scenario (NULL for removed rows) |
+
+**Example:**
+```sql
+-- Create scenario and make changes
+SELECT scenario_create('pricing_test', 'Price change analysis');
+SELECT delta_create('pricing_test', 'products');
+
+-- Make modifications
+INSERT INTO _scen_pricing_test._delta_products (_op, id, name, price) VALUES ('I', 100, 'New Product', 49.99);
+INSERT INTO _scen_pricing_test._delta_products (_op, id, name, price) VALUES ('U', 1, 'Widget Pro', 14.99);
+INSERT INTO _scen_pricing_test._delta_products (_op, id, name, price) VALUES ('D', 5, 'Discontinued', 9.99);
+
+-- Compare to see all changes
+SELECT * FROM scenario_compare('pricing_test', 'products');
+-- Returns:
+-- diff_type | id  | column_name | old_value | new_value
+-- added     | 100 | NULL        | NULL      | NULL
+-- changed   | 1   | name        | Widget    | Widget Pro
+-- changed   | 1   | price       | 9.99      | 14.99
+-- removed   | 5   | NULL        | NULL      | NULL
+```
+
+**Notes:**
+- For 'added' rows: one row per PK, column_name/old_value/new_value are NULL
+- For 'removed' rows: one row per PK, column_name/old_value/new_value are NULL
+- For 'changed' rows: one row per changed column with old/new values
+- Unchanged rows are excluded from output
+- Supports compound primary keys (multiple PK columns in output)
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name
+- `Base table '%s' does not exist in main schema` - Table not found
+- `Delta table for '%s' does not exist in scenario '%s'` - No delta created
+
+---
+
 ## Metadata Tables
 
 ### _scenario_registry

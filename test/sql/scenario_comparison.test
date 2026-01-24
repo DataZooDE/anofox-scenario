@@ -1,0 +1,143 @@
+# name: test/sql/scenario_comparison.test
+# description: Test scenario comparison functionality
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# ===== Setup =====
+
+statement ok
+CREATE TABLE products (id INTEGER PRIMARY KEY, name VARCHAR, price DECIMAL(10,2));
+
+statement ok
+INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99), (3, 'Thingamajig', 29.99);
+
+# Create a scenario with delta table
+query T
+SELECT scenario_create('compare_test', 'Testing scenario comparison');
+----
+true
+
+query T
+SELECT delta_create('compare_test', 'products');
+----
+true
+
+# ===== Test 1: No differences initially =====
+
+# Verify compare returns empty when no changes
+query I
+SELECT COUNT(*) FROM scenario_compare('compare_test', 'products');
+----
+0
+
+# ===== Test 2: Added rows =====
+
+# Insert a new row
+statement ok
+INSERT INTO _scen_compare_test._delta_products (_op, id, name, price) VALUES ('I', 4, 'NewProduct', 39.99);
+
+# Compare should show added row
+query TITTT
+SELECT diff_type, id, column_name, old_value, new_value FROM scenario_compare('compare_test', 'products') ORDER BY id;
+----
+added	4	NULL	NULL	NULL
+
+# ===== Test 3: Removed rows =====
+
+# Delete a row
+statement ok
+INSERT INTO _scen_compare_test._delta_products (_op, id, name, price) VALUES ('D', 1, 'Widget', 9.99);
+
+# Compare should show removed row
+query TITTT
+SELECT diff_type, id, column_name, old_value, new_value FROM scenario_compare('compare_test', 'products')
+WHERE diff_type = 'removed' ORDER BY id;
+----
+removed	1	NULL	NULL	NULL
+
+# ===== Test 4: Changed rows =====
+
+# Update a row
+statement ok
+INSERT INTO _scen_compare_test._delta_products (_op, id, name, price) VALUES ('U', 2, 'UpdatedGadget', 24.99);
+
+# Compare should show changed columns
+query TITTT
+SELECT diff_type, id, column_name, old_value, new_value FROM scenario_compare('compare_test', 'products')
+WHERE diff_type = 'changed' ORDER BY id, column_name;
+----
+changed	2	name	Gadget	UpdatedGadget
+changed	2	price	19.99	24.99
+
+# ===== Test 5: Full comparison output =====
+
+query TITTT
+SELECT diff_type, id, column_name, old_value, new_value FROM scenario_compare('compare_test', 'products')
+ORDER BY diff_type, id, column_name;
+----
+added	4	NULL	NULL	NULL
+changed	2	name	Gadget	UpdatedGadget
+changed	2	price	19.99	24.99
+removed	1	NULL	NULL	NULL
+
+# ===== Test 6: Error for non-existent scenario =====
+
+statement error
+SELECT * FROM scenario_compare('nonexistent', 'products');
+----
+does not exist
+
+# ===== Test 7: Error for non-existent table =====
+
+statement error
+SELECT * FROM scenario_compare('compare_test', 'nonexistent_table');
+----
+does not exist
+
+# ===== Test 8: Compare with compound primary key =====
+
+statement ok
+CREATE TABLE order_items (order_id INTEGER, product_id INTEGER, quantity INTEGER, PRIMARY KEY (order_id, product_id));
+
+statement ok
+INSERT INTO order_items VALUES (1, 100, 5), (1, 101, 3), (2, 100, 7);
+
+query T
+SELECT delta_create('compare_test', 'order_items');
+----
+true
+
+# Insert new row with compound key
+statement ok
+INSERT INTO _scen_compare_test._delta_order_items (_op, order_id, product_id, quantity) VALUES ('I', 2, 101, 2);
+
+# Delete row with compound key
+statement ok
+INSERT INTO _scen_compare_test._delta_order_items (_op, order_id, product_id, quantity) VALUES ('D', 1, 100, 5);
+
+# Update row with compound key
+statement ok
+INSERT INTO _scen_compare_test._delta_order_items (_op, order_id, product_id, quantity) VALUES ('U', 1, 101, 10);
+
+# Verify compound key comparison
+query TIITTT
+SELECT diff_type, order_id, product_id, column_name, old_value, new_value FROM scenario_compare('compare_test', 'order_items')
+ORDER BY diff_type, order_id, product_id, column_name;
+----
+added	2	101	NULL	NULL	NULL
+changed	1	101	quantity	3	10
+removed	1	100	NULL	NULL	NULL
+
+# ===== Cleanup =====
+
+query T
+SELECT scenario_drop('compare_test');
+----
+true
+
+statement ok
+DROP TABLE products;
+
+statement ok
+DROP TABLE order_items;

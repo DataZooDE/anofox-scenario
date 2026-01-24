@@ -352,6 +352,53 @@ static void DeltaCreateFunction(DataChunk &args, ExpressionState &state, Vector 
 		pk_columns.push_back(pk_result->GetValue(0, i).ToString());
 	}
 
+	// Register table in _scenario_tables if not already registered
+	// This handles tables created after the scenario was created
+	auto check_reg = con.Query(StringUtil::Format(
+	    "SELECT COUNT(*) FROM _scenario_tables st "
+	    "JOIN _scenario_registry sr ON st.scenario_id = sr.scenario_id "
+	    "WHERE sr.scenario_name = '%s' AND st.table_name = '%s'",
+	    ScenarioManager::EscapeSQLString(scenario_name).c_str(),
+	    ScenarioManager::EscapeSQLString(table_name).c_str()));
+
+	if (!check_reg->HasError() && check_reg->GetValue(0, 0).GetValue<int64_t>() == 0) {
+		// Get scenario_id
+		auto id_result = con.Query(StringUtil::Format(
+		    "SELECT scenario_id FROM _scenario_registry WHERE scenario_name = '%s'",
+		    ScenarioManager::EscapeSQLString(scenario_name).c_str()));
+		if (!id_result->HasError() && id_result->RowCount() > 0) {
+			int64_t scenario_id = id_result->GetValue(0, 0).GetValue<int64_t>();
+
+			// Get row count
+			auto count_result = con.Query("SELECT COUNT(*) FROM main." + ScenarioManager::QuoteIdentifier(table_name));
+			int64_t row_count = 0;
+			if (!count_result->HasError() && count_result->RowCount() > 0) {
+				row_count = count_result->GetValue(0, 0).GetValue<int64_t>();
+			}
+
+			// Build PK array string
+			string pk_array;
+			if (pk_columns.empty()) {
+				pk_array = "NULL";
+			} else {
+				pk_array = "[";
+				for (idx_t i = 0; i < pk_columns.size(); i++) {
+					if (i > 0) pk_array += ", ";
+					pk_array += "'" + ScenarioManager::EscapeSQLString(pk_columns[i]) + "'";
+				}
+				pk_array += "]";
+			}
+
+			// Insert into _scenario_tables
+			auto insert_sql = StringUtil::Format(
+			    "INSERT INTO _scenario_tables (scenario_id, table_name, base_row_count, has_primary_key, primary_key_columns) "
+			    "VALUES (%d, '%s', %d, %s, %s)",
+			    scenario_id, ScenarioManager::EscapeSQLString(table_name).c_str(), row_count,
+			    pk_columns.empty() ? "false" : "true", pk_array.c_str());
+			con.Query(insert_sql);
+		}
+	}
+
 	// Create the merge-on-read view
 	DeltaStorageEngine::CreateMergeView(context, schema_name, table_name, pk_columns);
 
@@ -473,6 +520,178 @@ static void DeltaDropFunction(DataChunk &args, ExpressionState &state, Vector &r
 }
 
 //===--------------------------------------------------------------------===//
+// scenario_write: Generic write function for delta tables (Task 2.2 fallback)
+//===--------------------------------------------------------------------===//
+
+struct ScenarioWriteBindData : public FunctionData {
+	string scenario_name;
+	string table_name;
+	string operation; // 'I', 'U', or 'D'
+
+	ScenarioWriteBindData(string scenario, string table, string op)
+	    : scenario_name(std::move(scenario)), table_name(std::move(table)), operation(std::move(op)) {
+	}
+
+	unique_ptr<FunctionData> Copy() const override {
+		return make_uniq<ScenarioWriteBindData>(scenario_name, table_name, operation);
+	}
+
+	bool Equals(const FunctionData &other) const override {
+		auto &o = other.Cast<ScenarioWriteBindData>();
+		return scenario_name == o.scenario_name && table_name == o.table_name && operation == o.operation;
+	}
+};
+
+static unique_ptr<FunctionData> ScenarioWriteBind(ClientContext &context, ScalarFunction &bound_function,
+                                                  vector<unique_ptr<Expression>> &arguments) {
+	if (arguments.size() < 4) {
+		throw InvalidInputException("scenario_write requires scenario_name, table_name, operation, and row_data parameters");
+	}
+
+	string scenario_name, table_name, operation;
+
+	if (arguments[0]->IsFoldable()) {
+		auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[0]);
+		if (val.IsNull()) {
+			throw InvalidInputException("scenario_write requires a non-NULL scenario_name");
+		}
+		scenario_name = val.ToString();
+	}
+
+	if (arguments[1]->IsFoldable()) {
+		auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
+		if (val.IsNull()) {
+			throw InvalidInputException("scenario_write requires a non-NULL table_name");
+		}
+		table_name = val.ToString();
+	}
+
+	if (arguments[2]->IsFoldable()) {
+		auto val = ExpressionExecutor::EvaluateScalar(context, *arguments[2]);
+		if (val.IsNull()) {
+			throw InvalidInputException("scenario_write requires a non-NULL operation ('I', 'U', or 'D')");
+		}
+		operation = val.ToString();
+		if (operation != "I" && operation != "U" && operation != "D") {
+			throw InvalidInputException("scenario_write operation must be 'I' (insert), 'U' (update), or 'D' (delete)");
+		}
+	}
+
+	// Validate scenario exists
+	if (!scenario_name.empty() && !ScenarioManager::ScenarioExists(context, scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", scenario_name);
+	}
+
+	return make_uniq<ScenarioWriteBindData>(scenario_name, table_name, operation);
+}
+
+static void ScenarioWriteFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ScenarioWriteBindData>();
+	auto &context = state.GetContext();
+
+	string scenario_name = bind_data.scenario_name;
+	string table_name = bind_data.table_name;
+	string operation = bind_data.operation;
+
+	// Get runtime values if not bound at compile time
+	if (scenario_name.empty()) {
+		scenario_name = args.data[0].GetValue(0).ToString();
+	}
+	if (table_name.empty()) {
+		table_name = args.data[1].GetValue(0).ToString();
+	}
+	if (operation.empty()) {
+		operation = args.data[2].GetValue(0).ToString();
+	}
+
+	// Get the row data as a struct
+	auto row_data = args.data[3].GetValue(0);
+	if (row_data.IsNull()) {
+		throw InvalidInputException("scenario_write requires non-NULL row_data");
+	}
+
+	// Validate scenario and delta table exist
+	if (!ScenarioManager::ScenarioExists(context, scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", scenario_name);
+	}
+
+	string schema_name = ScenarioManager::GetSchemaName(context, scenario_name);
+
+	if (!DeltaStorageEngine::DeltaTableExists(context, schema_name, table_name)) {
+		throw InvalidInputException("Delta table for '%s' does not exist in scenario '%s'. Call delta_create first.",
+		                            table_name, scenario_name);
+	}
+
+	// Build INSERT statement for delta table
+	Connection con(context.db->GetDatabase(context));
+
+	// Get column names from delta table
+	string delta_table = DeltaStorageEngine::GetDeltaTableName(table_name);
+	auto cols_result = con.Query(StringUtil::Format(
+	    "SELECT column_name FROM information_schema.columns "
+	    "WHERE table_schema = '%s' AND table_name = '%s' "
+	    "AND column_name NOT IN ('_op', '_ts', '_version') "
+	    "ORDER BY ordinal_position",
+	    ScenarioManager::EscapeSQLString(schema_name).c_str(),
+	    ScenarioManager::EscapeSQLString(delta_table).c_str()));
+
+	if (cols_result->RowCount() == 0) {
+		throw InvalidInputException("Could not get column information for delta table");
+	}
+
+	// Extract values from the struct based on column names
+	vector<string> columns;
+	vector<string> values;
+	columns.push_back("_op");
+	values.push_back("'" + operation + "'");
+
+	auto &struct_children = StructValue::GetChildren(row_data);
+	auto &struct_type = row_data.type();
+	auto &child_types = StructType::GetChildTypes(struct_type);
+
+	for (idx_t i = 0; i < cols_result->RowCount(); i++) {
+		string col_name = cols_result->GetValue(0, i).ToString();
+		columns.push_back(ScenarioManager::QuoteIdentifier(col_name));
+
+		// Find the value in the struct
+		bool found = false;
+		for (idx_t j = 0; j < child_types.size(); j++) {
+			if (child_types[j].first == col_name) {
+				auto &val = struct_children[j];
+				if (val.IsNull()) {
+					values.push_back("NULL");
+				} else if (val.type().id() == LogicalTypeId::VARCHAR) {
+					values.push_back("'" + ScenarioManager::EscapeSQLString(val.ToString()) + "'");
+				} else {
+					values.push_back(val.ToString());
+				}
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			values.push_back("NULL");
+		}
+	}
+
+	// Execute INSERT OR REPLACE to handle updates
+	string insert_sql = StringUtil::Format(
+	    "INSERT OR REPLACE INTO %s.%s (%s) VALUES (%s)",
+	    ScenarioManager::QuoteIdentifier(schema_name).c_str(),
+	    ScenarioManager::QuoteIdentifier(delta_table).c_str(),
+	    StringUtil::Join(columns, ", ").c_str(),
+	    StringUtil::Join(values, ", ").c_str());
+
+	auto insert_result = con.Query(insert_sql);
+	if (insert_result->HasError()) {
+		throw InvalidInputException("Failed to write to delta table: %s", insert_result->GetError().c_str());
+	}
+
+	result.SetValue(0, Value::BOOLEAN(true));
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 
@@ -490,6 +709,16 @@ void DeltaStorageEngine::RegisterFunctions(ExtensionLoader &loader) {
 	                          LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                          FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(delta_drop);
+
+	// scenario_write(scenario_name, table_name, operation, row_data) -> BOOLEAN
+	// operation: 'I' for insert, 'U' for update, 'D' for delete
+	// row_data: struct with column values
+	ScalarFunction scenario_write("scenario_write",
+	                              {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY},
+	                              LogicalType::BOOLEAN, ScenarioWriteFunction, ScenarioWriteBind, nullptr, nullptr, nullptr,
+	                              LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
+	                              FunctionNullHandling::SPECIAL_HANDLING);
+	loader.RegisterFunction(scenario_write);
 }
 
 } // namespace duckdb

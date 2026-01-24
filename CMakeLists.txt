@@ -21,6 +21,7 @@ set(EXTENSION_SOURCES
     src/snapshot_manager.cpp
     src/protocol_manager.cpp
     src/delta_storage_engine.cpp
+    src/comparison_engine.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
