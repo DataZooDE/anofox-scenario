@@ -805,6 +805,18 @@ Stores information about scenario snapshots.
 | description | VARCHAR | Optional description |
 | size_bytes | BIGINT | Size of the snapshot (NULL if not computed) |
 
+### _scenario_protocols
+
+Stores protocol documentation for scenarios and snapshots.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| entity_type | VARCHAR | 'scenario' or 'snapshot' |
+| entity_name | VARCHAR | Name of the scenario or snapshot |
+| section | VARCHAR | Protocol section: 'why', 'changes', 'findings', 'plan', 'decision', 'metadata' |
+| content | VARCHAR | Text content for this section |
+| updated_at | TIMESTAMP | When this section was last updated |
+
 ---
 
 ## DDL Restrictions
@@ -845,3 +857,78 @@ Schema modifications would break this pattern and invalidate existing delta data
 - Use `delta_create()` to enable modifications on existing tables
 - Use `delta_drop()` to remove delta tables
 - Use `scenario_drop()` to remove an entire scenario
+
+---
+
+## Protocol Functions
+
+Protocol functions allow embedding documentation within scenarios for audit trails and decision tracking.
+
+### protocol_set_why
+
+Sets or replaces the "why" section of a scenario's protocol, documenting the purpose of the scenario.
+
+**Syntax:**
+```sql
+SELECT protocol_set_why(scenario_name, why_text);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario (required) |
+| why_text | VARCHAR | Text describing why this scenario was created (required) |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Document why the scenario was created
+SELECT protocol_set_why('pricing_analysis', 'Exploring impact of 15% price increase on Q4 revenue');
+
+-- Update the reason later
+SELECT protocol_set_why('pricing_analysis', 'Updated: Now analyzing 10% increase after stakeholder feedback');
+```
+
+**Notes:**
+- Replaces any existing "why" content (not append)
+- Stored in `_scenario_protocols` table with section='why'
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name
+
+---
+
+### protocol_log_change
+
+Appends an entry to the "changes" section of a scenario's protocol, creating an audit trail of modifications.
+
+**Syntax:**
+```sql
+SELECT protocol_log_change(scenario_name, change_text);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario (required) |
+| change_text | VARCHAR | Description of the change being logged (required) |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Log changes as you modify the scenario
+SELECT protocol_log_change('pricing_analysis', 'Increased price by 10% for product category A');
+SELECT protocol_log_change('pricing_analysis', 'Added bulk discount rules for orders > 100 units');
+SELECT protocol_log_change('pricing_analysis', 'Removed discontinued products from analysis');
+```
+
+**Notes:**
+- Appends to existing changes (does not replace)
+- Each entry is separated by a newline
+- Creates the "changes" section if it doesn't exist
+- Useful for creating audit trails of scenario modifications
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name

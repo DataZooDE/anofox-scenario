@@ -82,6 +82,80 @@ SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND
 ----
 1
 
+# ===== Test: protocol_log_change =====
+
+# First change entry
+query T
+SELECT protocol_log_change('protocol_test', 'Increased price by 10% for product A');
+----
+true
+
+# Verify change was logged
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'changes';
+----
+Increased price by 10% for product A
+
+# Second change entry (should append with newline)
+query T
+SELECT protocol_log_change('protocol_test', 'Added discount for bulk orders');
+----
+true
+
+# Verify both changes are present (check length increased from first entry)
+query I
+SELECT LENGTH(content) > 40 FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'changes';
+----
+true
+
+# Verify content contains both entries
+query I
+SELECT content LIKE '%Increased price%' AND content LIKE '%discount for bulk%' FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'changes';
+----
+true
+
+# Third change entry
+query T
+SELECT protocol_log_change('protocol_test', 'Removed discontinued products');
+----
+true
+
+# Verify all three changes present
+query I
+SELECT content LIKE '%Increased price%' AND content LIKE '%discount%' AND content LIKE '%discontinued%' FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'changes';
+----
+true
+
+# Test: protocol_log_change with special characters
+query T
+SELECT protocol_log_change('protocol_test', 'Changed "special" item''s price to $9.99');
+----
+true
+
+# Verify special characters preserved
+query I
+SELECT LENGTH(content) > 100 FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'changes';
+----
+true
+
+# Test: protocol_log_change with non-existent scenario
+statement error
+SELECT protocol_log_change('nonexistent_scenario', 'This should fail');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Verify 'changes' section is separate from 'why' section
+query I
+SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'protocol_test';
+----
+2
+
+query TT
+SELECT section, CASE WHEN LENGTH(content) > 0 THEN 'has content' ELSE 'empty' END FROM _scenario_protocols WHERE entity_name = 'protocol_test' ORDER BY section;
+----
+changes	has content
+why	has content
+
 # Cleanup: Drop the test scenario
 query T
 SELECT scenario_drop('protocol_test');
