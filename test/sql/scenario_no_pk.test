@@ -1,0 +1,181 @@
+# name: test/sql/scenario_no_pk.test
+# description: Test scenario handling for tables without primary keys
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# ===== Setup =====
+
+# Create a table without primary key
+statement ok
+CREATE TABLE no_pk_data (name VARCHAR, value INTEGER, category VARCHAR);
+
+statement ok
+INSERT INTO no_pk_data VALUES
+    ('alpha', 10, 'A'),
+    ('beta', 20, 'B'),
+    ('gamma', 30, 'A'),
+    ('delta', 40, 'B');
+
+# Create scenario
+query T
+SELECT scenario_create('no_pk_test', 'Testing tables without primary keys');
+----
+true
+
+# ===== Test 1: delta_create succeeds for no-PK table =====
+
+query T
+SELECT delta_create('no_pk_test', 'no_pk_data');
+----
+true
+
+# ===== Test 2: Merge view shows base data initially =====
+
+query TIT
+SELECT name, value, category FROM _scen_no_pk_test.no_pk_data ORDER BY name;
+----
+alpha	10	A
+beta	20	B
+delta	40	B
+gamma	30	A
+
+# ===== Test 3: Insert new row works =====
+
+statement ok
+INSERT INTO _scen_no_pk_test._delta_no_pk_data (_op, name, value, category) VALUES ('I', 'epsilon', 50, 'C');
+
+query TIT
+SELECT name, value, category FROM _scen_no_pk_test.no_pk_data ORDER BY name;
+----
+alpha	10	A
+beta	20	B
+delta	40	B
+epsilon	50	C
+gamma	30	A
+
+# ===== Test 4: Update using DELETE + INSERT (required for no-PK tables) =====
+
+# For tables without PK, updates require DELETE (with old values) + INSERT (with new values)
+# because all columns are used as the composite key to identify rows
+
+# Step 1: Delete the old row (must specify exact old values)
+statement ok
+INSERT INTO _scen_no_pk_test._delta_no_pk_data (_op, name, value, category) VALUES ('D', 'beta', 20, 'B');
+
+# Step 2: Insert the new row
+statement ok
+INSERT INTO _scen_no_pk_test._delta_no_pk_data (_op, name, value, category) VALUES ('I', 'beta', 25, 'B');
+
+# The "update" should show the new values
+query TIT
+SELECT name, value, category FROM _scen_no_pk_test.no_pk_data WHERE name = 'beta';
+----
+beta	25	B
+
+# Total count should still be 5 (not 6)
+query I
+SELECT COUNT(*) FROM _scen_no_pk_test.no_pk_data;
+----
+5
+
+# ===== Test 5: Delete works (using all columns as composite key) =====
+
+# Delete 'gamma' row
+statement ok
+INSERT INTO _scen_no_pk_test._delta_no_pk_data (_op, name, value, category) VALUES ('D', 'gamma', 30, 'A');
+
+# Row should be gone
+query I
+SELECT COUNT(*) FROM _scen_no_pk_test.no_pk_data WHERE name = 'gamma';
+----
+0
+
+# Total count should be 4
+query I
+SELECT COUNT(*) FROM _scen_no_pk_test.no_pk_data;
+----
+4
+
+# ===== Test 6: Base table unchanged =====
+
+query I
+SELECT COUNT(*) FROM main.no_pk_data;
+----
+4
+
+query TIT
+SELECT name, value, category FROM main.no_pk_data ORDER BY name;
+----
+alpha	10	A
+beta	20	B
+delta	40	B
+gamma	30	A
+
+# ===== Test 7: Scenario comparison works for no-PK tables =====
+
+# We have: 2 inserts (epsilon + beta new), 2 deletes (beta old + gamma)
+query I
+SELECT COUNT(*) FROM scenario_compare('no_pk_test', 'no_pk_data')
+WHERE diff_type = 'added';
+----
+2
+
+query I
+SELECT COUNT(*) FROM scenario_compare('no_pk_test', 'no_pk_data')
+WHERE diff_type = 'removed';
+----
+2
+
+# ===== Cleanup =====
+
+query T
+SELECT scenario_drop('no_pk_test');
+----
+true
+
+statement ok
+DROP TABLE no_pk_data;
+
+# ===== Test 8: Table with duplicate rows =====
+
+statement ok
+CREATE TABLE dup_data (x INTEGER, y INTEGER);
+
+statement ok
+INSERT INTO dup_data VALUES (1, 1), (1, 1), (2, 2), (2, 2), (2, 2);
+
+query T
+SELECT scenario_create('dup_test', 'Testing duplicate row handling');
+----
+true
+
+query T
+SELECT delta_create('dup_test', 'dup_data');
+----
+true
+
+# Should show all rows including duplicates
+query I
+SELECT COUNT(*) FROM _scen_dup_test.dup_data;
+----
+5
+
+# Deleting one duplicate should remove all matching rows (documented behavior)
+statement ok
+INSERT INTO _scen_dup_test._delta_dup_data (_op, x, y) VALUES ('D', 1, 1);
+
+# Both (1,1) rows should be gone
+query I
+SELECT COUNT(*) FROM _scen_dup_test.dup_data WHERE x = 1;
+----
+0
+
+# Cleanup
+query T
+SELECT scenario_drop('dup_test');
+----
+true
+
+statement ok
+DROP TABLE dup_data;

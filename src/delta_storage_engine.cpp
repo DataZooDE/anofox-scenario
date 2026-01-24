@@ -174,17 +174,40 @@ bool DeltaStorageEngine::CreateMergeView(ClientContext &context, const string &s
 	string view_sql;
 
 	if (pk_columns.empty()) {
-		// No PK: Use rowid-based anti-join (fallback, less efficient)
-		// This case is complex - for now, just union all base with delta for tables without PK
+		// No PK: Use ALL columns as composite key for anti-join
+		// This treats every unique combination of column values as a row identifier
+		// Note: Duplicate rows in base table will all be affected by a single delta operation
+		vector<string> all_join_conditions;
+		for (const auto &col : columns) {
+			string quoted_col = ScenarioManager::QuoteIdentifier(col);
+			// Use IS NOT DISTINCT FROM to handle NULLs correctly
+			all_join_conditions.push_back("d." + quoted_col + " IS NOT DISTINCT FROM base." + quoted_col);
+		}
+		string join_condition = StringUtil::Join(all_join_conditions, " AND ");
+
+		// Build base SELECT with prefixed columns
+		vector<string> base_columns;
+		for (const auto &col : columns) {
+			base_columns.push_back("base." + ScenarioManager::QuoteIdentifier(col));
+		}
+		string base_column_list = StringUtil::Join(base_columns, ", ");
+
 		view_sql = StringUtil::Format(
 		    "CREATE OR REPLACE VIEW %s.%s AS "
-		    "SELECT %s FROM main.%s "
+		    "SELECT %s FROM main.%s base "
+		    "WHERE NOT EXISTS ("
+		    "  SELECT 1 FROM %s.%s d "
+		    "  WHERE %s AND d._op IN ('U', 'D')"
+		    ") "
 		    "UNION ALL "
 		    "SELECT %s FROM %s.%s WHERE _op IN ('I', 'U')",
 		    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
 		    ScenarioManager::QuoteIdentifier(view_name).c_str(),
-		    column_list.c_str(),
+		    base_column_list.c_str(),
 		    ScenarioManager::QuoteIdentifier(base_table_name).c_str(),
+		    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
+		    ScenarioManager::QuoteIdentifier(delta_table).c_str(),
+		    join_condition.c_str(),
 		    column_list.c_str(),
 		    ScenarioManager::QuoteIdentifier(scenario_schema).c_str(),
 		    ScenarioManager::QuoteIdentifier(delta_table).c_str());

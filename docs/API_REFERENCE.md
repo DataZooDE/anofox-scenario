@@ -302,6 +302,21 @@ Delta tables inherit the following constraints from the base table:
 
 This ensures data integrity is maintained within scenarios. Inserting invalid data into a delta table will fail with appropriate constraint violation errors.
 
+**Tables Without Primary Keys:**
+For tables without a primary key, all columns are used as a composite key for row identification. This has the following implications:
+
+- **Updates require DELETE + INSERT**: Since there's no unique identifier, updates must be performed as two operations:
+  ```sql
+  -- Delete the old row (specify exact old values)
+  INSERT INTO _scen_myscenario._delta_products (_op, col1, col2) VALUES ('D', 'old_val1', 'old_val2');
+  -- Insert the new row
+  INSERT INTO _scen_myscenario._delta_products (_op, col1, col2) VALUES ('I', 'new_val1', 'new_val2');
+  ```
+
+- **Duplicate rows**: If the base table contains duplicate rows (identical values in all columns), a single DELETE operation will remove all matching duplicates.
+
+- **NULL handling**: The row matching uses `IS NOT DISTINCT FROM` semantics, so NULL values are handled correctly.
+
 **Errors:**
 - `Scenario '%s' does not exist` - No scenario with this name exists
 - `Delta table for '%s' already exists in scenario '%s'` - Delta already created
