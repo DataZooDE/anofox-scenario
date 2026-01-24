@@ -968,3 +968,75 @@ SELECT protocol_add_finding('pricing_analysis', 'Premium tier showed strongest r
 
 **Errors:**
 - `Scenario '%s' does not exist` - No scenario with this name
+
+---
+
+### protocol_set_plan
+
+Sets the "plan" section of a scenario's protocol, describing the intended approach or methodology. Replaces any existing plan content.
+
+**Syntax:**
+```sql
+SELECT protocol_set_plan(scenario_name, plan_text);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario (required) |
+| plan_text | VARCHAR | Description of the plan or methodology (required) |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Set initial plan
+SELECT protocol_set_plan('pricing_analysis', 'Step 1: Update prices by 10%. Step 2: Monitor sales for 2 weeks. Step 3: Adjust based on results.');
+
+-- Update plan (replaces existing)
+SELECT protocol_set_plan('pricing_analysis', 'Revised: Test in West region first, then roll out nationally.');
+```
+
+**Notes:**
+- Replaces existing plan content (does not append)
+- Creates the "plan" section if it doesn't exist
+- Useful for documenting what you intend to do before making changes
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name
+
+---
+
+### protocol_set_decision
+
+Sets the "decision" section of a scenario's protocol, documenting the final decision or outcome. Replaces any existing decision content.
+
+**Syntax:**
+```sql
+SELECT protocol_set_decision(scenario_name, decision_text);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario (required) |
+| decision_text | VARCHAR | Description of the decision made (required) |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Record the decision
+SELECT protocol_set_decision('pricing_analysis', 'Approved: roll out 10% price increase to all regions starting Q2.');
+
+-- Update decision if it changes
+SELECT protocol_set_decision('pricing_analysis', 'Revised: delay rollout pending competitor response analysis.');
+```
+
+**Notes:**
+- Replaces existing decision content (does not append)
+- Creates the "decision" section if it doesn't exist
+- Useful for documenting the final outcome of the scenario analysis
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name

@@ -315,6 +315,154 @@ static void ProtocolAddFindingFunction(DataChunk &args, ExpressionState &state, 
 	*ConstantVector::GetData<bool>(result) = true;
 }
 
+// ===== protocol_set_plan Implementation =====
+
+struct ProtocolSetPlanBindData : public FunctionData {
+	string scenario_name;
+	string plan_text;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ProtocolSetPlanBindData>();
+		result->scenario_name = scenario_name;
+		result->plan_text = plan_text;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ProtocolSetPlanBindData>();
+		return scenario_name == other.scenario_name && plan_text == other.plan_text;
+	}
+};
+
+static unique_ptr<FunctionData> ProtocolSetPlanBind(ClientContext &context, ScalarFunction &bound_function,
+                                                     vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<ProtocolSetPlanBindData>();
+
+	if (arguments.size() < 2) {
+		throw InvalidInputException("protocol_set_plan requires two arguments: scenario_name and plan_text");
+	}
+
+	if (arguments[0]->return_type != LogicalType::VARCHAR || !arguments[0]->IsFoldable()) {
+		throw InvalidInputException("protocol_set_plan: scenario_name must be a constant VARCHAR");
+	}
+	bind_data->scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	if (arguments[1]->return_type != LogicalType::VARCHAR || !arguments[1]->IsFoldable()) {
+		throw InvalidInputException("protocol_set_plan: plan_text must be a constant VARCHAR");
+	}
+	bind_data->plan_text = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).GetValue<string>();
+
+	if (!ProtocolManager::ScenarioExists(context, bind_data->scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data->scenario_name);
+	}
+
+	return std::move(bind_data);
+}
+
+static void ProtocolSetPlanFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ProtocolSetPlanBindData>();
+	auto &context = state.GetContext();
+
+	Connection con(context.db->GetDatabase(context));
+
+	string escaped = bind_data.plan_text;
+	size_t pos = 0;
+	while ((pos = escaped.find('\'', pos)) != string::npos) {
+		escaped.replace(pos, 1, "''");
+		pos += 2;
+	}
+
+	auto upsert_sql = StringUtil::Format(
+	    "INSERT OR REPLACE INTO _scenario_protocols (entity_type, entity_name, section, content, updated_at) "
+	    "VALUES ('scenario', '%s', 'plan', '%s', current_timestamp)",
+	    bind_data.scenario_name, escaped);
+
+	auto upsert_result = con.Query(upsert_sql);
+	if (upsert_result->HasError()) {
+		throw InvalidInputException("Failed to set protocol 'plan' for scenario '%s': %s",
+		                            bind_data.scenario_name, upsert_result->GetError());
+	}
+
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
+// ===== protocol_set_decision Implementation =====
+
+struct ProtocolSetDecisionBindData : public FunctionData {
+	string scenario_name;
+	string decision_text;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ProtocolSetDecisionBindData>();
+		result->scenario_name = scenario_name;
+		result->decision_text = decision_text;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ProtocolSetDecisionBindData>();
+		return scenario_name == other.scenario_name && decision_text == other.decision_text;
+	}
+};
+
+static unique_ptr<FunctionData> ProtocolSetDecisionBind(ClientContext &context, ScalarFunction &bound_function,
+                                                         vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<ProtocolSetDecisionBindData>();
+
+	if (arguments.size() < 2) {
+		throw InvalidInputException("protocol_set_decision requires two arguments: scenario_name and decision_text");
+	}
+
+	if (arguments[0]->return_type != LogicalType::VARCHAR || !arguments[0]->IsFoldable()) {
+		throw InvalidInputException("protocol_set_decision: scenario_name must be a constant VARCHAR");
+	}
+	bind_data->scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	if (arguments[1]->return_type != LogicalType::VARCHAR || !arguments[1]->IsFoldable()) {
+		throw InvalidInputException("protocol_set_decision: decision_text must be a constant VARCHAR");
+	}
+	bind_data->decision_text = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).GetValue<string>();
+
+	if (!ProtocolManager::ScenarioExists(context, bind_data->scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data->scenario_name);
+	}
+
+	return std::move(bind_data);
+}
+
+static void ProtocolSetDecisionFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ProtocolSetDecisionBindData>();
+	auto &context = state.GetContext();
+
+	Connection con(context.db->GetDatabase(context));
+
+	string escaped = bind_data.decision_text;
+	size_t pos = 0;
+	while ((pos = escaped.find('\'', pos)) != string::npos) {
+		escaped.replace(pos, 1, "''");
+		pos += 2;
+	}
+
+	auto upsert_sql = StringUtil::Format(
+	    "INSERT OR REPLACE INTO _scenario_protocols (entity_type, entity_name, section, content, updated_at) "
+	    "VALUES ('scenario', '%s', 'decision', '%s', current_timestamp)",
+	    bind_data.scenario_name, escaped);
+
+	auto upsert_result = con.Query(upsert_sql);
+	if (upsert_result->HasError()) {
+		throw InvalidInputException("Failed to set protocol 'decision' for scenario '%s': %s",
+		                            bind_data.scenario_name, upsert_result->GetError());
+	}
+
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
 // ===== Function Registration =====
 
 void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -335,6 +483,18 @@ void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
 	                                     ProtocolAddFindingFunction, ProtocolAddFindingBind, nullptr, nullptr, nullptr,
 	                                     LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
 	loader.RegisterFunction(protocol_add_finding);
+
+	// protocol_set_plan(scenario_name, plan_text) - returns boolean
+	ScalarFunction protocol_set_plan("protocol_set_plan", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                  ProtocolSetPlanFunction, ProtocolSetPlanBind, nullptr, nullptr, nullptr,
+	                                  LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	loader.RegisterFunction(protocol_set_plan);
+
+	// protocol_set_decision(scenario_name, decision_text) - returns boolean
+	ScalarFunction protocol_set_decision("protocol_set_decision", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                      ProtocolSetDecisionFunction, ProtocolSetDecisionBind, nullptr, nullptr, nullptr,
+	                                      LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	loader.RegisterFunction(protocol_set_decision);
 }
 
 } // namespace duckdb

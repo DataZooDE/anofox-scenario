@@ -213,6 +213,109 @@ changes
 findings
 why
 
+# ===== Test: protocol_set_plan =====
+
+# Set the plan for the scenario
+query T
+SELECT protocol_set_plan('protocol_test', 'Step 1: Update prices. Step 2: Monitor sales. Step 3: Adjust as needed.');
+----
+true
+
+# Verify plan was stored
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'plan';
+----
+Step 1: Update prices. Step 2: Monitor sales. Step 3: Adjust as needed.
+
+# Update the plan (should replace, not append)
+query T
+SELECT protocol_set_plan('protocol_test', 'Revised plan: Test in limited market first.');
+----
+true
+
+# Verify plan was replaced
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'plan';
+----
+Revised plan: Test in limited market first.
+
+# Verify only one plan entry exists
+query I
+SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'plan';
+----
+1
+
+# Test: protocol_set_plan with non-existent scenario
+statement error
+SELECT protocol_set_plan('nonexistent_scenario', 'This should fail');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Test: protocol_set_plan with special characters
+query T
+SELECT protocol_set_plan('protocol_test', 'Plan: test "special" item''s pricing at $9.99');
+----
+true
+
+# Verify special characters stored correctly
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'plan';
+----
+Plan: test "special" item's pricing at $9.99
+
+# ===== Test: protocol_set_decision =====
+
+# Set the decision for the scenario
+query T
+SELECT protocol_set_decision('protocol_test', 'Approved: roll out new pricing to all regions.');
+----
+true
+
+# Verify decision was stored
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'decision';
+----
+Approved: roll out new pricing to all regions.
+
+# Update the decision (should replace, not append)
+query T
+SELECT protocol_set_decision('protocol_test', 'Revised decision: delay rollout pending further analysis.');
+----
+true
+
+# Verify decision was replaced
+query T
+SELECT content FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'decision';
+----
+Revised decision: delay rollout pending further analysis.
+
+# Verify only one decision entry exists
+query I
+SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'protocol_test' AND section = 'decision';
+----
+1
+
+# Test: protocol_set_decision with non-existent scenario
+statement error
+SELECT protocol_set_decision('nonexistent_scenario', 'This should fail');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Verify all 5 sections now exist
+query I
+SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'protocol_test';
+----
+5
+
+query T
+SELECT section FROM _scenario_protocols WHERE entity_name = 'protocol_test' ORDER BY section;
+----
+changes
+decision
+findings
+plan
+why
+
 # Cleanup: Drop the test scenario
 query T
 SELECT scenario_drop('protocol_test');
