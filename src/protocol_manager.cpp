@@ -2,6 +2,7 @@
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/execution/expression_executor.hpp"
@@ -542,6 +543,110 @@ static void ProtocolReadFunction(ClientContext &context, TableFunctionInput &dat
 	output.SetCardinality(count);
 }
 
+// ===== protocol_export_markdown Implementation =====
+
+struct ProtocolExportMarkdownBindData : public FunctionData {
+	string scenario_name;
+	string file_path;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ProtocolExportMarkdownBindData>();
+		result->scenario_name = scenario_name;
+		result->file_path = file_path;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ProtocolExportMarkdownBindData>();
+		return scenario_name == other.scenario_name && file_path == other.file_path;
+	}
+};
+
+static unique_ptr<FunctionData> ProtocolExportMarkdownBind(ClientContext &context, ScalarFunction &bound_function,
+                                                            vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<ProtocolExportMarkdownBindData>();
+
+	if (arguments.size() < 2) {
+		throw InvalidInputException("protocol_export_markdown requires two arguments: scenario_name and file_path");
+	}
+
+	if (arguments[0]->return_type != LogicalType::VARCHAR || !arguments[0]->IsFoldable()) {
+		throw InvalidInputException("protocol_export_markdown: scenario_name must be a constant VARCHAR");
+	}
+	bind_data->scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	if (arguments[1]->return_type != LogicalType::VARCHAR || !arguments[1]->IsFoldable()) {
+		throw InvalidInputException("protocol_export_markdown: file_path must be a constant VARCHAR");
+	}
+	bind_data->file_path = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).GetValue<string>();
+
+	if (!ProtocolManager::ScenarioExists(context, bind_data->scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data->scenario_name);
+	}
+
+	return std::move(bind_data);
+}
+
+static void ProtocolExportMarkdownFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ProtocolExportMarkdownBindData>();
+	auto &context = state.GetContext();
+
+	Connection con(context.db->GetDatabase(context));
+
+	// Query all protocol sections
+	auto protocol_result = con.Query(StringUtil::Format(
+	    "SELECT section, content FROM _scenario_protocols "
+	    "WHERE entity_type = 'scenario' AND entity_name = '%s' ORDER BY section",
+	    bind_data.scenario_name));
+
+	// Build markdown content
+	string markdown = "# Scenario Protocol: " + bind_data.scenario_name + "\n\n";
+
+	// Section order and display names
+	vector<pair<string, string>> section_order = {
+	    {"why", "Why (Purpose)"},
+	    {"plan", "Plan"},
+	    {"changes", "Changes Made"},
+	    {"findings", "Findings"},
+	    {"decision", "Decision"}
+	};
+
+	// Collect sections into a map for ordered output
+	unordered_map<string, string> sections;
+	if (!protocol_result->HasError()) {
+		for (idx_t i = 0; i < protocol_result->RowCount(); i++) {
+			string section = protocol_result->GetValue(0, i).GetValue<string>();
+			string content = protocol_result->GetValue(1, i).GetValue<string>();
+			sections[section] = content;
+		}
+	}
+
+	// Output sections in defined order
+	for (auto &sec : section_order) {
+		auto it = sections.find(sec.first);
+		if (it != sections.end()) {
+			markdown += "## " + sec.second + "\n\n";
+			markdown += it->second + "\n\n";
+		}
+	}
+
+	// Add footer
+	markdown += "---\n*Exported from anofox-scenario*\n";
+
+	// Write to file using DuckDB's filesystem
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto file_handle = fs.OpenFile(bind_data.file_path,
+	    FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE);
+	file_handle->Write((void *)markdown.c_str(), markdown.size());
+	file_handle->Sync();
+	file_handle->Close();
+
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
 // ===== Function Registration =====
 
 void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -578,6 +683,12 @@ void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
 	// protocol_read(scenario_name) - table function returning all protocol sections
 	TableFunction protocol_read("protocol_read", {LogicalType::VARCHAR}, ProtocolReadFunction, ProtocolReadBind, ProtocolReadInit);
 	loader.RegisterFunction(protocol_read);
+
+	// protocol_export_markdown(scenario_name, file_path) - export to markdown file
+	ScalarFunction protocol_export_markdown("protocol_export_markdown", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                         ProtocolExportMarkdownFunction, ProtocolExportMarkdownBind, nullptr, nullptr, nullptr,
+	                                         LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	loader.RegisterFunction(protocol_export_markdown);
 }
 
 } // namespace duckdb

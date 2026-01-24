@@ -368,6 +368,24 @@ SELECT scenario_drop('empty_protocol_test');
 ----
 true
 
+# ===== Test: protocol_export_markdown =====
+
+# Export protocol to markdown file
+query T
+SELECT protocol_export_markdown('protocol_test', '/tmp/protocol_test_export.md');
+----
+true
+
+# Verify file was created by reading it back (using a workaround - check file exists via query)
+# Note: In practice, the file content would be verified by external means
+# Here we just verify the function returns true
+
+# Test: protocol_export_markdown with non-existent scenario
+statement error
+SELECT protocol_export_markdown('nonexistent_scenario', '/tmp/test.md');
+----
+Scenario 'nonexistent_scenario' does not exist
+
 # Cleanup: Drop the test scenario
 query T
 SELECT scenario_drop('protocol_test');

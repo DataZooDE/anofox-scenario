@@ -1083,3 +1083,47 @@ SELECT section, updated_at FROM protocol_read('pricing_analysis') ORDER BY updat
 
 **Errors:**
 - `Scenario '%s' does not exist` - No scenario with this name
+
+---
+
+### protocol_export_markdown
+
+Exports all protocol sections for a scenario to a markdown file.
+
+**Syntax:**
+```sql
+SELECT protocol_export_markdown(scenario_name, file_path);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario (required) |
+| file_path | VARCHAR | Path to the output markdown file (required) |
+
+**Returns:** BOOLEAN (true on success)
+
+**Example:**
+```sql
+-- Export protocol to a markdown file
+SELECT protocol_export_markdown('pricing_analysis', '/reports/pricing_protocol.md');
+
+-- Export to a relative path
+SELECT protocol_export_markdown('q4_forecast', './scenario_docs/q4_forecast.md');
+```
+
+**Output Format:**
+The generated markdown file includes:
+- Title with scenario name
+- Sections in logical order: Why, Plan, Changes Made, Findings, Decision
+- Only sections that have content are included
+- Footer indicating the file was exported from anofox-scenario
+
+**Notes:**
+- Creates the file if it doesn't exist
+- Overwrites any existing file at the specified path
+- Only includes sections that have been set
+- Useful for generating documentation reports from scenario protocols
+
+**Errors:**
+- `Scenario '%s' does not exist` - No scenario with this name
