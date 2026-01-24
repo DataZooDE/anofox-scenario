@@ -412,16 +412,16 @@ For each registered table, delta tables will be created:
 | Component | Functions | Status |
 |-----------|-----------|--------|
 | MetadataStore | Initialize, all Create*Table | ✅ Complete |
-| ScenarioManager | scenario_create, scenario_drop, scenario_list | ✅ Complete |
+| ScenarioManager | scenario_create, scenario_drop, scenario_list, scenario_branch, scenario_archive, scenario_unarchive, scenario_stats | ✅ Complete |
 | SnapshotManager | snapshot_create | ✅ Complete |
 | ProtocolManager | protocol_set_why | ✅ Complete |
+| DeltaStorageEngine | delta_create, delta_drop | ✅ Complete |
 
 ### 9.2 Planned Components
 
 | Component | Functions | Status |
 |-----------|-----------|--------|
-| ScenarioManager | scenario_branch, scenario_archive, scenario_stats | 🔲 Planned |
-| DeltaStorageEngine | Delta tables, merge views | 🔲 Planned |
+| DeltaStorageEngine | Merge-on-read views, write interception | 🔲 Planned |
 | OptimizerExtension | Write interception | 🔲 Planned |
 | ComparisonEngine | scenario_compare, scenario_compare_all | 🔲 Planned |
 | SnapshotManager | snapshot_list, snapshot_drop, snapshot_compare | 🔲 Planned |
@@ -429,13 +429,14 @@ For each registered table, delta tables will be created:
 
 ### 9.3 Test Coverage
 
-- **Total**: 277 assertions across 5 test cases
+- **Total**: 373 assertions across 6 test cases
 - **Files**:
   - anofox_scenario_load.test
   - scenario_metadata.test
   - scenario_lifecycle.test
   - scenario_snapshots.test
   - scenario_protocols.test
+  - scenario_write.test
 
 ---
 

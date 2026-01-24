@@ -1,0 +1,154 @@
+# name: test/sql/scenario_write.test
+# description: Test delta table structure and operations
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# ===== Delta Table Structure Tests (Task 2.0) =====
+
+# Setup: Create base tables
+statement ok
+CREATE TABLE products (id INTEGER PRIMARY KEY, name VARCHAR, price DECIMAL(10,2));
+
+statement ok
+INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99), (3, 'Thingamajig', 29.99);
+
+statement ok
+CREATE TABLE orders (order_id INTEGER PRIMARY KEY, product_id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO orders VALUES (100, 1, 5), (101, 2, 3);
+
+statement ok
+CREATE TABLE no_pk_table (col1 VARCHAR, col2 INTEGER);
+
+statement ok
+INSERT INTO no_pk_table VALUES ('a', 1), ('b', 2);
+
+# Create scenario
+query T
+SELECT scenario_create('delta_test', 'Testing delta table creation');
+----
+true
+
+# Test: Create delta table for products
+query T
+SELECT delta_create('delta_test', 'products');
+----
+true
+
+# Verify delta table was created
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_delta_test' AND table_name = '_delta_products';
+----
+1
+
+# Verify delta table has correct columns (_op, _ts, _version + base columns)
+query TTT
+SELECT column_name, data_type, is_nullable FROM information_schema.columns
+WHERE table_schema = '_scen_delta_test' AND table_name = '_delta_products'
+ORDER BY ordinal_position;
+----
+_op	VARCHAR	NO
+_ts	TIMESTAMP	YES
+_version	INTEGER	YES
+id	INTEGER	NO
+name	VARCHAR	YES
+price	DECIMAL(10,2)	YES
+
+# Test: Cannot create delta table twice
+statement error
+SELECT delta_create('delta_test', 'products');
+----
+Delta table for 'products' already exists in scenario 'delta_test'
+
+# Test: Create delta table for orders
+query T
+SELECT delta_create('delta_test', 'orders');
+----
+true
+
+# Test: Create delta table for table without primary key
+query T
+SELECT delta_create('delta_test', 'no_pk_table');
+----
+true
+
+# Verify no_pk_table delta has no PRIMARY KEY constraint (since base has none)
+query I
+SELECT COUNT(*) FROM information_schema.table_constraints
+WHERE table_schema = '_scen_delta_test' AND table_name = '_delta_no_pk_table' AND constraint_type = 'PRIMARY KEY';
+----
+0
+
+# Test: Error for non-existent scenario
+statement error
+SELECT delta_create('nonexistent', 'products');
+----
+Scenario 'nonexistent' does not exist
+
+# Test: Error for non-existent table
+statement error
+SELECT delta_create('delta_test', 'nonexistent_table');
+----
+Base table 'nonexistent_table' not found in main schema
+
+# Test: Delta table respects CHECK constraint on _op
+query T
+SELECT delta_drop('delta_test', 'products');
+----
+true
+
+query T
+SELECT delta_create('delta_test', 'products');
+----
+true
+
+# Insert valid operation
+statement ok
+INSERT INTO _scen_delta_test._delta_products (_op, id, name, price) VALUES ('I', 4, 'New Item', 39.99);
+
+# Verify insert
+query ITTR
+SELECT id, name, price, _op FROM _scen_delta_test._delta_products;
+----
+4	New Item	39.99	I
+
+# Test: Invalid _op value should fail
+statement error
+INSERT INTO _scen_delta_test._delta_products (_op, id, name, price) VALUES ('X', 5, 'Bad', 0.00);
+----
+CHECK
+
+# Test: delta_drop function
+query T
+SELECT delta_drop('delta_test', 'products');
+----
+true
+
+# Verify delta table was dropped
+query I
+SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_delta_test' AND table_name = '_delta_products';
+----
+0
+
+# Test: Cannot drop non-existent delta table
+statement error
+SELECT delta_drop('delta_test', 'products');
+----
+Delta table for 'products' does not exist in scenario 'delta_test'
+
+# Cleanup
+query T
+SELECT scenario_drop('delta_test');
+----
+true
+
+statement ok
+DROP TABLE products;
+
+statement ok
+DROP TABLE orders;
+
+statement ok
+DROP TABLE no_pk_table;

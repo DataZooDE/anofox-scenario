@@ -20,6 +20,7 @@ set(EXTENSION_SOURCES
     src/scenario_manager.cpp
     src/snapshot_manager.cpp
     src/protocol_manager.cpp
+    src/delta_storage_engine.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

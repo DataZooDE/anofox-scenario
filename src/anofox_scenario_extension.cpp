@@ -5,6 +5,7 @@
 #include "scenario_manager.hpp"
 #include "snapshot_manager.hpp"
 #include "protocol_manager.hpp"
+#include "delta_storage_engine.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -26,6 +27,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register protocol management functions
 	ProtocolManager::RegisterFunctions(loader);
+
+	// Register delta storage engine functions
+	DeltaStorageEngine::RegisterFunctions(loader);
 }
 
 void AnofoxScenarioExtension::Load(ExtensionLoader &loader) {

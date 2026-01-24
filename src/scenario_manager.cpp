@@ -79,6 +79,40 @@ struct ScenarioDropBindData : public FunctionData {
 	}
 };
 
+struct ScenarioArchiveBindData : public FunctionData {
+	string scenario_name;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ScenarioArchiveBindData>();
+		result->scenario_name = scenario_name;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ScenarioArchiveBindData>();
+		return scenario_name == other.scenario_name;
+	}
+};
+
+struct ScenarioBranchBindData : public FunctionData {
+	string source_scenario;
+	string new_name;
+	string description;
+
+	unique_ptr<FunctionData> Copy() const override {
+		auto result = make_uniq<ScenarioBranchBindData>();
+		result->source_scenario = source_scenario;
+		result->new_name = new_name;
+		result->description = description;
+		return std::move(result);
+	}
+
+	bool Equals(const FunctionData &other_p) const override {
+		auto &other = other_p.Cast<ScenarioBranchBindData>();
+		return source_scenario == other.source_scenario && new_name == other.new_name && description == other.description;
+	}
+};
+
 // ===== scenario_create Implementation =====
 
 static unique_ptr<FunctionData> ScenarioCreateBind(ClientContext &context, ScalarFunction &bound_function,
@@ -307,6 +341,224 @@ static void ScenarioDropFunction(DataChunk &args, ExpressionState &state, Vector
 	*ConstantVector::GetData<bool>(result) = true;
 }
 
+// ===== scenario_archive Implementation =====
+
+static unique_ptr<FunctionData> ScenarioArchiveBind(ClientContext &context, ScalarFunction &bound_function,
+                                                     vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<ScenarioArchiveBindData>();
+
+	if (arguments.size() < 1 || arguments[0]->return_type != LogicalType::VARCHAR) {
+		throw InvalidInputException("scenario_archive requires a scenario name");
+	}
+
+	if (!arguments[0]->IsFoldable()) {
+		throw InvalidInputException("scenario_archive name must be a constant");
+	}
+	bind_data->scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	// Check if scenario exists
+	if (!ScenarioManager::ScenarioExists(context, bind_data->scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data->scenario_name);
+	}
+
+	return std::move(bind_data);
+}
+
+static void ScenarioArchiveFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ScenarioArchiveBindData>();
+	auto &context = state.GetContext();
+
+	// Use a new connection to avoid re-entrancy
+	Connection con(context.db->GetDatabase(context));
+
+	// Update status to 'archived'
+	auto update_result = con.Query("UPDATE _scenario_registry SET status = 'archived' WHERE scenario_name = '" +
+	                               bind_data.scenario_name + "'");
+	if (update_result->HasError()) {
+		throw InvalidInputException("Failed to archive scenario '%s': %s", bind_data.scenario_name,
+		                            update_result->GetError());
+	}
+
+	// Return true for all rows
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
+// ===== scenario_unarchive Implementation =====
+
+static unique_ptr<FunctionData> ScenarioUnarchiveBind(ClientContext &context, ScalarFunction &bound_function,
+                                                       vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<ScenarioArchiveBindData>();
+
+	if (arguments.size() < 1 || arguments[0]->return_type != LogicalType::VARCHAR) {
+		throw InvalidInputException("scenario_unarchive requires a scenario name");
+	}
+
+	if (!arguments[0]->IsFoldable()) {
+		throw InvalidInputException("scenario_unarchive name must be a constant");
+	}
+	bind_data->scenario_name = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	// Check if scenario exists
+	if (!ScenarioManager::ScenarioExists(context, bind_data->scenario_name)) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data->scenario_name);
+	}
+
+	return std::move(bind_data);
+}
+
+static void ScenarioUnarchiveFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ScenarioArchiveBindData>();
+	auto &context = state.GetContext();
+
+	// Use a new connection to avoid re-entrancy
+	Connection con(context.db->GetDatabase(context));
+
+	// Update status to 'active'
+	auto update_result = con.Query("UPDATE _scenario_registry SET status = 'active' WHERE scenario_name = '" +
+	                               bind_data.scenario_name + "'");
+	if (update_result->HasError()) {
+		throw InvalidInputException("Failed to unarchive scenario '%s': %s", bind_data.scenario_name,
+		                            update_result->GetError());
+	}
+
+	// Return true for all rows
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
+// ===== scenario_branch Implementation =====
+
+static unique_ptr<FunctionData> ScenarioBranchBind(ClientContext &context, ScalarFunction &bound_function,
+                                                    vector<unique_ptr<Expression>> &arguments) {
+	auto bind_data = make_uniq<ScenarioBranchBindData>();
+
+	// Extract source_scenario (required)
+	if (arguments.size() < 2 || arguments[0]->return_type != LogicalType::VARCHAR ||
+	    arguments[1]->return_type != LogicalType::VARCHAR) {
+		throw InvalidInputException("scenario_branch requires source_scenario and new_name as arguments");
+	}
+
+	if (!arguments[0]->IsFoldable()) {
+		throw InvalidInputException("scenario_branch source_scenario must be a constant");
+	}
+	bind_data->source_scenario = ExpressionExecutor::EvaluateScalar(context, *arguments[0]).GetValue<string>();
+
+	if (!arguments[1]->IsFoldable()) {
+		throw InvalidInputException("scenario_branch new_name must be a constant");
+	}
+	bind_data->new_name = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).GetValue<string>();
+
+	// Extract optional description
+	if (arguments.size() > 2 && arguments[2]->IsFoldable()) {
+		bind_data->description = ExpressionExecutor::EvaluateScalar(context, *arguments[2]).GetValue<string>();
+	}
+
+	// Validate source scenario exists
+	if (!ScenarioManager::ScenarioExists(context, bind_data->source_scenario)) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data->source_scenario);
+	}
+
+	// Validate new name
+	if (!ScenarioManager::ValidateName(bind_data->new_name)) {
+		throw InvalidInputException("Invalid scenario name '%s'. Names must be alphanumeric with underscores, "
+		                            "max 63 characters, and not start with a digit.",
+		                            bind_data->new_name);
+	}
+
+	// Check if new scenario already exists
+	if (ScenarioManager::ScenarioExists(context, bind_data->new_name)) {
+		throw InvalidInputException("Scenario '%s' already exists", bind_data->new_name);
+	}
+
+	return std::move(bind_data);
+}
+
+static void ScenarioBranchFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
+	auto &bind_data = func_expr.bind_info->Cast<ScenarioBranchBindData>();
+	auto &context = state.GetContext();
+
+	// Use a new connection to avoid re-entrancy
+	Connection con(context.db->GetDatabase(context));
+
+	string schema_name = ScenarioManager::GetSchemaName(context, bind_data.new_name);
+
+	// Create the schema for the new scenario
+	auto create_result = con.Query("CREATE SCHEMA \"" + schema_name + "\"");
+	if (create_result->HasError()) {
+		throw InvalidInputException("Failed to create schema '%s': %s", schema_name, create_result->GetError());
+	}
+
+	// Get the source scenario_id
+	auto source_id_result = con.Query("SELECT scenario_id FROM _scenario_registry WHERE scenario_name = '" +
+	                                   bind_data.source_scenario + "'");
+	if (source_id_result->HasError() || source_id_result->RowCount() == 0) {
+		con.Query("DROP SCHEMA \"" + schema_name + "\"");
+		throw InvalidInputException("Source scenario '%s' not found", bind_data.source_scenario);
+	}
+	int64_t source_scenario_id = source_id_result->GetValue(0, 0).GetValue<int64_t>();
+
+	// Get next scenario_id for the new scenario
+	auto id_result = con.Query("SELECT COALESCE(MAX(scenario_id), 0) + 1 FROM _scenario_registry");
+	if (id_result->HasError()) {
+		con.Query("DROP SCHEMA \"" + schema_name + "\"");
+		throw InvalidInputException("Failed to get next scenario ID: %s", id_result->GetError());
+	}
+	int64_t new_scenario_id = id_result->GetValue(0, 0).GetValue<int64_t>();
+
+	// Insert into registry with parent_scenario_id pointing to source
+	string desc_value = bind_data.description.empty() ? "NULL" : "'" + bind_data.description + "'";
+	auto insert_sql = StringUtil::Format(
+	    "INSERT INTO _scenario_registry (scenario_id, scenario_name, schema_name, base_schema, base_captured_at, description, parent_scenario_id) "
+	    "VALUES (%d, '%s', '%s', 'main', current_timestamp, %s, %d)",
+	    new_scenario_id, bind_data.new_name, schema_name, desc_value, source_scenario_id);
+
+	auto insert_result = con.Query(insert_sql);
+	if (insert_result->HasError()) {
+		con.Query("DROP SCHEMA \"" + schema_name + "\"");
+		throw InvalidInputException("Failed to register branched scenario: %s", insert_result->GetError());
+	}
+
+	// Copy table registrations from source scenario to new scenario
+	auto copy_tables_sql = StringUtil::Format(
+	    "INSERT INTO _scenario_tables (scenario_id, table_name, base_row_count, has_primary_key, primary_key_columns) "
+	    "SELECT %d, table_name, base_row_count, has_primary_key, primary_key_columns "
+	    "FROM _scenario_tables WHERE scenario_id = %d",
+	    new_scenario_id, source_scenario_id);
+	auto copy_tables_result = con.Query(copy_tables_sql);
+	if (copy_tables_result->HasError()) {
+		// Cleanup on failure
+		con.Query(StringUtil::Format("DELETE FROM _scenario_registry WHERE scenario_id = %d", new_scenario_id));
+		con.Query("DROP SCHEMA \"" + schema_name + "\"");
+		throw InvalidInputException("Failed to copy table registrations: %s", copy_tables_result->GetError());
+	}
+
+	// Copy base rowids from source scenario to new scenario
+	auto copy_rowids_sql = StringUtil::Format(
+	    "INSERT INTO _scenario_base_rowids (scenario_id, table_name, base_rowid) "
+	    "SELECT %d, table_name, base_rowid "
+	    "FROM _scenario_base_rowids WHERE scenario_id = %d",
+	    new_scenario_id, source_scenario_id);
+	auto copy_rowids_result = con.Query(copy_rowids_sql);
+	if (copy_rowids_result->HasError()) {
+		// Cleanup on failure
+		con.Query(StringUtil::Format("DELETE FROM _scenario_tables WHERE scenario_id = %d", new_scenario_id));
+		con.Query(StringUtil::Format("DELETE FROM _scenario_registry WHERE scenario_id = %d", new_scenario_id));
+		con.Query("DROP SCHEMA \"" + schema_name + "\"");
+		throw InvalidInputException("Failed to copy base rowids: %s", copy_rowids_result->GetError());
+	}
+
+	// Return true for all rows
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	ConstantVector::SetNull(result, false);
+	*ConstantVector::GetData<bool>(result) = true;
+}
+
 // ===== scenario_list Implementation =====
 
 struct ScenarioListData : public GlobalTableFunctionState {
@@ -321,6 +573,24 @@ struct ScenarioListData : public GlobalTableFunctionState {
 	vector<Value> parent_names;
 	idx_t offset;
 	bool finished;
+};
+
+// ===== scenario_stats Implementation =====
+
+struct ScenarioStatsBindData : public TableFunctionData {
+	string scenario_name;
+};
+
+struct ScenarioStatsData : public GlobalTableFunctionState {
+	ScenarioStatsData() : done(false) {
+	}
+
+	int64_t table_count;
+	int64_t total_base_rows;
+	int64_t delta_row_count;
+	Value created_at;
+	string status;
+	bool done;
 };
 
 static unique_ptr<FunctionData> ScenarioListBind(ClientContext &context, TableFunctionBindInput &input,
@@ -400,6 +670,90 @@ static void ScenarioListFunction(ClientContext &context, TableFunctionInput &dat
 	output.SetCardinality(count);
 }
 
+// ===== scenario_stats Implementation (continued) =====
+
+static unique_ptr<FunctionData> ScenarioStatsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                   vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<ScenarioStatsBindData>();
+
+	// Get scenario name from input
+	if (input.inputs.empty() || input.inputs[0].IsNull()) {
+		throw InvalidInputException("scenario_stats requires a scenario name");
+	}
+	bind_data->scenario_name = input.inputs[0].GetValue<string>();
+
+	// Define return columns
+	names.emplace_back("table_count");
+	return_types.emplace_back(LogicalType::BIGINT);
+
+	names.emplace_back("total_base_rows");
+	return_types.emplace_back(LogicalType::BIGINT);
+
+	names.emplace_back("delta_row_count");
+	return_types.emplace_back(LogicalType::BIGINT);
+
+	names.emplace_back("created_at");
+	return_types.emplace_back(LogicalType::TIMESTAMP);
+
+	names.emplace_back("status");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> ScenarioStatsInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<ScenarioStatsData>();
+	auto &bind_data = input.bind_data->Cast<ScenarioStatsBindData>();
+
+	// Check if scenario exists and get registry info
+	Connection con(context.db->GetDatabase(context));
+	auto registry_result = con.Query(
+	    "SELECT created_at, status FROM _scenario_registry WHERE scenario_name = '" + bind_data.scenario_name + "'");
+
+	if (registry_result->HasError() || registry_result->RowCount() == 0) {
+		throw InvalidInputException("Scenario '%s' does not exist", bind_data.scenario_name);
+	}
+
+	result->created_at = registry_result->GetValue(0, 0);
+	result->status = registry_result->GetValue(1, 0).GetValue<string>();
+
+	// Get table statistics
+	auto stats_result = con.Query(
+	    "SELECT COUNT(*), COALESCE(SUM(base_row_count), 0) FROM _scenario_tables "
+	    "WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = '" +
+	    bind_data.scenario_name + "')");
+
+	if (!stats_result->HasError() && stats_result->RowCount() > 0) {
+		result->table_count = stats_result->GetValue(0, 0).GetValue<int64_t>();
+		result->total_base_rows = stats_result->GetValue(1, 0).GetValue<int64_t>();
+	} else {
+		result->table_count = 0;
+		result->total_base_rows = 0;
+	}
+
+	// Delta row count is 0 for now (delta tables not implemented yet)
+	result->delta_row_count = 0;
+
+	return std::move(result);
+}
+
+static void ScenarioStatsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = data_p.global_state->Cast<ScenarioStatsData>();
+
+	if (data.done) {
+		return;
+	}
+
+	output.SetValue(0, 0, Value::BIGINT(data.table_count));
+	output.SetValue(1, 0, Value::BIGINT(data.total_base_rows));
+	output.SetValue(2, 0, Value::BIGINT(data.delta_row_count));
+	output.SetValue(3, 0, data.created_at);
+	output.SetValue(4, 0, Value(data.status));
+
+	output.SetCardinality(1);
+	data.done = true;
+}
+
 // ===== Function Registration =====
 
 void ScenarioManager::RegisterFunctions(ExtensionLoader &loader) {
@@ -425,9 +779,40 @@ void ScenarioManager::RegisterFunctions(ExtensionLoader &loader) {
 	                              LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
 	loader.RegisterFunction(scenario_drop);
 
+	// scenario_archive(name) - returns boolean
+	ScalarFunction scenario_archive("scenario_archive", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                 ScenarioArchiveFunction, ScenarioArchiveBind, nullptr, nullptr, nullptr,
+	                                 LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	loader.RegisterFunction(scenario_archive);
+
+	// scenario_unarchive(name) - returns boolean
+	ScalarFunction scenario_unarchive("scenario_unarchive", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                   ScenarioUnarchiveFunction, ScenarioUnarchiveBind, nullptr, nullptr, nullptr,
+	                                   LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	loader.RegisterFunction(scenario_unarchive);
+
+	// scenario_branch(source_scenario, new_name, description?) - returns boolean
+	ScalarFunctionSet scenario_branch_set("scenario_branch");
+
+	ScalarFunction scenario_branch_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                  ScenarioBranchFunction, ScenarioBranchBind, nullptr, nullptr, nullptr,
+	                                  LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	scenario_branch_set.AddFunction(scenario_branch_3);
+
+	ScalarFunction scenario_branch_2({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
+	                                  ScenarioBranchFunction, ScenarioBranchBind, nullptr, nullptr, nullptr,
+	                                  LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
+	scenario_branch_set.AddFunction(scenario_branch_2);
+
+	loader.RegisterFunction(scenario_branch_set);
+
 	// scenario_list() - returns table
 	TableFunction scenario_list("scenario_list", {}, ScenarioListFunction, ScenarioListBind, ScenarioListInit);
 	loader.RegisterFunction(scenario_list);
+
+	// scenario_stats(name) - returns table with statistics
+	TableFunction scenario_stats("scenario_stats", {LogicalType::VARCHAR}, ScenarioStatsFunction, ScenarioStatsBind, ScenarioStatsInit);
+	loader.RegisterFunction(scenario_stats);
 }
 
 } // namespace duckdb

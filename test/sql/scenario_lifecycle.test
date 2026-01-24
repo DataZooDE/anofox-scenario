@@ -217,3 +217,242 @@ DROP TABLE reg_orders;
 
 statement ok
 DROP TABLE reg_no_pk;
+
+# ===== scenario_archive/unarchive Tests =====
+
+query T
+SELECT scenario_create('archive_test', 'For archive testing');
+----
+true
+
+# Verify initial status is active
+query T
+SELECT status FROM scenario_list() WHERE scenario_name = 'archive_test';
+----
+active
+
+# Test: Archive scenario
+query T
+SELECT scenario_archive('archive_test');
+----
+true
+
+# Verify status changed
+query T
+SELECT status FROM scenario_list() WHERE scenario_name = 'archive_test';
+----
+archived
+
+# Test: Unarchive scenario
+query T
+SELECT scenario_unarchive('archive_test');
+----
+true
+
+# Verify status restored
+query T
+SELECT status FROM scenario_list() WHERE scenario_name = 'archive_test';
+----
+active
+
+# Test: Error for non-existent scenario
+statement error
+SELECT scenario_archive('nonexistent');
+----
+Scenario 'nonexistent' does not exist
+
+statement error
+SELECT scenario_unarchive('nonexistent');
+----
+Scenario 'nonexistent' does not exist
+
+# Cleanup
+query T
+SELECT scenario_drop('archive_test');
+----
+true
+
+# ===== scenario_branch Tests =====
+
+# Setup: Create a scenario to branch from
+query T
+SELECT scenario_create('branch_source', 'Source for branching');
+----
+true
+
+# Test: Branch from existing scenario with description
+query T
+SELECT scenario_branch('branch_source', 'branched_scenario', 'Branched from source');
+----
+true
+
+# Verify parent relationship
+query TT
+SELECT scenario_name, parent_scenario FROM scenario_list() WHERE scenario_name = 'branched_scenario';
+----
+branched_scenario	branch_source
+
+# Verify the branched scenario has correct metadata
+query TTT
+SELECT scenario_name, status, description FROM _scenario_registry WHERE scenario_name = 'branched_scenario';
+----
+branched_scenario	active	Branched from source
+
+# Verify schema was created for branched scenario
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_branched_scenario';
+----
+1
+
+# Test: Table registrations were copied from source
+# First, verify source has the test_data table registered
+query I
+SELECT COUNT(*) FROM _scenario_tables WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'branch_source') AND table_name = 'test_data';
+----
+1
+
+# Verify branched scenario also has the table registered
+query I
+SELECT COUNT(*) FROM _scenario_tables WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'branched_scenario') AND table_name = 'test_data';
+----
+1
+
+# Verify base rowids were copied
+query I
+SELECT COUNT(*) FROM _scenario_base_rowids WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'branched_scenario') AND table_name = 'test_data';
+----
+2
+
+# Test: Branch without description
+query T
+SELECT scenario_branch('branch_source', 'branch_no_desc');
+----
+true
+
+# Verify null description
+query T
+SELECT description FROM _scenario_registry WHERE scenario_name = 'branch_no_desc';
+----
+NULL
+
+# Verify parent is still set correctly
+query T
+SELECT parent_scenario FROM scenario_list() WHERE scenario_name = 'branch_no_desc';
+----
+branch_source
+
+# Test: Cannot branch from non-existent scenario
+statement error
+SELECT scenario_branch('nonexistent', 'new_branch', 'Will fail');
+----
+Scenario 'nonexistent' does not exist
+
+# Test: Cannot branch to existing scenario name
+statement error
+SELECT scenario_branch('branch_source', 'branched_scenario', 'Duplicate name');
+----
+Scenario 'branched_scenario' already exists
+
+# Test: Cannot branch with invalid new name
+statement error
+SELECT scenario_branch('branch_source', 'invalid-name', 'Has dashes');
+----
+Invalid scenario name
+
+# Test: Cannot drop parent scenario while children exist
+statement error
+SELECT scenario_drop('branch_source');
+----
+Cannot drop scenario 'branch_source': scenario
+
+# Cleanup (must drop children first)
+query T
+SELECT scenario_drop('branch_no_desc');
+----
+true
+
+query T
+SELECT scenario_drop('branched_scenario');
+----
+true
+
+query T
+SELECT scenario_drop('branch_source');
+----
+true
+
+# Verify all scenarios cleaned up
+query I
+SELECT COUNT(*) FROM scenario_list();
+----
+0
+
+# ===== scenario_stats Tests =====
+
+# Setup: Create tables for stats testing
+statement ok
+CREATE TABLE stats_products (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE stats_orders (order_id INTEGER PRIMARY KEY, product_id INTEGER);
+
+statement ok
+INSERT INTO stats_products VALUES (1, 'Widget'), (2, 'Gadget'), (3, 'Gizmo');
+
+statement ok
+INSERT INTO stats_orders VALUES (100, 1), (101, 2);
+
+# Create scenario for stats testing
+query T
+SELECT scenario_create('stats_scenario', 'For stats testing');
+----
+true
+
+# Test: Get scenario stats - verify column types and values
+# Note: test_data table from earlier tests is still present, so we have 3 tables:
+# test_data (2 rows) + stats_products (3 rows) + stats_orders (2 rows) = 7 total rows
+query IIIT
+SELECT table_count, total_base_rows, delta_row_count, typeof(created_at)
+FROM scenario_stats('stats_scenario');
+----
+3	7	0	TIMESTAMP
+
+# Test: Verify status is returned correctly
+query T
+SELECT status FROM scenario_stats('stats_scenario');
+----
+active
+
+# Test: Stats after archiving scenario
+query T
+SELECT scenario_archive('stats_scenario');
+----
+true
+
+query T
+SELECT status FROM scenario_stats('stats_scenario');
+----
+archived
+
+query T
+SELECT scenario_unarchive('stats_scenario');
+----
+true
+
+# Test: Error for non-existent scenario
+statement error
+SELECT * FROM scenario_stats('nonexistent');
+----
+Scenario 'nonexistent' does not exist
+
+# Cleanup
+query T
+SELECT scenario_drop('stats_scenario');
+----
+true
+
+statement ok
+DROP TABLE stats_products;
+
+statement ok
+DROP TABLE stats_orders;
