@@ -141,3 +141,213 @@ DROP TABLE products;
 
 statement ok
 DROP TABLE order_items;
+
+# ===== Test 9: Branched scenario compares to parent (branch origin) =====
+
+statement ok
+CREATE TABLE inventory (sku VARCHAR PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO inventory VALUES ('A', 100), ('B', 200), ('C', 300);
+
+# Create parent scenario with some changes
+query T
+SELECT scenario_create('parent_scen', 'Parent scenario');
+----
+true
+
+query T
+SELECT delta_create('parent_scen', 'inventory');
+----
+true
+
+# Parent: update A, insert D
+statement ok
+INSERT INTO _scen_parent_scen._delta_inventory (_op, sku, qty) VALUES ('U', 'A', 150);
+
+statement ok
+INSERT INTO _scen_parent_scen._delta_inventory (_op, sku, qty) VALUES ('I', 'D', 400);
+
+# Branch from parent
+query T
+SELECT scenario_branch('parent_scen', 'child_scen', 'Child branched from parent');
+----
+true
+
+query T
+SELECT delta_create('child_scen', 'inventory');
+----
+true
+
+# Child: update B, delete C (relative to child's view of main)
+statement ok
+INSERT INTO _scen_child_scen._delta_inventory (_op, sku, qty) VALUES ('U', 'B', 250);
+
+statement ok
+INSERT INTO _scen_child_scen._delta_inventory (_op, sku, qty) VALUES ('D', 'C', 300);
+
+# Compare child to its branch origin (parent)
+# Should show child's changes compared to parent's view
+query TTTT
+SELECT diff_type, sku, column_name, new_value FROM scenario_compare('child_scen', 'inventory')
+WHERE diff_type IN ('changed', 'removed') ORDER BY diff_type, sku;
+----
+changed	B	qty	250
+removed	C	NULL	NULL
+
+# Cleanup branched test
+query T
+SELECT scenario_drop('child_scen');
+----
+true
+
+query T
+SELECT scenario_drop('parent_scen');
+----
+true
+
+statement ok
+DROP TABLE inventory;
+
+# ===== Test 10: scenario_compare_all summary =====
+
+statement ok
+CREATE TABLE items (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO items VALUES (1, 'A'), (2, 'B'), (3, 'C');
+
+statement ok
+CREATE TABLE categories (cat_id INTEGER PRIMARY KEY, cat_name VARCHAR);
+
+statement ok
+INSERT INTO categories VALUES (10, 'X'), (20, 'Y');
+
+query T
+SELECT scenario_create('summary_test', 'Testing compare_all');
+----
+true
+
+query T
+SELECT delta_create('summary_test', 'items');
+----
+true
+
+query T
+SELECT delta_create('summary_test', 'categories');
+----
+true
+
+# items: 2 inserts, 1 update, 1 delete
+statement ok
+INSERT INTO _scen_summary_test._delta_items (_op, id, name) VALUES ('I', 4, 'D');
+
+statement ok
+INSERT INTO _scen_summary_test._delta_items (_op, id, name) VALUES ('I', 5, 'E');
+
+statement ok
+INSERT INTO _scen_summary_test._delta_items (_op, id, name) VALUES ('U', 1, 'A-updated');
+
+statement ok
+INSERT INTO _scen_summary_test._delta_items (_op, id, name) VALUES ('D', 2, 'B');
+
+# categories: 1 delete only
+statement ok
+INSERT INTO _scen_summary_test._delta_categories (_op, cat_id, cat_name) VALUES ('D', 10, 'X');
+
+# Test scenario_compare_all
+query TIII
+SELECT table_name, added_rows, removed_rows, changed_rows FROM scenario_compare_all('summary_test') ORDER BY table_name;
+----
+categories	0	1	0
+items	2	1	1
+
+# Error for non-existent scenario
+statement error
+SELECT * FROM scenario_compare_all('nonexistent');
+----
+does not exist
+
+# Cleanup
+query T
+SELECT scenario_drop('summary_test');
+----
+true
+
+statement ok
+DROP TABLE items;
+
+statement ok
+DROP TABLE categories;
+
+# ===== Test 11: Scenario-to-scenario comparison (3-arg) =====
+
+statement ok
+CREATE TABLE data (id INTEGER PRIMARY KEY, val VARCHAR);
+
+statement ok
+INSERT INTO data VALUES (1, 'A'), (2, 'B'), (3, 'C');
+
+query T
+SELECT scenario_create('left_scen', 'Left scenario');
+----
+true
+
+query T
+SELECT scenario_create('right_scen', 'Right scenario');
+----
+true
+
+query T
+SELECT delta_create('left_scen', 'data');
+----
+true
+
+query T
+SELECT delta_create('right_scen', 'data');
+----
+true
+
+# Left: update 1, delete 2
+statement ok
+INSERT INTO _scen_left_scen._delta_data (_op, id, val) VALUES ('U', 1, 'A-left');
+
+statement ok
+INSERT INTO _scen_left_scen._delta_data (_op, id, val) VALUES ('D', 2, 'B');
+
+# Right: update 1 differently, insert 4
+statement ok
+INSERT INTO _scen_right_scen._delta_data (_op, id, val) VALUES ('U', 1, 'A-right');
+
+statement ok
+INSERT INTO _scen_right_scen._delta_data (_op, id, val) VALUES ('I', 4, 'D');
+
+# Compare left to right
+query TITTT
+SELECT diff_type, id, column_name, old_value, new_value
+FROM scenario_compare('left_scen', 'right_scen', 'data')
+ORDER BY diff_type, id;
+----
+added	2	NULL	NULL	NULL
+added	4	NULL	NULL	NULL
+changed	1	val	A-left	A-right
+
+# Error for non-existent scenario
+statement error
+SELECT * FROM scenario_compare('left_scen', 'nonexistent', 'data');
+----
+does not exist
+
+# Cleanup
+query T
+SELECT scenario_drop('left_scen');
+----
+true
+
+query T
+SELECT scenario_drop('right_scen');
+----
+true
+
+statement ok
+DROP TABLE data;

@@ -394,6 +394,78 @@ SELECT * FROM scenario_compare('pricing_test', 'products');
 
 ---
 
+### scenario_compare (3-argument)
+
+Compares a table between two scenarios, showing differences between their current states.
+
+**Syntax:**
+```sql
+SELECT * FROM scenario_compare(scenario_a, scenario_b, table_name);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_a | VARCHAR | First scenario (the "old" state) |
+| scenario_b | VARCHAR | Second scenario (the "new" state) |
+| table_name | VARCHAR | Name of the table to compare |
+
+**Returns:** Same schema as 2-argument version (diff_type, pk_columns, column_name, old_value, new_value)
+
+**Example:**
+```sql
+-- Compare two alternative scenarios
+SELECT * FROM scenario_compare('optimistic_forecast', 'pessimistic_forecast', 'sales')
+ORDER BY diff_type, id;
+```
+
+**Notes:**
+- Compares current state of both scenarios (not branch origins)
+- 'added' means row exists in B but not in A
+- 'removed' means row exists in A but not in B
+- 'changed' shows column-level differences for rows in both
+
+---
+
+### scenario_compare_all
+
+Returns a summary of changes per table across all delta tables in a scenario.
+
+**Syntax:**
+```sql
+SELECT * FROM scenario_compare_all(scenario_name);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario |
+
+**Returns:** Table with columns:
+| Column | Type | Description |
+|--------|------|-------------|
+| table_name | VARCHAR | Name of the table with changes |
+| added_rows | BIGINT | Count of inserted rows |
+| removed_rows | BIGINT | Count of deleted rows |
+| changed_rows | BIGINT | Count of updated rows |
+
+**Example:**
+```sql
+-- Get summary of all changes in a scenario
+SELECT * FROM scenario_compare_all('pricing_analysis');
+-- Returns:
+-- table_name | added_rows | removed_rows | changed_rows
+-- products   |          5 |            2 |           10
+-- inventory  |          0 |            3 |            0
+```
+
+**Notes:**
+- Only tables with at least one change are included
+- Efficient: counts directly from delta tables without materializing full diffs
+- For branched scenarios, counts are relative to branch origin
+
+---
+
 ## Metadata Tables
 
 ### _scenario_registry
