@@ -13,8 +13,13 @@ namespace duckdb {
 // ===== Helper Functions =====
 
 string ScenarioManager::GetSchemaPrefix(ClientContext &context) {
-	// TODO: Read from configuration when Task 1.9 is implemented
-	return "_scen_";
+	// Read from configuration option (default: "_scen_")
+	Value prefix_value;
+	auto result = context.TryGetCurrentSetting("scenario_schema_prefix", prefix_value);
+	if (!result || prefix_value.IsNull()) {
+		return "_scen_";
+	}
+	return prefix_value.ToString();
 }
 
 string ScenarioManager::GetSchemaName(ClientContext &context, const string &scenario_name) {
@@ -686,6 +691,7 @@ struct ScenarioListData : public GlobalTableFunctionState {
 	}
 
 	vector<Value> scenario_names;
+	vector<Value> schema_names;
 	vector<Value> statuses;
 	vector<Value> descriptions;
 	vector<Value> created_ats;
@@ -718,6 +724,9 @@ static unique_ptr<FunctionData> ScenarioListBind(ClientContext &context, TableFu
 	names.emplace_back("scenario_name");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
+	names.emplace_back("schema_name");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
 	names.emplace_back("status");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
@@ -742,7 +751,7 @@ static unique_ptr<GlobalTableFunctionState> ScenarioListInit(ClientContext &cont
 	// Query the registry
 	Connection con(context.db->GetDatabase(context));
 	auto query_result = con.Query(
-	    "SELECT r.scenario_name, r.status, r.description, r.created_at, r.base_schema, p.scenario_name as parent_name "
+	    "SELECT r.scenario_name, r.schema_name, r.status, r.description, r.created_at, r.base_schema, p.scenario_name as parent_name "
 	    "FROM _scenario_registry r "
 	    "LEFT JOIN _scenario_registry p ON r.parent_scenario_id = p.scenario_id "
 	    "ORDER BY r.scenario_name");
@@ -759,11 +768,12 @@ static unique_ptr<GlobalTableFunctionState> ScenarioListInit(ClientContext &cont
 		}
 		for (idx_t i = 0; i < chunk->size(); i++) {
 			result->scenario_names.push_back(chunk->GetValue(0, i));
-			result->statuses.push_back(chunk->GetValue(1, i));
-			result->descriptions.push_back(chunk->GetValue(2, i));
-			result->created_ats.push_back(chunk->GetValue(3, i));
-			result->base_schemas.push_back(chunk->GetValue(4, i));
-			result->parent_names.push_back(chunk->GetValue(5, i));
+			result->schema_names.push_back(chunk->GetValue(1, i));
+			result->statuses.push_back(chunk->GetValue(2, i));
+			result->descriptions.push_back(chunk->GetValue(3, i));
+			result->created_ats.push_back(chunk->GetValue(4, i));
+			result->base_schemas.push_back(chunk->GetValue(5, i));
+			result->parent_names.push_back(chunk->GetValue(6, i));
 		}
 	}
 
@@ -779,11 +789,12 @@ static void ScenarioListFunction(ClientContext &context, TableFunctionInput &dat
 	idx_t count = 0;
 	while (data.offset < data.scenario_names.size() && count < STANDARD_VECTOR_SIZE) {
 		output.SetValue(0, count, data.scenario_names[data.offset]);
-		output.SetValue(1, count, data.statuses[data.offset]);
-		output.SetValue(2, count, data.descriptions[data.offset]);
-		output.SetValue(3, count, data.created_ats[data.offset]);
-		output.SetValue(4, count, data.base_schemas[data.offset]);
-		output.SetValue(5, count, data.parent_names[data.offset]);
+		output.SetValue(1, count, data.schema_names[data.offset]);
+		output.SetValue(2, count, data.statuses[data.offset]);
+		output.SetValue(3, count, data.descriptions[data.offset]);
+		output.SetValue(4, count, data.created_ats[data.offset]);
+		output.SetValue(5, count, data.base_schemas[data.offset]);
+		output.SetValue(6, count, data.parent_names[data.offset]);
 		data.offset++;
 		count++;
 	}

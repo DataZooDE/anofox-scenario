@@ -11,13 +11,45 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
+#include "duckdb/main/config.hpp"
 
 // OpenSSL linked through vcpkg (kept for future HTTPS protocol export)
 #include <openssl/opensslv.h>
 
 namespace duckdb {
 
+// Validation callback for scenario_schema_prefix
+static void SetScenarioSchemaPrefix(ClientContext &context, SetScope scope, Value &parameter) {
+	auto prefix = parameter.ToString();
+
+	// Validate not empty
+	if (prefix.empty()) {
+		throw InvalidInputException("scenario_schema_prefix cannot be empty");
+	}
+
+	// Validate ends with underscore
+	if (prefix.back() != '_') {
+		throw InvalidInputException("scenario_schema_prefix must end with an underscore");
+	}
+
+	// Validate characters: alphanumeric and underscore only
+	for (char c : prefix) {
+		if (!std::isalnum(c) && c != '_') {
+			throw InvalidInputException("scenario_schema_prefix must contain only alphanumeric characters and underscores");
+		}
+	}
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
+	// Register configuration options
+	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
+	config.AddExtensionOption("scenario_schema_prefix",
+	                          "Prefix for scenario schema names (default: '_scen_')",
+	                          LogicalType::VARCHAR,
+	                          Value("_scen_"),
+	                          SetScenarioSchemaPrefix,
+	                          SetScope::SESSION);
+
 	// Initialize metadata tables
 	MetadataStore::Initialize(loader.GetDatabaseInstance());
 

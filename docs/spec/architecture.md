@@ -447,14 +447,14 @@ For each registered table, delta tables are created by `delta_create()`:
 
 | Component | Enhancement | Status |
 |-----------|-------------|--------|
-| ScenarioManager | scenario_schema_prefix config | 🔲 Planned |
+| ScenarioManager | scenario_schema_prefix config | ✅ Complete |
 | DeltaStorageEngine | OptimizerExtension for transparent writes | 🔲 Deferred |
 | Validation | scenario_validate for rowid integrity | ✅ Complete |
 | Concurrency | Read safety testing | ✅ Complete |
 
 ### 9.3 Test Coverage
 
-- **Total**: 1476 assertions across 18 test files
+- **Total**: 1517 assertions across 19 test files
 - **Files**:
   - anofox_scenario_load.test - Extension loading
   - scenario_metadata.test - Metadata table creation
@@ -472,8 +472,9 @@ For each registered table, delta tables are created by `delta_create()`:
   - scenario_concurrent.test - Concurrent read safety
   - scenario_validation.test - Rowid validation
   - scenario_portability.test - Database portability
-  - scenario_errors.test - Error message verification
   - scenario_transactions.test - Transaction atomicity
+  - scenario_config.test - Configuration option testing
+  - scenario_security.test - Security validation
 
 ---
 

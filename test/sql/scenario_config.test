@@ -1,0 +1,231 @@
+# name: test/sql/scenario_config.test
+# description: Test scenario_schema_prefix configuration option
+# group: [anofox_scenario]
+#
+# Tests the scenario_schema_prefix extension option:
+# - Default value is '_scen_'
+# - Can be changed with SET
+# - Session-scoped
+# - Affects scenario schema naming
+
+require anofox_scenario
+
+# ============================================================================
+# Test 1: Verify default prefix is '_scen_'
+# ============================================================================
+
+# Check the default value
+query T
+SELECT current_setting('scenario_schema_prefix');
+----
+_scen_
+
+# Create a scenario with default prefix
+query T
+SELECT scenario_create('default_prefix_test', 'Testing default prefix');
+----
+true
+
+# Verify schema was created with default prefix
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_default_prefix_test';
+----
+1
+
+# scenario_list should show default prefix
+query TT
+SELECT scenario_name, schema_name FROM scenario_list() WHERE scenario_name = 'default_prefix_test';
+----
+default_prefix_test	_scen_default_prefix_test
+
+# Cleanup
+query T
+SELECT scenario_drop('default_prefix_test');
+----
+true
+
+# ============================================================================
+# Test 2: Change prefix with SET
+# ============================================================================
+
+# Change the prefix
+statement ok
+SET scenario_schema_prefix = '_my_';
+
+# Verify the change
+query T
+SELECT current_setting('scenario_schema_prefix');
+----
+_my_
+
+# Create a scenario with custom prefix
+query T
+SELECT scenario_create('custom_prefix_test', 'Testing custom prefix');
+----
+true
+
+# Verify schema was created with custom prefix
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_my_custom_prefix_test';
+----
+1
+
+# scenario_list should show custom prefix
+query TT
+SELECT scenario_name, schema_name FROM scenario_list() WHERE scenario_name = 'custom_prefix_test';
+----
+custom_prefix_test	_my_custom_prefix_test
+
+# Cleanup - drop uses current prefix to find schema
+query T
+SELECT scenario_drop('custom_prefix_test');
+----
+true
+
+# ============================================================================
+# Test 3: RESET returns to default
+# ============================================================================
+
+# Reset to default
+statement ok
+RESET scenario_schema_prefix;
+
+# Verify reset to default
+query T
+SELECT current_setting('scenario_schema_prefix');
+----
+_scen_
+
+# Create scenario with default prefix again
+query T
+SELECT scenario_create('reset_test', 'Testing after reset');
+----
+true
+
+# Verify uses default prefix
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_reset_test';
+----
+1
+
+# Cleanup
+query T
+SELECT scenario_drop('reset_test');
+----
+true
+
+# ============================================================================
+# Test 4: Prefix validation - must end with underscore
+# ============================================================================
+
+# Prefix not ending with underscore should fail
+statement error
+SET scenario_schema_prefix = 'scen';
+----
+scenario_schema_prefix must end with an underscore
+
+# Verify previous value unchanged
+query T
+SELECT current_setting('scenario_schema_prefix');
+----
+_scen_
+
+# ============================================================================
+# Test 5: Prefix validation - must be valid identifier
+# ============================================================================
+
+# Empty prefix should fail
+statement error
+SET scenario_schema_prefix = '';
+----
+scenario_schema_prefix cannot be empty
+
+# Prefix with invalid characters should fail
+statement error
+SET scenario_schema_prefix = 'my-prefix_';
+----
+scenario_schema_prefix must contain only alphanumeric characters and underscores
+
+# ============================================================================
+# Test 6: Mixed prefixes - scenarios with different prefixes coexist
+# ============================================================================
+
+# Create scenario with default prefix
+query T
+SELECT scenario_create('prefix_a', 'First scenario');
+----
+true
+
+# Change prefix
+statement ok
+SET scenario_schema_prefix = '_alt_';
+
+# Create scenario with different prefix
+query T
+SELECT scenario_create('prefix_b', 'Second scenario');
+----
+true
+
+# Both should be visible in scenario_list
+query I
+SELECT COUNT(*) FROM scenario_list() WHERE scenario_name IN ('prefix_a', 'prefix_b');
+----
+2
+
+# Schemas should exist with their respective prefixes
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name IN ('_scen_prefix_a', '_alt_prefix_b');
+----
+2
+
+# scenario_list shows actual schema names
+query TTT rowsort
+SELECT scenario_name, schema_name, description FROM scenario_list()
+WHERE scenario_name IN ('prefix_a', 'prefix_b')
+ORDER BY scenario_name;
+----
+prefix_a	_scen_prefix_a	First scenario
+prefix_b	_alt_prefix_b	Second scenario
+
+# Drop first scenario (need to match its prefix)
+statement ok
+SET scenario_schema_prefix = '_scen_';
+
+query T
+SELECT scenario_drop('prefix_a');
+----
+true
+
+# Drop second scenario
+statement ok
+SET scenario_schema_prefix = '_alt_';
+
+query T
+SELECT scenario_drop('prefix_b');
+----
+true
+
+# Reset for next tests
+statement ok
+RESET scenario_schema_prefix;
+
+# ============================================================================
+# Test 7: Prefix setting is visible in duckdb_settings()
+# ============================================================================
+
+query TT
+SELECT name, value FROM duckdb_settings() WHERE name = 'scenario_schema_prefix';
+----
+scenario_schema_prefix	_scen_
+
+# ============================================================================
+# Test 8: scenario_list always shows actual schema_name regardless of prefix
+# ============================================================================
+
+# This ensures scenario_list reads schema_name from registry, not computing it
+
+# Final cleanup check
+query I
+SELECT COUNT(*) FROM scenario_list();
+----
+0

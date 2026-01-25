@@ -2,6 +2,68 @@
 
 This document describes the SQL API for the anofox-scenario DuckDB extension.
 
+## Configuration Options
+
+### scenario_schema_prefix
+
+Controls the prefix used for scenario schema names.
+
+**Default:** `_scen_`
+
+**Scope:** Session
+
+**Syntax:**
+```sql
+-- View current value
+SELECT current_setting('scenario_schema_prefix');
+
+-- Change the prefix
+SET scenario_schema_prefix = '_my_';
+
+-- Reset to default
+RESET scenario_schema_prefix;
+```
+
+**Description:**
+
+When creating a scenario, the extension creates a schema named `<prefix><scenario_name>`. By default, a scenario named `test` gets schema `_scen_test`. Changing this setting allows using a custom prefix.
+
+**Validation Rules:**
+- Must not be empty
+- Must end with an underscore (`_`)
+- Must contain only alphanumeric characters and underscores
+
+**Example:**
+```sql
+-- Create scenario with default prefix
+SELECT scenario_create('analysis1', 'First analysis');
+-- Creates schema: _scen_analysis1
+
+-- Change prefix for new scenarios
+SET scenario_schema_prefix = '_experiment_';
+
+-- Create scenario with custom prefix
+SELECT scenario_create('analysis2', 'Second analysis');
+-- Creates schema: _experiment_analysis2
+
+-- Both scenarios coexist - scenario_list() shows actual schema names
+SELECT scenario_name, schema_name FROM scenario_list();
+-- analysis1 | _scen_analysis1
+-- analysis2 | _experiment_analysis2
+```
+
+**Notes:**
+- Changing the prefix only affects new scenarios; existing scenarios keep their original schema names
+- When dropping scenarios, ensure the prefix matches the scenario's actual schema
+- The `schema_name` column in `scenario_list()` shows the actual schema name stored in the registry
+
+**Errors:**
+- `scenario_schema_prefix cannot be empty` - Empty string provided
+- `scenario_schema_prefix must end with an underscore` - Prefix doesn't end with `_`
+- `scenario_schema_prefix must contain only alphanumeric characters and underscores` - Invalid characters
+
+---
+
 ## Scenario Lifecycle Functions
 
 ### scenario_create
@@ -80,6 +142,7 @@ SELECT * FROM scenario_list();
 | Column | Type | Description |
 |--------|------|-------------|
 | scenario_name | VARCHAR | Name of the scenario |
+| schema_name | VARCHAR | Full schema name (prefix + scenario_name) |
 | status | VARCHAR | 'active' or 'archived' |
 | description | VARCHAR | Optional description |
 | created_at | TIMESTAMP | When the scenario was created |
