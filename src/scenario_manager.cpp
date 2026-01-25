@@ -232,61 +232,58 @@ static void ScenarioCreateFunction(DataChunk &args, ExpressionState &state, Vect
 			throw InvalidInputException("Failed to register scenario: %s", insert_result->GetError());
 		}
 
-		// Register all user tables from the base schema
-		auto tables_result = con.Query(
-		    "SELECT table_name FROM information_schema.tables "
-		    "WHERE table_schema = 'main' AND table_type = 'BASE TABLE' "
-		    "AND table_name NOT LIKE '\\_%' ESCAPE '\\'");
+		// PERF-1: Batch PK column queries
+		// Instead of N queries for N tables, use a single query to get all PK info
+		// This query joins tables with their primary key columns using list aggregation
+		auto tables_with_pk_result = con.Query(
+		    "SELECT t.table_name, "
+		    "       COALESCE(pk.has_pk, false) as has_pk, "
+		    "       pk.pk_columns "
+		    "FROM information_schema.tables t "
+		    "LEFT JOIN ("
+		    "    SELECT tc.table_name, "
+		    "           true as has_pk, "
+		    "           list(kcu.column_name ORDER BY kcu.ordinal_position) as pk_columns "
+		    "    FROM information_schema.table_constraints tc "
+		    "    JOIN information_schema.key_column_usage kcu "
+		    "      ON tc.constraint_name = kcu.constraint_name "
+		    "    WHERE tc.table_schema = 'main' AND tc.constraint_type = 'PRIMARY KEY' "
+		    "    GROUP BY tc.table_name"
+		    ") pk ON t.table_name = pk.table_name "
+		    "WHERE t.table_schema = 'main' AND t.table_type = 'BASE TABLE' "
+		    "AND t.table_name NOT LIKE '\\_%' ESCAPE '\\'");
 
-		if (!tables_result->HasError()) {
+		if (!tables_with_pk_result->HasError()) {
 			while (true) {
-				auto chunk = tables_result->Fetch();
+				auto chunk = tables_with_pk_result->Fetch();
 				if (!chunk || chunk->size() == 0) {
 					break;
 				}
 				for (idx_t i = 0; i < chunk->size(); i++) {
 					string table_name = chunk->GetValue(0, i).GetValue<string>();
+					bool has_pk = chunk->GetValue(1, i).GetValue<bool>();
 
-					// Get row count
+					// Get row count (still per-table, requires scanning each table)
 					auto count_result = con.Query("SELECT COUNT(*) FROM main." + ScenarioManager::QuoteIdentifier(table_name));
 					int64_t row_count = 0;
 					if (!count_result->HasError() && count_result->RowCount() > 0) {
 						row_count = count_result->GetValue(0, 0).GetValue<int64_t>();
 					}
 
-					// Get primary key columns
-					auto pk_result = con.Query(
-					    "SELECT column_name FROM information_schema.table_constraints tc "
-					    "JOIN information_schema.key_column_usage kcu "
-					    "ON tc.constraint_name = kcu.constraint_name "
-					    "WHERE tc.table_schema = 'main' AND tc.table_name = '" + ScenarioManager::EscapeSQLString(table_name) + "' "
-					    "AND tc.constraint_type = 'PRIMARY KEY' "
-					    "ORDER BY kcu.ordinal_position");
-
-					bool has_pk = false;
-					vector<string> pk_columns;
-					if (!pk_result->HasError()) {
-						while (true) {
-							auto pk_chunk = pk_result->Fetch();
-							if (!pk_chunk || pk_chunk->size() == 0) {
-								break;
-							}
-							has_pk = true;
-							for (idx_t j = 0; j < pk_chunk->size(); j++) {
-								pk_columns.push_back(pk_chunk->GetValue(0, j).GetValue<string>());
-							}
-						}
-					}
-
-					// Format primary key columns as array
+					// Format primary key columns as array from the batched result
 					string pk_array = "NULL";
-					if (!pk_columns.empty()) {
-						pk_array = "[";
-						for (size_t k = 0; k < pk_columns.size(); k++) {
-							if (k > 0) pk_array += ", ";
-							pk_array += "'" + ScenarioManager::EscapeSQLString(pk_columns[k]) + "'";
+					if (has_pk && !chunk->GetValue(2, i).IsNull()) {
+						// pk_columns is already a list, convert to our array format
+						auto pk_list = chunk->GetValue(2, i);
+						auto &list_children = ListValue::GetChildren(pk_list);
+						if (!list_children.empty()) {
+							pk_array = "[";
+							for (size_t k = 0; k < list_children.size(); k++) {
+								if (k > 0) pk_array += ", ";
+								pk_array += "'" + ScenarioManager::EscapeSQLString(list_children[k].GetValue<string>()) + "'";
+							}
+							pk_array += "]";
 						}
-						pk_array += "]";
 					}
 
 					// Insert into _scenario_tables
