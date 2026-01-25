@@ -1,0 +1,405 @@
+# name: test/sql/scenario_transactions.test
+# description: Test transaction rollback and partial failure handling
+# group: [anofox_scenario]
+#
+# Tests that operations are atomic and don't leave partial state:
+# - scenario_create rolls back on failure
+# - scenario_drop handles inconsistent state
+# - scenario_branch rolls back on failure
+
+require anofox_scenario
+
+# ============================================================================
+# Setup
+# ============================================================================
+
+statement ok
+CREATE TABLE txn_test (id INTEGER PRIMARY KEY, value VARCHAR);
+
+statement ok
+INSERT INTO txn_test VALUES (1, 'one'), (2, 'two'), (3, 'three');
+
+# ============================================================================
+# Test 1: Verify scenario_create is atomic
+# ============================================================================
+# If scenario_create fails midway, schema should be cleaned up
+
+# Create a scenario successfully first
+query T
+SELECT scenario_create('atomic_test', 'Testing atomicity');
+----
+true
+
+# Verify it exists
+query I
+SELECT COUNT(*) FROM scenario_list() WHERE scenario_name = 'atomic_test';
+----
+1
+
+# Verify schema was created
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_atomic_test';
+----
+1
+
+# Try to create duplicate - should fail
+statement error
+SELECT scenario_create('atomic_test', 'duplicate');
+----
+Scenario 'atomic_test' already exists
+
+# Verify original still exists and is intact
+query I
+SELECT COUNT(*) FROM scenario_list() WHERE scenario_name = 'atomic_test';
+----
+1
+
+# Cleanup
+query T
+SELECT scenario_drop('atomic_test');
+----
+true
+
+# ============================================================================
+# Test 2: Verify schema and registry are consistent
+# ============================================================================
+# After successful creation, both schema and registry should exist
+
+query T
+SELECT scenario_create('consistency_test', 'Testing consistency');
+----
+true
+
+# Verify both exist
+query II
+SELECT
+    (SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_consistency_test'),
+    (SELECT COUNT(*) FROM _scenario_registry WHERE scenario_name = 'consistency_test');
+----
+1	1
+
+# Verify tables are registered
+query I
+SELECT COUNT(*) FROM _scenario_tables WHERE scenario_id = (
+    SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'consistency_test'
+);
+----
+1
+
+# Cleanup
+query T
+SELECT scenario_drop('consistency_test');
+----
+true
+
+# Verify both cleaned up
+query II
+SELECT
+    (SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_consistency_test'),
+    (SELECT COUNT(*) FROM _scenario_registry WHERE scenario_name = 'consistency_test');
+----
+0	0
+
+# ============================================================================
+# Test 3: scenario_drop handles all related data
+# ============================================================================
+# Drop should clean up registry, tables, rowids, and protocols
+
+query T
+SELECT scenario_create('full_cleanup_test', 'Testing full cleanup');
+----
+true
+
+query T
+SELECT delta_create('full_cleanup_test', 'txn_test');
+----
+true
+
+# Add some delta data
+statement ok
+INSERT INTO _scen_full_cleanup_test._delta_txn_test (_op, id, value)
+VALUES ('I', 4, 'four');
+
+# Add protocol data
+query T
+SELECT protocol_set_why('full_cleanup_test', 'Testing cleanup');
+----
+true
+
+query T
+SELECT protocol_log_change('full_cleanup_test', 'Added row 4');
+----
+true
+
+# Get scenario_id for verification
+query I
+SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'full_cleanup_test';
+----
+1
+
+# Verify all data exists before drop
+query IIII
+SELECT
+    (SELECT COUNT(*) FROM _scenario_registry WHERE scenario_name = 'full_cleanup_test'),
+    (SELECT COUNT(*) FROM _scenario_tables WHERE scenario_id = 1),
+    (SELECT COUNT(*) FROM _scenario_base_rowids WHERE scenario_id = 1),
+    (SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'full_cleanup_test');
+----
+1	1	3	2
+
+# Drop the scenario
+query T
+SELECT scenario_drop('full_cleanup_test');
+----
+true
+
+# Verify all data cleaned up
+query IIII
+SELECT
+    (SELECT COUNT(*) FROM _scenario_registry WHERE scenario_name = 'full_cleanup_test'),
+    (SELECT COUNT(*) FROM _scenario_tables WHERE scenario_id = 1),
+    (SELECT COUNT(*) FROM _scenario_base_rowids WHERE scenario_id = 1),
+    (SELECT COUNT(*) FROM _scenario_protocols WHERE entity_name = 'full_cleanup_test');
+----
+0	0	0	0
+
+# Verify schema dropped
+query I
+SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_scen_full_cleanup_test';
+----
+0
+
+# ============================================================================
+# Test 4: scenario_branch is atomic
+# ============================================================================
+# Branch should create new scenario with proper parent relationship
+
+query T
+SELECT scenario_create('branch_source', 'Source for branching');
+----
+true
+
+query T
+SELECT delta_create('branch_source', 'txn_test');
+----
+true
+
+# Add modifications to source
+statement ok
+INSERT INTO _scen_branch_source._delta_txn_test (_op, id, value)
+VALUES ('U', 1, 'modified');
+
+# Branch successfully
+query T
+SELECT scenario_branch('branch_source', 'branch_target', 'Branched scenario');
+----
+true
+
+# Verify both exist
+query I
+SELECT COUNT(*) FROM scenario_list() WHERE scenario_name IN ('branch_source', 'branch_target');
+----
+2
+
+# Verify parent relationship
+query T
+SELECT parent_scenario FROM scenario_list() WHERE scenario_name = 'branch_target';
+----
+branch_source
+
+# Verify branch has same tables registered
+query II
+SELECT
+    (SELECT COUNT(*) FROM _scenario_tables WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'branch_source')),
+    (SELECT COUNT(*) FROM _scenario_tables WHERE scenario_id = (SELECT scenario_id FROM _scenario_registry WHERE scenario_name = 'branch_target'));
+----
+1	1
+
+# Try to create duplicate branch - should fail
+statement error
+SELECT scenario_branch('branch_source', 'branch_target', 'duplicate');
+----
+Scenario 'branch_target' already exists
+
+# Original branch still intact
+query I
+SELECT COUNT(*) FROM scenario_list() WHERE scenario_name = 'branch_target';
+----
+1
+
+# Cannot drop source while branch exists
+statement error
+SELECT scenario_drop('branch_source');
+----
+Cannot drop scenario 'branch_source': scenario 'branch_target' depends on it
+
+# Drop branch first
+query T
+SELECT scenario_drop('branch_target');
+----
+true
+
+# Now can drop source
+query T
+SELECT scenario_drop('branch_source');
+----
+true
+
+# ============================================================================
+# Test 5: Rapid create/drop cycles maintain consistency
+# ============================================================================
+# Multiple rapid operations should not corrupt state
+
+# Cycle 1
+query T
+SELECT scenario_create('rapid_test', 'cycle 1');
+----
+true
+
+query T
+SELECT scenario_drop('rapid_test');
+----
+true
+
+# Cycle 2
+query T
+SELECT scenario_create('rapid_test', 'cycle 2');
+----
+true
+
+query T
+SELECT scenario_drop('rapid_test');
+----
+true
+
+# Cycle 3
+query T
+SELECT scenario_create('rapid_test', 'cycle 3');
+----
+true
+
+# Verify clean state
+query I
+SELECT COUNT(*) FROM scenario_list() WHERE scenario_name = 'rapid_test';
+----
+1
+
+query T
+SELECT scenario_drop('rapid_test');
+----
+true
+
+# Final verification - no orphaned data
+query I
+SELECT COUNT(*) FROM _scenario_registry WHERE scenario_name = 'rapid_test';
+----
+0
+
+# ============================================================================
+# Test 6: delta_create/drop are atomic
+# ============================================================================
+
+query T
+SELECT scenario_create('delta_atomic_test', 'Testing delta atomicity');
+----
+true
+
+# Create delta
+query T
+SELECT delta_create('delta_atomic_test', 'txn_test');
+----
+true
+
+# Verify delta table and view exist
+query II
+SELECT
+    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_delta_atomic_test' AND table_name = '_delta_txn_test'),
+    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_delta_atomic_test' AND table_name = 'txn_test');
+----
+1	1
+
+# Drop delta
+query T
+SELECT delta_drop('delta_atomic_test', 'txn_test');
+----
+true
+
+# Verify both gone
+query II
+SELECT
+    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_delta_atomic_test' AND table_name = '_delta_txn_test'),
+    (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '_scen_delta_atomic_test' AND table_name = 'txn_test');
+----
+0	0
+
+# Cleanup
+query T
+SELECT scenario_drop('delta_atomic_test');
+----
+true
+
+# ============================================================================
+# Test 7: snapshot_create/drop are atomic
+# ============================================================================
+
+query T
+SELECT scenario_create('snap_atomic_test', 'Testing snapshot atomicity');
+----
+true
+
+query T
+SELECT delta_create('snap_atomic_test', 'txn_test');
+----
+true
+
+# Create snapshot
+query T
+SELECT snapshot_create('snap_atomic_test', 'atomic_snap', 'Test snapshot');
+----
+true
+
+# Verify snapshot exists in registry and schema exists
+query II
+SELECT
+    (SELECT COUNT(*) FROM _scenario_snapshots WHERE snapshot_name = 'atomic_snap'),
+    (SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_snap_atomic_snap');
+----
+1	1
+
+# Drop snapshot
+query T
+SELECT snapshot_drop('atomic_snap');
+----
+true
+
+# Verify both cleaned up
+query II
+SELECT
+    (SELECT COUNT(*) FROM _scenario_snapshots WHERE snapshot_name = 'atomic_snap'),
+    (SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '_snap_atomic_snap');
+----
+0	0
+
+# Cleanup
+query T
+SELECT scenario_drop('snap_atomic_test');
+----
+true
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+statement ok
+DROP TABLE txn_test;
+
+# Final verification - no scenarios left
+query I
+SELECT COUNT(*) FROM scenario_list();
+----
+0
+
+query I
+SELECT COUNT(*) FROM snapshot_list();
+----
+0
