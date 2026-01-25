@@ -370,9 +370,9 @@ true
 
 # ===== Test: protocol_export_markdown =====
 
-# Export protocol to markdown file
+# Export protocol to markdown file (using __TEST_DIR__ for cross-platform compatibility)
 query T
-SELECT protocol_export_markdown('protocol_test', '/tmp/protocol_test_export.md');
+SELECT protocol_export_markdown('protocol_test', '__TEST_DIR__/protocol_test_export.md');
 ----
 true
 
@@ -382,7 +382,7 @@ true
 
 # Test: protocol_export_markdown with non-existent scenario
 statement error
-SELECT protocol_export_markdown('nonexistent_scenario', '/tmp/test.md');
+SELECT protocol_export_markdown('nonexistent_scenario', '__TEST_DIR__/test.md');
 ----
 Scenario 'nonexistent_scenario' does not exist
 
