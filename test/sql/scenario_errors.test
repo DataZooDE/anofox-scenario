@@ -1,0 +1,314 @@
+# name: test/sql/scenario_errors.test
+# description: Test error messages are clear and helpful
+# group: [anofox_scenario]
+#
+# Verifies error messages:
+# - Include scenario/table names for context
+# - Distinguish base vs delta errors
+# - Suggest remediation where appropriate
+
+require anofox_scenario
+
+# ============================================================================
+# Setup
+# ============================================================================
+
+statement ok
+CREATE TABLE error_test (id INTEGER PRIMARY KEY, value VARCHAR);
+
+statement ok
+INSERT INTO error_test VALUES (1, 'test');
+
+# ============================================================================
+# Scenario Lifecycle Errors
+# ============================================================================
+
+# Error: Create scenario with invalid name
+statement error
+SELECT scenario_create('123invalid', 'starts with digit');
+----
+Invalid scenario name '123invalid'
+
+# Error: Create scenario with special characters
+statement error
+SELECT scenario_create('test-scenario', 'has hyphen');
+----
+Invalid scenario name 'test-scenario'
+
+# Error: Create duplicate scenario
+query T
+SELECT scenario_create('duplicate_test', 'first');
+----
+true
+
+statement error
+SELECT scenario_create('duplicate_test', 'second');
+----
+Scenario 'duplicate_test' already exists
+
+# Cleanup
+query T
+SELECT scenario_drop('duplicate_test');
+----
+true
+
+# Error: Drop non-existent scenario
+statement error
+SELECT scenario_drop('nonexistent_scenario');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: Archive non-existent scenario
+statement error
+SELECT scenario_archive('nonexistent_scenario');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: Unarchive non-existent scenario
+statement error
+SELECT scenario_unarchive('nonexistent_scenario');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: Branch from non-existent scenario
+statement error
+SELECT scenario_branch('nonexistent_source', 'new_branch');
+----
+Scenario 'nonexistent_source' does not exist
+
+# Error: Branch with invalid new name
+query T
+SELECT scenario_create('valid_source', 'source for branching');
+----
+true
+
+statement error
+SELECT scenario_branch('valid_source', '123invalid');
+----
+Invalid scenario name '123invalid'
+
+query T
+SELECT scenario_drop('valid_source');
+----
+true
+
+# ============================================================================
+# Delta Storage Errors
+# ============================================================================
+
+# Error: delta_create for non-existent scenario
+statement error
+SELECT delta_create('nonexistent_scenario', 'error_test');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: delta_create for non-existent table
+query T
+SELECT scenario_create('delta_error_test', 'test delta errors');
+----
+true
+
+statement error
+SELECT delta_create('delta_error_test', 'nonexistent_table');
+----
+Base table 'nonexistent_table' not found in main schema
+
+# Error: delta_create duplicate
+query T
+SELECT delta_create('delta_error_test', 'error_test');
+----
+true
+
+statement error
+SELECT delta_create('delta_error_test', 'error_test');
+----
+Delta table for 'error_test' already exists in scenario 'delta_error_test'
+
+# Error: delta_drop for non-existent scenario
+statement error
+SELECT delta_drop('nonexistent_scenario', 'error_test');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: delta_drop for non-existent delta
+query T
+SELECT scenario_create('no_delta_scenario', 'has no delta tables');
+----
+true
+
+statement error
+SELECT delta_drop('no_delta_scenario', 'error_test');
+----
+Delta table for 'error_test' does not exist in scenario 'no_delta_scenario'
+
+query T
+SELECT scenario_drop('no_delta_scenario');
+----
+true
+
+# ============================================================================
+# scenario_write Errors
+# ============================================================================
+
+# Error: scenario_write with invalid operation
+statement error
+SELECT scenario_write('delta_error_test', 'error_test', 'X', {'id': 1, 'value': 'test'});
+----
+scenario_write operation must be 'I' (insert), 'U' (update), or 'D' (delete)
+
+# Error: scenario_write for non-existent scenario
+statement error
+SELECT scenario_write('nonexistent', 'error_test', 'I', {'id': 1, 'value': 'test'});
+----
+Scenario 'nonexistent' does not exist
+
+# Error: scenario_write for table without delta
+query T
+SELECT scenario_create('no_delta_write_test', 'no delta created');
+----
+true
+
+statement error
+SELECT scenario_write('no_delta_write_test', 'error_test', 'I', {'id': 2, 'value': 'new'});
+----
+Delta table for 'error_test' does not exist in scenario 'no_delta_write_test'. Call delta_create first.
+
+query T
+SELECT scenario_drop('no_delta_write_test');
+----
+true
+
+# ============================================================================
+# Comparison Errors
+# ============================================================================
+
+# Error: scenario_compare for non-existent scenario
+statement error
+SELECT * FROM scenario_compare('nonexistent_scenario', 'error_test');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: scenario_compare for non-existent table
+statement error
+SELECT * FROM scenario_compare('delta_error_test', 'nonexistent_table');
+----
+Base table 'nonexistent_table' does not exist in main schema
+
+# ============================================================================
+# Snapshot Errors
+# ============================================================================
+
+# Error: snapshot_create for non-existent scenario
+statement error
+SELECT snapshot_create('nonexistent_scenario', 'snap1', 'test');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: snapshot_drop for non-existent snapshot
+statement error
+SELECT snapshot_drop('nonexistent_snapshot');
+----
+Snapshot 'nonexistent_snapshot' does not exist
+
+# Error: duplicate snapshot name
+query T
+SELECT snapshot_create('delta_error_test', 'dup_snap', 'first snapshot');
+----
+true
+
+statement error
+SELECT snapshot_create('delta_error_test', 'dup_snap', 'duplicate');
+----
+Snapshot 'dup_snap' already exists
+
+query T
+SELECT snapshot_drop('dup_snap');
+----
+true
+
+# ============================================================================
+# Protocol Errors
+# ============================================================================
+
+# Error: protocol_set_why for non-existent scenario
+statement error
+SELECT protocol_set_why('nonexistent_scenario', 'why text');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: protocol_log_change for non-existent scenario
+statement error
+SELECT protocol_log_change('nonexistent_scenario', 'change text');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: protocol_add_finding for non-existent scenario
+statement error
+SELECT protocol_add_finding('nonexistent_scenario', 'finding text');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: protocol_set_plan for non-existent scenario
+statement error
+SELECT protocol_set_plan('nonexistent_scenario', 'plan text');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: protocol_set_decision for non-existent scenario
+statement error
+SELECT protocol_set_decision('nonexistent_scenario', 'decision text');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# Error: protocol_export_markdown for non-existent scenario
+statement error
+SELECT protocol_export_markdown('nonexistent_scenario', '/tmp/test.md');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# ============================================================================
+# DDL Blocking Errors
+# ============================================================================
+
+# Error: CREATE TABLE in scenario schema (includes remediation)
+statement error
+CREATE TABLE _scen_delta_error_test.new_table (id INT);
+----
+CREATE TABLE is not permitted in scenario schemas. Scenarios use copy-on-write delta tables for modifications. Use delta_create() to enable modifications on existing tables.
+
+# Error: ALTER TABLE in scenario schema (includes remediation)
+statement error
+ALTER TABLE _scen_delta_error_test.error_test ADD COLUMN new_col INT;
+----
+ALTER TABLE is not permitted in scenario schemas. Schema modifications cannot be made within scenarios. Tables in scenarios are views that merge base data with delta changes.
+
+# Note: DROP on internal objects (delta tables, merge views) is allowed
+# since our extension needs to manage them. Only user-visible operations are blocked.
+
+# ============================================================================
+# Stats Errors
+# ============================================================================
+
+# Error: scenario_stats for non-existent scenario
+statement error
+SELECT * FROM scenario_stats('nonexistent_scenario');
+----
+Scenario 'nonexistent_scenario' does not exist
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+query T
+SELECT scenario_drop('delta_error_test');
+----
+true
+
+statement ok
+DROP TABLE error_test;
+
+# Verify cleanup
+query I
+SELECT COUNT(*) FROM scenario_list();
+----
+0
