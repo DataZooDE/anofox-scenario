@@ -872,23 +872,45 @@ static unique_ptr<GlobalTableFunctionState> ScenarioValidateInit(ClientContext &
 			    ScenarioManager::QuoteIdentifier(table_name).c_str()));
 			current_row_count = count_result->GetValue(0, 0).GetValue<int64_t>();
 
-			// Check for missing rowids (rowids captured but no longer in base table)
-			auto missing_result = con.Query(StringUtil::Format(
-			    "SELECT COUNT(*) FROM _scenario_base_rowids r "
-			    "WHERE r.scenario_id = %d AND r.table_name = '%s' "
-			    "AND NOT EXISTS (SELECT 1 FROM main.%s t WHERE t.rowid = r.base_rowid)",
-			    scenario_id, ScenarioManager::EscapeSQLString(table_name).c_str(),
-			    ScenarioManager::QuoteIdentifier(table_name).c_str()));
-			missing_rowids = missing_result->GetValue(0, 0).GetValue<int64_t>();
+			// Check if rowids were captured for this table
+			auto rowid_count_result = con.Query(StringUtil::Format(
+			    "SELECT COUNT(*) FROM _scenario_base_rowids WHERE scenario_id = %d AND table_name = '%s'",
+			    scenario_id, ScenarioManager::EscapeSQLString(table_name).c_str()));
+			int64_t captured_rowid_count = rowid_count_result->GetValue(0, 0).GetValue<int64_t>();
 
-			if (missing_rowids > 0) {
-				status = "WARNING";
-				message = StringUtil::Format("%d captured rowids no longer exist (possible VACUUM or DELETE)", missing_rowids);
-			} else if (current_row_count != captured_row_count) {
+			if (captured_rowid_count > 0) {
+				// Rowids were captured - perform full validation
+				// Check for missing rowids (rowids captured but no longer in base table)
+				auto missing_result = con.Query(StringUtil::Format(
+				    "SELECT COUNT(*) FROM _scenario_base_rowids r "
+				    "WHERE r.scenario_id = %d AND r.table_name = '%s' "
+				    "AND NOT EXISTS (SELECT 1 FROM main.%s t WHERE t.rowid = r.base_rowid)",
+				    scenario_id, ScenarioManager::EscapeSQLString(table_name).c_str(),
+				    ScenarioManager::QuoteIdentifier(table_name).c_str()));
+				missing_rowids = missing_result->GetValue(0, 0).GetValue<int64_t>();
+
+				if (missing_rowids > 0) {
+					status = "WARNING";
+					message = StringUtil::Format("%d captured rowids no longer exist (possible VACUUM or DELETE)", missing_rowids);
+				} else if (current_row_count != captured_row_count) {
+					status = "INFO";
+					message = StringUtil::Format("Row count changed: %d -> %d", captured_row_count, current_row_count);
+				} else {
+					message = "All validations passed";
+				}
+			} else if (captured_row_count > 0) {
+				// No rowids captured but table had rows - capture was disabled or table added via delta_create
+				// Return INFO to indicate limited validation
 				status = "INFO";
-				message = StringUtil::Format("Row count changed: %d -> %d", captured_row_count, current_row_count);
+				message = "Rowid validation skipped (capture_rowids=false at creation)";
 			} else {
-				message = "All validations passed";
+				// Table was empty at registration, no rowids to capture - this is OK
+				if (current_row_count != captured_row_count) {
+					status = "INFO";
+					message = StringUtil::Format("Row count changed: %d -> %d", captured_row_count, current_row_count);
+				} else {
+					message = "All validations passed";
+				}
 			}
 		}
 

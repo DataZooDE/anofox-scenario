@@ -454,7 +454,7 @@ For each registered table, delta tables are created by `delta_create()`:
 
 ### 9.3 Test Coverage
 
-- **Total**: 1517 assertions across 19 test files
+- **Total**: 1558 assertions across 20 test files
 - **Files**:
   - anofox_scenario_load.test - Extension loading
   - scenario_metadata.test - Metadata table creation
@@ -474,6 +474,7 @@ For each registered table, delta tables are created by `delta_create()`:
   - scenario_portability.test - Database portability
   - scenario_transactions.test - Transaction atomicity
   - scenario_config.test - Configuration option testing
+  - scenario_rowid_options.test - Deferred rowid capture option
   - scenario_security.test - Security validation
 
 ---

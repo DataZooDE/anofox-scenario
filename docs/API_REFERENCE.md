@@ -74,6 +74,7 @@ Creates a new scenario with an isolated schema for what-if analysis.
 ```sql
 SELECT scenario_create(scenario_name);
 SELECT scenario_create(scenario_name, description);
+SELECT scenario_create(scenario_name, description, capture_rowids);
 ```
 
 **Parameters:**
@@ -81,6 +82,7 @@ SELECT scenario_create(scenario_name, description);
 |-----------|------|-------------|
 | scenario_name | VARCHAR | Name of the scenario (required). Must be alphanumeric with underscores, max 63 characters, cannot start with a digit. |
 | description | VARCHAR | Optional description of the scenario's purpose. |
+| capture_rowids | BOOLEAN | Whether to capture base table rowids at creation time (default: true). Set to false for faster creation on large tables. |
 
 **Returns:** BOOLEAN (true on success)
 
@@ -91,7 +93,13 @@ SELECT scenario_create('price_increase_analysis');
 
 -- Create a scenario with description
 SELECT scenario_create('supplier_risk_q4', 'Analysis of Q4 supplier disruption impact');
+
+-- Create a scenario without rowid capture (faster for large tables)
+SELECT scenario_create('quick_analysis', 'Fast scenario for testing', false);
 ```
+
+**Performance Note:**
+When `capture_rowids` is set to `false`, the scenario creation is faster because it skips capturing individual rowids for all existing tables. This is useful for large tables with millions of rows. The trade-off is that `scenario_validate()` will report `INFO` instead of performing full rowid validation.
 
 **Errors:**
 - `Scenario '%s' already exists` - A scenario with this name already exists

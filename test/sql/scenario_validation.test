@@ -177,12 +177,14 @@ SELECT delta_create('valid_scenario', 'validation_data_2');
 ----
 true
 
-# Validate both tables - should show OK for both
+# Validate both tables
+# validation_data: OK (created at scenario_create time, rowids captured)
+# validation_data_2: INFO (added later via delta_create, no rowids captured)
 query TTI
 SELECT table_name, validation_status, missing_rowids FROM scenario_validate('valid_scenario') ORDER BY table_name;
 ----
 validation_data	OK	0
-validation_data_2	OK	0
+validation_data_2	INFO	0
 
 # ============================================================================
 # Test 7: Validate after base table dropped
@@ -206,10 +208,11 @@ SELECT delta_create('drop_table_test', 'temp_table');
 true
 
 # Validate before drop - filter to temp_table only
+# INFO because table was added via delta_create (no rowids captured)
 query TT
 SELECT validation_status, message FROM scenario_validate('drop_table_test') WHERE table_name = 'temp_table';
 ----
-OK	All validations passed
+INFO	Rowid validation skipped (capture_rowids=false at creation)
 
 # Drop the base table
 statement ok

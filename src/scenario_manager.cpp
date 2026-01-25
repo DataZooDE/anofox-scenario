@@ -90,17 +90,20 @@ bool ScenarioManager::ScenarioExists(ClientContext &context, const string &name)
 struct ScenarioCreateBindData : public FunctionData {
 	string scenario_name;
 	string description;
+	bool capture_rowids = true;  // Default: capture rowids for validation
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto result = make_uniq<ScenarioCreateBindData>();
 		result->scenario_name = scenario_name;
 		result->description = description;
+		result->capture_rowids = capture_rowids;
 		return std::move(result);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<ScenarioCreateBindData>();
-		return scenario_name == other.scenario_name && description == other.description;
+		return scenario_name == other.scenario_name && description == other.description &&
+		       capture_rowids == other.capture_rowids;
 	}
 };
 
@@ -177,6 +180,14 @@ static unique_ptr<FunctionData> ScenarioCreateBind(ClientContext &context, Scala
 
 	if (arguments.size() > 1 && arguments[1]->IsFoldable()) {
 		bind_data->description = ExpressionExecutor::EvaluateScalar(context, *arguments[1]).GetValue<string>();
+	}
+
+	// Optional third argument: capture_rowids (default: true)
+	if (arguments.size() > 2 && arguments[2]->IsFoldable()) {
+		auto capture_val = ExpressionExecutor::EvaluateScalar(context, *arguments[2]);
+		if (!capture_val.IsNull()) {
+			bind_data->capture_rowids = capture_val.GetValue<bool>();
+		}
 	}
 
 	// Validate name
@@ -301,8 +312,8 @@ static void ScenarioCreateFunction(DataChunk &args, ExpressionState &state, Vect
 						throw InvalidInputException("Failed to register table '%s': %s", table_name, table_insert_result->GetError());
 					}
 
-					// Capture rowids for base rows (if table has rows)
-					if (row_count > 0) {
+					// Capture rowids for base rows (if enabled and table has rows)
+					if (bind_data.capture_rowids && row_count > 0) {
 						auto rowid_insert_sql = StringUtil::Format(
 						    "INSERT INTO _scenario_base_rowids (scenario_id, table_name, base_rowid) "
 						    "SELECT %d, '%s', rowid FROM main.%s",
@@ -912,16 +923,24 @@ static void ScenarioStatsFunction(ClientContext &context, TableFunctionInput &da
 // ===== Function Registration =====
 
 void ScenarioManager::RegisterFunctions(ExtensionLoader &loader) {
-	// scenario_create(name, description) - returns boolean
+	// scenario_create(name, description, capture_rowids) - returns boolean
 	ScalarFunctionSet scenario_create_set("scenario_create");
 
-	// Constructor with SPECIAL_HANDLING to allow validation of NULL inputs
+	// 3-argument version: name, description, capture_rowids (boolean)
+	ScalarFunction scenario_create_3({LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN}, LogicalType::BOOLEAN,
+	                                  ScenarioCreateFunction, ScenarioCreateBind, nullptr, nullptr, nullptr,
+	                                  LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
+	                                  FunctionNullHandling::SPECIAL_HANDLING);
+	scenario_create_set.AddFunction(scenario_create_3);
+
+	// 2-argument version: name, description
 	ScalarFunction scenario_create_2({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                  ScenarioCreateFunction, ScenarioCreateBind, nullptr, nullptr, nullptr,
 	                                  LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                                  FunctionNullHandling::SPECIAL_HANDLING);
 	scenario_create_set.AddFunction(scenario_create_2);
 
+	// 1-argument version: name only
 	ScalarFunction scenario_create_1({LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                  ScenarioCreateFunction, ScenarioCreateBind, nullptr, nullptr, nullptr,
 	                                  LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
