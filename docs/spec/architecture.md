@@ -1,9 +1,5 @@
 # anofox-scenario Architecture
 
-Version 0.1 | January 2026
-
----
-
 ## 1. Introduction and Goals
 
 ### 1.1 Purpose
@@ -97,8 +93,8 @@ Base data remains immutable in DuckDB's columnar storage. Scenario modifications
 Read Query Flow:
   User Query → Scenario View → UNION (Base + Delta) with anti-join on deleted
 
-Write Query Flow (future):
-  User INSERT/UPDATE/DELETE → OptimizerExtension → Delta Table
+Write Query Flow:
+  User INSERT into Delta Table → Delta Table stores operation (_op: I/U/D)
 ```
 
 ### 4.2 Schema Isolation
@@ -132,24 +128,24 @@ All metadata tables live in `main` schema with `_scenario_` prefix:
 │   create        │   create        │ • protocol_log_change   │
 │ • scenario_drop │ • snapshot_list │ • protocol_add_finding  │
 │ • scenario_list │ • snapshot_drop │ • protocol_read         │
+│ • scenario_     │ • snapshot_     │ • protocol_set_plan     │
+│   branch        │   compare       │ • protocol_set_decision │
 │ • scenario_     │                 │ • protocol_export_md    │
-│   branch        │                 │                         │
+│   archive       │                 │                         │
+│ • scenario_     │                 │                         │
+│   stats         │                 │                         │
 ├─────────────────┴─────────────────┴─────────────────────────┤
 │                      MetadataStore                          │
 │  • Initialize metadata tables on extension load             │
 │  • Provide table schemas for registry, tables, rowids, etc. │
 ├─────────────────────────────────────────────────────────────┤
-│                   DeltaStorageEngine (planned)              │
-│  • Delta table creation and management                      │
+│                   DeltaStorageEngine                        │
+│  • Delta table creation and management (delta_create/drop)  │
 │  • Merge-on-read view generation                            │
 ├─────────────────────────────────────────────────────────────┤
-│                   OptimizerExtension (planned)              │
-│  • Intercept writes to scenario schemas                     │
-│  • Redirect to delta tables                                 │
-├─────────────────────────────────────────────────────────────┤
-│                   ComparisonEngine (planned)                │
+│                   ComparisonEngine                          │
 │  • scenario_compare for single table diff                   │
-│  • scenario_compare_all for summary                         │
+│  • scenario_compare (3-arg) for scenario-to-scenario        │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -205,14 +201,27 @@ All metadata tables live in `main` schema with `_scenario_` prefix:
 ├─────────────────────────────────────────────────────────────┤
 │ Public Functions (SQL API):                                 │
 │                                                             │
-│ snapshot_create(name, source_schema, description?) → BOOL   │
-│   • Validates name uniqueness                               │
-│   • Records in _scenario_snapshots                          │
-│   • (Data copy implementation pending)                      │
+│ snapshot_create(scenario, name, description?) → BOOLEAN     │
+│   • Validates scenario exists and name is unique            │
+│   • Creates snapshot schema _snap_<name>                    │
+│   • Copies delta tables to snapshot schema                  │
+│   • Records in _scenario_snapshots with source_scenario_id  │
 │                                                             │
-│ snapshot_list() → TABLE (planned)                           │
-│ snapshot_drop(name) → BOOLEAN (planned)                     │
-│ snapshot_compare(name, other) → TABLE (planned)             │
+│ snapshot_list() → TABLE                                     │
+│   • Returns all snapshots with metadata                     │
+│   • Columns: snapshot_name, scenario_name, description,     │
+│     created_at                                              │
+│                                                             │
+│ snapshot_drop(name) → BOOLEAN                               │
+│   • Validates snapshot exists                               │
+│   • Drops snapshot schema _snap_<name>                      │
+│   • Deletes from _scenario_snapshots                        │
+│                                                             │
+│ snapshot_compare(snapshot, table) → TABLE                   │
+│   • Compares snapshot state to current base table           │
+│   • Returns row-level and column-level differences          │
+│   • Columns: pk_columns, diff_type, column_name,            │
+│     old_value, new_value                                    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -228,12 +237,25 @@ All metadata tables live in `main` schema with `_scenario_` prefix:
 │   • Validates scenario exists                               │
 │   • Upserts into _scenario_protocols with section='why'     │
 │                                                             │
-│ protocol_log_change(name, change_text) → BOOLEAN (planned)  │
-│ protocol_add_finding(name, finding) → BOOLEAN (planned)     │
-│ protocol_set_plan(name, plan) → BOOLEAN (planned)           │
-│ protocol_set_decision(name, decision) → BOOLEAN (planned)   │
-│ protocol_read(name) → TABLE (planned)                       │
-│ protocol_export_markdown(name) → VARCHAR (planned)          │
+│ protocol_log_change(name, change_text) → BOOLEAN            │
+│   • Appends to changes log (versioned: changes_1, _2, etc.) │
+│                                                             │
+│ protocol_add_finding(name, finding) → BOOLEAN               │
+│   • Appends to findings log (versioned)                     │
+│                                                             │
+│ protocol_set_plan(name, plan) → BOOLEAN                     │
+│   • Upserts plan section                                    │
+│                                                             │
+│ protocol_set_decision(name, decision) → BOOLEAN             │
+│   • Upserts decision section                                │
+│                                                             │
+│ protocol_read(name) → TABLE                                 │
+│   • Returns all protocol sections for a scenario            │
+│   • Columns: section, content, updated_at                   │
+│                                                             │
+│ protocol_export_markdown(name, file_path) → BOOLEAN         │
+│   • Exports protocol to markdown file                       │
+│   • Sections: Why, Plan, Changes Made, Findings, Decision   │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -268,17 +290,20 @@ User: SELECT scenario_create('pricing_test', 'Q1 price analysis');
                     └─────────────────┘
 ```
 
-### 6.2 Scenario Query Flow (Future - COW Read)
+### 6.2 Scenario Query Flow (COW Read)
 
 ```
-User: SET SCHEMA '_scen_pricing_test';
-User: SELECT * FROM products WHERE price > 100;
+User: SELECT * FROM _scen_pricing_test.products WHERE price > 100;
 
 ┌──────────────┐    ┌─────────────────┐    ┌──────────────────┐
-│ Query        │───>│ Scenario View   │───>│ UNION ALL        │
-│ Planner      │    │ (auto-created)  │    │ Base + Delta     │
-└──────────────┘    └─────────────────┘    │ with anti-join   │
-                                           └──────────────────┘
+│ Query        │───>│ Merge View      │───>│ UNION ALL        │
+│ Planner      │    │ (via delta_     │    │ Base + Delta     │
+│              │    │  create)        │    │ with anti-join   │
+└──────────────┘    └─────────────────┘    └──────────────────┘
+
+The merge view is created by delta_create() and combines:
+- Base table rows (excluding deleted/updated PKs)
+- Delta table rows (inserts and updates)
 ```
 
 ---
@@ -352,9 +377,9 @@ User: SELECT * FROM products WHERE price > 100;
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 7.2 Delta Table Structure (Planned)
+### 7.2 Delta Table Structure
 
-For each registered table, delta tables will be created:
+For each registered table, delta tables are created by `delta_create()`:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -413,30 +438,37 @@ For each registered table, delta tables will be created:
 |-----------|-----------|--------|
 | MetadataStore | Initialize, all Create*Table | ✅ Complete |
 | ScenarioManager | scenario_create, scenario_drop, scenario_list, scenario_branch, scenario_archive, scenario_unarchive, scenario_stats | ✅ Complete |
-| SnapshotManager | snapshot_create | ✅ Complete |
-| ProtocolManager | protocol_set_why | ✅ Complete |
-| DeltaStorageEngine | delta_create, delta_drop | ✅ Complete |
+| SnapshotManager | snapshot_create, snapshot_list, snapshot_drop, snapshot_compare | ✅ Complete |
+| ProtocolManager | protocol_set_why, protocol_log_change, protocol_add_finding, protocol_set_plan, protocol_set_decision, protocol_read, protocol_export_markdown | ✅ Complete |
+| DeltaStorageEngine | delta_create, delta_drop, merge-on-read views | ✅ Complete |
+| ComparisonEngine | scenario_compare (2-arg), scenario_compare (3-arg) | ✅ Complete |
 
-### 9.2 Planned Components
+### 9.2 Future Enhancements
 
-| Component | Functions | Status |
-|-----------|-----------|--------|
-| DeltaStorageEngine | Merge-on-read views, write interception | 🔲 Planned |
-| OptimizerExtension | Write interception | 🔲 Planned |
-| ComparisonEngine | scenario_compare, scenario_compare_all | 🔲 Planned |
-| SnapshotManager | snapshot_list, snapshot_drop, snapshot_compare | 🔲 Planned |
-| ProtocolManager | protocol_log_change, protocol_read, etc. | 🔲 Planned |
+| Component | Enhancement | Status |
+|-----------|-------------|--------|
+| ScenarioManager | scenario_schema_prefix config | 🔲 Planned |
+| DeltaStorageEngine | OptimizerExtension for transparent writes | 🔲 Deferred |
+| Validation | scenario_validate for rowid integrity | 🔲 Planned |
+| Concurrency | Read safety testing | 🔲 Planned |
 
 ### 9.3 Test Coverage
 
-- **Total**: 373 assertions across 6 test cases
+- **Total**: 1118 assertions across 13 test files
 - **Files**:
-  - anofox_scenario_load.test
-  - scenario_metadata.test
-  - scenario_lifecycle.test
-  - scenario_snapshots.test
-  - scenario_protocols.test
-  - scenario_write.test
+  - anofox_scenario_load.test - Extension loading
+  - scenario_metadata.test - Metadata table creation
+  - scenario_lifecycle.test - Scenario create/drop/list/branch
+  - scenario_snapshots.test - Snapshot management
+  - scenario_protocols.test - Protocol documentation
+  - scenario_write.test - Delta table operations
+  - scenario_read.test - Merge-on-read views
+  - scenario_branching.test - Scenario branching
+  - scenario_comparison.test - Diff operations
+  - scenario_no_pk.test - Tables without primary keys
+  - scenario_errors.test - Error message verification
+  - scenario_performance.test - Performance validation
+  - scenario_integration.test - End-to-end use case tests
 
 ---
 
