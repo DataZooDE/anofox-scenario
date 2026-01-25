@@ -124,12 +124,18 @@ bool DeltaStorageEngine::CreateDeltaTable(ClientContext &context, const string &
 	}
 
 	// Create index on PK columns for efficient anti-join during merge-on-read
+	// This is a BEST-EFFORT optimization - the merge view works correctly without it.
+	// Index creation may fail in some edge cases (e.g., unsupported column types)
+	// but this should not prevent delta table creation from succeeding.
+	// See docs/spec/error_handling.md for error handling policy.
 	if (!pk_columns.empty()) {
 		string index_name = "idx_" + delta_table_name + "_pk";
 		string index_sql = StringUtil::Format("CREATE INDEX %s ON %s.%s(%s)", index_name.c_str(),
 		                                      scenario_schema.c_str(), delta_table_name.c_str(),
 		                                      StringUtil::Join(pk_columns, ", ").c_str());
-		con.Query(index_sql); // Best effort, ignore errors
+		auto index_result = con.Query(index_sql);
+		// Intentionally ignore index_result - see error_handling.md for rationale
+		(void)index_result;
 	}
 
 	return true;
