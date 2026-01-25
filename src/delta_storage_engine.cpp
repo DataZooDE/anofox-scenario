@@ -735,6 +735,189 @@ static void ScenarioWriteFunction(DataChunk &args, ExpressionState &state, Vecto
 }
 
 //===--------------------------------------------------------------------===//
+// scenario_validate Table Function
+//===--------------------------------------------------------------------===//
+
+struct ScenarioValidateBindData : public TableFunctionData {
+	string scenario_name;
+};
+
+struct ScenarioValidateGlobalState : public GlobalTableFunctionState {
+	idx_t current_row = 0;
+	vector<vector<Value>> rows;
+};
+
+static unique_ptr<FunctionData> ScenarioValidateBind(ClientContext &context, TableFunctionBindInput &input,
+                                                      vector<LogicalType> &return_types, vector<string> &names) {
+	auto bind_data = make_uniq<ScenarioValidateBindData>();
+	bind_data->scenario_name = input.inputs[0].GetValue<string>();
+
+	// Define output columns
+	names.push_back("table_name");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	names.push_back("validation_status");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	names.push_back("base_table_exists");
+	return_types.push_back(LogicalType::BOOLEAN);
+
+	names.push_back("delta_table_exists");
+	return_types.push_back(LogicalType::BOOLEAN);
+
+	names.push_back("captured_row_count");
+	return_types.push_back(LogicalType::BIGINT);
+
+	names.push_back("current_row_count");
+	return_types.push_back(LogicalType::BIGINT);
+
+	names.push_back("missing_rowids");
+	return_types.push_back(LogicalType::BIGINT);
+
+	names.push_back("message");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> ScenarioValidateInit(ClientContext &context,
+                                                                   TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<ScenarioValidateBindData>();
+	auto state = make_uniq<ScenarioValidateGlobalState>();
+
+	Connection con(context.db->GetDatabase(context));
+
+	// Check if scenario exists
+	auto scenario_result = con.Query(StringUtil::Format(
+	    "SELECT scenario_id, schema_name FROM _scenario_registry WHERE scenario_name = '%s'",
+	    ScenarioManager::EscapeSQLString(bind_data.scenario_name).c_str()));
+
+	if (scenario_result->RowCount() == 0) {
+		// Return single row indicating scenario not found
+		state->rows.push_back({
+		    Value("(scenario)"),
+		    Value("ERROR"),
+		    Value::BOOLEAN(false),
+		    Value::BOOLEAN(false),
+		    Value::BIGINT(0),
+		    Value::BIGINT(0),
+		    Value::BIGINT(0),
+		    Value(StringUtil::Format("Scenario '%s' not found", bind_data.scenario_name))
+		});
+		return std::move(state);
+	}
+
+	int64_t scenario_id = scenario_result->GetValue(0, 0).GetValue<int64_t>();
+	string schema_name = scenario_result->GetValue(1, 0).ToString();
+
+	// Get all registered tables for this scenario
+	auto tables_result = con.Query(StringUtil::Format(
+	    "SELECT table_name, base_row_count FROM _scenario_tables WHERE scenario_id = %d ORDER BY table_name",
+	    scenario_id));
+
+	if (tables_result->RowCount() == 0) {
+		// Return single row indicating no tables registered
+		state->rows.push_back({
+		    Value("(no tables)"),
+		    Value("WARNING"),
+		    Value::BOOLEAN(true),
+		    Value::BOOLEAN(false),
+		    Value::BIGINT(0),
+		    Value::BIGINT(0),
+		    Value::BIGINT(0),
+		    Value("No tables registered for this scenario")
+		});
+		return std::move(state);
+	}
+
+	// Validate each table
+	for (idx_t i = 0; i < tables_result->RowCount(); i++) {
+		string table_name = tables_result->GetValue(0, i).ToString();
+		int64_t captured_row_count = tables_result->GetValue(1, i).GetValue<int64_t>();
+
+		string status = "OK";
+		bool base_exists = false;
+		bool delta_exists = false;
+		int64_t current_row_count = 0;
+		int64_t missing_rowids = 0;
+		string message;
+
+		// Check if base table exists
+		auto base_check = con.Query(StringUtil::Format(
+		    "SELECT 1 FROM information_schema.tables WHERE table_schema = 'main' AND table_name = '%s'",
+		    ScenarioManager::EscapeSQLString(table_name).c_str()));
+		base_exists = base_check->RowCount() > 0;
+
+		// Check if delta table exists
+		string delta_table = "_delta_" + table_name;
+		auto delta_check = con.Query(StringUtil::Format(
+		    "SELECT 1 FROM information_schema.tables WHERE table_schema = '%s' AND table_name = '%s'",
+		    ScenarioManager::EscapeSQLString(schema_name).c_str(),
+		    ScenarioManager::EscapeSQLString(delta_table).c_str()));
+		delta_exists = delta_check->RowCount() > 0;
+
+		if (!base_exists) {
+			status = "ERROR";
+			message = "Base table no longer exists";
+		} else {
+			// Get current row count
+			auto count_result = con.Query(StringUtil::Format(
+			    "SELECT COUNT(*) FROM main.%s",
+			    ScenarioManager::QuoteIdentifier(table_name).c_str()));
+			current_row_count = count_result->GetValue(0, 0).GetValue<int64_t>();
+
+			// Check for missing rowids (rowids captured but no longer in base table)
+			auto missing_result = con.Query(StringUtil::Format(
+			    "SELECT COUNT(*) FROM _scenario_base_rowids r "
+			    "WHERE r.scenario_id = %d AND r.table_name = '%s' "
+			    "AND NOT EXISTS (SELECT 1 FROM main.%s t WHERE t.rowid = r.base_rowid)",
+			    scenario_id, ScenarioManager::EscapeSQLString(table_name).c_str(),
+			    ScenarioManager::QuoteIdentifier(table_name).c_str()));
+			missing_rowids = missing_result->GetValue(0, 0).GetValue<int64_t>();
+
+			if (missing_rowids > 0) {
+				status = "WARNING";
+				message = StringUtil::Format("%d captured rowids no longer exist (possible VACUUM or DELETE)", missing_rowids);
+			} else if (current_row_count != captured_row_count) {
+				status = "INFO";
+				message = StringUtil::Format("Row count changed: %d -> %d", captured_row_count, current_row_count);
+			} else {
+				message = "All validations passed";
+			}
+		}
+
+		state->rows.push_back({
+		    Value(table_name),
+		    Value(status),
+		    Value::BOOLEAN(base_exists),
+		    Value::BOOLEAN(delta_exists),
+		    Value::BIGINT(captured_row_count),
+		    Value::BIGINT(current_row_count),
+		    Value::BIGINT(missing_rowids),
+		    Value(message)
+		});
+	}
+
+	return std::move(state);
+}
+
+static void ScenarioValidateScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<ScenarioValidateGlobalState>();
+
+	idx_t count = 0;
+	while (state.current_row < state.rows.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &row = state.rows[state.current_row];
+		for (idx_t col = 0; col < row.size(); col++) {
+			output.SetValue(col, count, row[col]);
+		}
+		state.current_row++;
+		count++;
+	}
+
+	output.SetCardinality(count);
+}
+
+//===--------------------------------------------------------------------===//
 // Registration
 //===--------------------------------------------------------------------===//
 
@@ -762,6 +945,12 @@ void DeltaStorageEngine::RegisterFunctions(ExtensionLoader &loader) {
 	                              LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                              FunctionNullHandling::SPECIAL_HANDLING);
 	loader.RegisterFunction(scenario_write);
+
+	// scenario_validate(scenario_name) -> TABLE
+	// Returns validation status for each table in the scenario
+	TableFunction scenario_validate("scenario_validate", {LogicalType::VARCHAR}, ScenarioValidateScan,
+	                                 ScenarioValidateBind, ScenarioValidateInit);
+	loader.RegisterFunction(scenario_validate);
 }
 
 } // namespace duckdb

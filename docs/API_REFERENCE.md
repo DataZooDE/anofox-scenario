@@ -220,6 +220,59 @@ SELECT scenario_unarchive('q4_final_analysis');
 
 ---
 
+### scenario_validate
+
+Validates a scenario's integrity by checking if captured rowids still exist in base tables. Use this to detect stale state after VACUUM operations or deletions.
+
+**Syntax:**
+```sql
+SELECT * FROM scenario_validate(scenario_name);
+```
+
+**Parameters:**
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| scenario_name | VARCHAR | Name of the scenario to validate (required) |
+
+**Returns:** Table with one row per registered table:
+| Column | Type | Description |
+|--------|------|-------------|
+| table_name | VARCHAR | Name of the table |
+| validation_status | VARCHAR | 'OK', 'INFO', 'WARNING', or 'ERROR' |
+| base_table_exists | BOOLEAN | Whether the base table still exists |
+| delta_table_exists | BOOLEAN | Whether a delta table has been created |
+| captured_row_count | BIGINT | Row count when scenario was created |
+| current_row_count | BIGINT | Current row count in base table |
+| missing_rowids | BIGINT | Count of captured rowids no longer in base table |
+| message | VARCHAR | Human-readable validation message |
+
+**Status Levels:**
+- `OK` - All validations passed
+- `INFO` - Row count changed (rows added to base table)
+- `WARNING` - Missing rowids detected (possible VACUUM or DELETE)
+- `ERROR` - Base table no longer exists
+
+**Example:**
+```sql
+-- Validate a scenario
+SELECT * FROM scenario_validate('pricing_analysis');
+
+-- Check for issues only
+SELECT table_name, validation_status, message
+FROM scenario_validate('pricing_analysis')
+WHERE validation_status != 'OK';
+```
+
+**Notes:**
+- Missing rowids can indicate VACUUM reorganization or direct deletes on base tables
+- If base data is modified after scenario creation, consider recreating the scenario
+- Scenarios with delta tables use PK-based merging, which is resilient to rowid changes
+
+**Errors:**
+- Returns error row if scenario doesn't exist
+
+---
+
 ### scenario_schema
 
 Returns the schema name for a scenario. Use this helper to construct the correct search_path for transparent scenario access.

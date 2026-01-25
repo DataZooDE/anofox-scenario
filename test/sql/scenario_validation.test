@@ -1,0 +1,271 @@
+# name: test/sql/scenario_validation.test
+# description: Test scenario_validate function for detecting stale state
+# group: [anofox_scenario]
+#
+# Tests rowid validation to detect:
+# - Base table removal
+# - Row deletions
+# - VACUUM effects
+# - Normal valid state
+
+require anofox_scenario
+
+# ============================================================================
+# Setup: Create test data
+# ============================================================================
+
+statement ok
+CREATE TABLE validation_data (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR,
+    value DOUBLE
+);
+
+statement ok
+INSERT INTO validation_data VALUES
+    (1, 'Item A', 100.0),
+    (2, 'Item B', 200.0),
+    (3, 'Item C', 300.0),
+    (4, 'Item D', 400.0),
+    (5, 'Item E', 500.0);
+
+# ============================================================================
+# Test 1: Validate non-existent scenario
+# ============================================================================
+
+query TTTTIIIT
+SELECT table_name, validation_status,
+       CASE WHEN base_table_exists THEN 'true' ELSE 'false' END,
+       CASE WHEN delta_table_exists THEN 'true' ELSE 'false' END,
+       captured_row_count, current_row_count, missing_rowids, message
+FROM scenario_validate('nonexistent_scenario');
+----
+(scenario)	ERROR	false	false	0	0	0	Scenario 'nonexistent_scenario' not found
+
+# ============================================================================
+# Test 2: Validate scenario with tables but no delta tables
+# ============================================================================
+# Note: scenario_create auto-registers all tables in main schema
+
+query T
+SELECT scenario_create('nodelta_scenario', 'Scenario without delta_create called');
+----
+true
+
+# Has validation_data table but no delta table created yet
+query TTT
+SELECT table_name, validation_status,
+       CASE WHEN delta_table_exists THEN 'true' ELSE 'false' END
+FROM scenario_validate('nodelta_scenario');
+----
+validation_data	OK	false
+
+query T
+SELECT scenario_drop('nodelta_scenario');
+----
+true
+
+# ============================================================================
+# Test 3: Validate healthy scenario
+# ============================================================================
+
+query T
+SELECT scenario_create('valid_scenario', 'Scenario for validation testing');
+----
+true
+
+query T
+SELECT delta_create('valid_scenario', 'validation_data');
+----
+true
+
+# Validate - should show OK status
+query TTTTIIIT
+SELECT table_name, validation_status,
+       CASE WHEN base_table_exists THEN 'true' ELSE 'false' END,
+       CASE WHEN delta_table_exists THEN 'true' ELSE 'false' END,
+       captured_row_count, current_row_count, missing_rowids, message
+FROM scenario_validate('valid_scenario');
+----
+validation_data	OK	true	true	5	5	0	All validations passed
+
+# ============================================================================
+# Test 4: Validate after rows added to base table
+# ============================================================================
+
+statement ok
+INSERT INTO validation_data VALUES (6, 'Item F', 600.0);
+
+# Row count changed - should show INFO status
+query TTTTIIIT
+SELECT table_name, validation_status,
+       CASE WHEN base_table_exists THEN 'true' ELSE 'false' END,
+       CASE WHEN delta_table_exists THEN 'true' ELSE 'false' END,
+       captured_row_count, current_row_count, missing_rowids, message
+FROM scenario_validate('valid_scenario');
+----
+validation_data	INFO	true	true	5	6	0	Row count changed: 5 -> 6
+
+# ============================================================================
+# Test 5: Validate after rows deleted from base table
+# ============================================================================
+
+statement ok
+DELETE FROM validation_data WHERE id = 6;
+
+# Back to original count
+query TTTTIIIT
+SELECT table_name, validation_status,
+       CASE WHEN base_table_exists THEN 'true' ELSE 'false' END,
+       CASE WHEN delta_table_exists THEN 'true' ELSE 'false' END,
+       captured_row_count, current_row_count, missing_rowids, message
+FROM scenario_validate('valid_scenario');
+----
+validation_data	OK	true	true	5	5	0	All validations passed
+
+# Delete a row that was captured
+statement ok
+DELETE FROM validation_data WHERE id = 5;
+
+# Should show WARNING about missing rowids
+query TT
+SELECT validation_status, message FROM scenario_validate('valid_scenario');
+----
+WARNING	1 captured rowids no longer exist (possible VACUUM or DELETE)
+
+# ============================================================================
+# Test 6: Validate multiple tables
+# ============================================================================
+
+# Note: Even after re-inserting row 5, the original rowid is still missing
+# because the new insert gets a different rowid. Drop and recreate scenario
+# to get fresh rowids.
+
+# First, restore the deleted row
+statement ok
+INSERT INTO validation_data VALUES (5, 'Item E', 500.0);
+
+# Drop and recreate scenario with fresh rowids
+query T
+SELECT scenario_drop('valid_scenario');
+----
+true
+
+query T
+SELECT scenario_create('valid_scenario', 'Scenario for validation testing - recreated');
+----
+true
+
+query T
+SELECT delta_create('valid_scenario', 'validation_data');
+----
+true
+
+# Create second table
+statement ok
+CREATE TABLE validation_data_2 (
+    code VARCHAR PRIMARY KEY,
+    description VARCHAR
+);
+
+statement ok
+INSERT INTO validation_data_2 VALUES ('A', 'Alpha'), ('B', 'Beta'), ('C', 'Gamma');
+
+# Register second table
+query T
+SELECT delta_create('valid_scenario', 'validation_data_2');
+----
+true
+
+# Validate both tables - should show OK for both
+query TTI
+SELECT table_name, validation_status, missing_rowids FROM scenario_validate('valid_scenario') ORDER BY table_name;
+----
+validation_data	OK	0
+validation_data_2	OK	0
+
+# ============================================================================
+# Test 7: Validate after base table dropped
+# ============================================================================
+
+# Create another scenario for this test
+query T
+SELECT scenario_create('drop_table_test', 'Test base table removal');
+----
+true
+
+statement ok
+CREATE TABLE temp_table (id INTEGER PRIMARY KEY, value INTEGER);
+
+statement ok
+INSERT INTO temp_table VALUES (1, 100), (2, 200);
+
+query T
+SELECT delta_create('drop_table_test', 'temp_table');
+----
+true
+
+# Validate before drop - filter to temp_table only
+query TT
+SELECT validation_status, message FROM scenario_validate('drop_table_test') WHERE table_name = 'temp_table';
+----
+OK	All validations passed
+
+# Drop the base table
+statement ok
+DROP TABLE temp_table;
+
+# Validate after drop - should show ERROR for temp_table
+query TT
+SELECT validation_status, message FROM scenario_validate('drop_table_test') WHERE table_name = 'temp_table';
+----
+ERROR	Base table no longer exists
+
+# Cleanup
+query T
+SELECT scenario_drop('drop_table_test');
+----
+true
+
+# ============================================================================
+# Test 8: Validate scenario without delta tables created
+# ============================================================================
+
+query T
+SELECT scenario_create('no_delta_scenario', 'Scenario without delta_create called');
+----
+true
+
+# This scenario has tables registered but no delta tables
+query TT
+SELECT table_name, CASE WHEN delta_table_exists THEN 'true' ELSE 'false' END
+FROM scenario_validate('no_delta_scenario') ORDER BY table_name LIMIT 2;
+----
+validation_data	false
+validation_data_2	false
+
+query T
+SELECT scenario_drop('no_delta_scenario');
+----
+true
+
+# ============================================================================
+# Cleanup
+# ============================================================================
+
+query T
+SELECT scenario_drop('valid_scenario');
+----
+true
+
+statement ok
+DROP TABLE validation_data;
+
+statement ok
+DROP TABLE validation_data_2;
+
+# Verify all scenarios cleaned up
+query I
+SELECT COUNT(*) FROM scenario_list();
+----
+0
