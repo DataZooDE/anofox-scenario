@@ -12,10 +12,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  duckdb-stable-build:
-    name: Build extension binaries
+  # Build for DuckDB v1.4.3 (previous stable)
+  duckdb-v1_4_3-build:
+    name: Build extension (DuckDB v1.4.3)
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.3
     with:
       duckdb_version: v1.4.3
       ci_tools_version: v1.4.3
       extension_name: anofox_scenario
+      artifact_postfix: _v1.4.3
+
+  # Build for DuckDB v1.4.4 (latest stable)
+  duckdb-v1_4_4-build:
+    name: Build extension (DuckDB v1.4.4)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4.4
+    with:
+      duckdb_version: v1.4.4
+      ci_tools_version: v1.4.4
+      extension_name: anofox_scenario
+      artifact_postfix: _v1.4.4
