@@ -7,6 +7,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  id-token: write
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: true
@@ -22,6 +26,18 @@ jobs:
       extension_name: anofox_scenario
       artifact_postfix: _v1.4.3
 
+  duckdb-v1_4_3-deploy:
+    name: Deploy extension (DuckDB v1.4.3)
+    needs: duckdb-v1_4_3-build
+    uses: ./.github/workflows/_extension_deploy.yml
+    secrets: inherit
+    with:
+      duckdb_version: v1.4.3
+      extension_name: anofox_scenario
+      artifact_postfix: _v1.4.3
+      deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+      deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+
   # Build for DuckDB v1.4.4 (latest stable)
   duckdb-v1_4_4-build:
     name: Build extension (DuckDB v1.4.4)
@@ -31,3 +47,15 @@ jobs:
       ci_tools_version: v1.4.4
       extension_name: anofox_scenario
       artifact_postfix: _v1.4.4
+
+  duckdb-v1_4_4-deploy:
+    name: Deploy extension (DuckDB v1.4.4)
+    needs: duckdb-v1_4_4-build
+    uses: ./.github/workflows/_extension_deploy.yml
+    secrets: inherit
+    with:
+      duckdb_version: v1.4.4
+      extension_name: anofox_scenario
+      artifact_postfix: _v1.4.4
+      deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+      deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
