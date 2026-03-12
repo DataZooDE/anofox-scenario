@@ -108,7 +108,7 @@ public:
 //===--------------------------------------------------------------------===//
 void DDLBlocker::Register(DatabaseInstance &db) {
 	auto &config = DBConfig::GetConfig(db);
-	config.optimizer_extensions.push_back(DDLBlockerExtension());
+	OptimizerExtension::Register(config, DDLBlockerExtension());
 }
 
 } // namespace duckdb
