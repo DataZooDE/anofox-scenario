@@ -108,7 +108,13 @@ public:
 //===--------------------------------------------------------------------===//
 void DDLBlocker::Register(DatabaseInstance &db) {
 	auto &config = DBConfig::GetConfig(db);
+#if __has_include("duckdb/main/extension_callback_manager.hpp")
+	// v1.5.0+: OptimizerExtension::Register via ExtensionCallbackManager
 	OptimizerExtension::Register(config, DDLBlockerExtension());
+#else
+	// v1.4.x: direct vector push_back
+	config.optimizer_extensions.push_back(DDLBlockerExtension());
+#endif
 }
 
 } // namespace duckdb
