@@ -13,8 +13,6 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
 
-// OpenSSL linked through vcpkg (kept for future HTTPS protocol export)
-#include <openssl/opensslv.h>
 
 namespace duckdb {
 
