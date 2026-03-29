@@ -40,7 +40,7 @@ jobs:
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
 
-  # Build for DuckDB v1.5.0 (latest stable)
+  # Build for DuckDB v1.5.0 (previous stable)
   duckdb-v1_5_0-build:
     name: Build extension (DuckDB v1.5.0)
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.0
@@ -60,6 +60,30 @@ jobs:
       duckdb_version: v1.5.0
       extension_name: anofox_scenario
       artifact_postfix: _v1.5.0
+      exclude_archs: windows_amd64_mingw
+      deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+      deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+
+  # Build for DuckDB v1.5.1 (latest stable)
+  duckdb-v1_5_1-build:
+    name: Build extension (DuckDB v1.5.1)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.1
+    with:
+      duckdb_version: v1.5.1
+      ci_tools_version: v1.5.1
+      extension_name: anofox_scenario
+      artifact_postfix: _v1.5.1
+      exclude_archs: windows_amd64_mingw
+
+  duckdb-v1_5_1-deploy:
+    name: Deploy extension (DuckDB v1.5.1)
+    needs: duckdb-v1_5_1-build
+    uses: ./.github/workflows/_extension_deploy.yml
+    secrets: inherit
+    with:
+      duckdb_version: v1.5.1
+      extension_name: anofox_scenario
+      artifact_postfix: _v1.5.1
       exclude_archs: windows_amd64_mingw
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
