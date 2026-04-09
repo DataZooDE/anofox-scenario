@@ -1,5 +1,6 @@
 #include "include/comparison_engine.hpp"
 #include "include/scenario_manager.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -787,21 +788,50 @@ static void ScenarioCompare3Function(ClientContext &context, TableFunctionInput 
 //===--------------------------------------------------------------------===//
 
 void ComparisonEngine::RegisterFunctions(ExtensionLoader &loader) {
-	// scenario_compare(scenario_name, table_name) -> TABLE
-	TableFunction scenario_compare("scenario_compare", {LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                               ScenarioCompareFunction, ScenarioCompareBind, ScenarioCompareInit);
-	loader.RegisterFunction(scenario_compare);
-
-	// scenario_compare(scenario_a, scenario_b, table_name) -> TABLE (scenario-to-scenario)
-	TableFunction scenario_compare_3("scenario_compare",
-	                                 {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
-	                                 ScenarioCompare3Function, ScenarioCompare3Bind, ScenarioCompare3Init);
-	loader.RegisterFunction(scenario_compare_3);
+	// scenario_compare has two overloads: 2-arg (vs base) and 3-arg (scenario-to-scenario)
+	TableFunctionSet scenario_compare_set("scenario_compare");
+	scenario_compare_set.AddFunction(TableFunction("scenario_compare", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                               ScenarioCompareFunction, ScenarioCompareBind, ScenarioCompareInit));
+	scenario_compare_set.AddFunction(TableFunction("scenario_compare",
+	                                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                               ScenarioCompare3Function, ScenarioCompare3Bind, ScenarioCompare3Init));
+	{
+		CreateTableFunctionInfo info(scenario_compare_set);
+		{
+			FunctionDescription d;
+			d.description     = "Compare a single table in a scenario against the base, returning rows with change_type ('inserted', 'updated', 'deleted') and column-level diffs.";
+			d.examples        = {"SELECT * FROM scenario_compare('forecast_q1', 'products')"};
+			d.categories      = {"comparison"};
+			d.parameter_names = {"scenario_name", "table_name"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		{
+			FunctionDescription d;
+			d.description     = "Compare a single table between two scenarios, returning rows with change_type and column-level diffs.";
+			d.examples        = {"SELECT * FROM scenario_compare('forecast_q1', 'forecast_q2', 'products')"};
+			d.categories      = {"comparison"};
+			d.parameter_names = {"scenario_a", "scenario_b", "table_name"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_compare_all(scenario_name) -> TABLE
 	TableFunction scenario_compare_all("scenario_compare_all", {LogicalType::VARCHAR},
 	                                   ScenarioCompareAllFunction, ScenarioCompareAllBind, ScenarioCompareAllInit);
-	loader.RegisterFunction(scenario_compare_all);
+	{
+		CreateTableFunctionInfo info(scenario_compare_all);
+		FunctionDescription d;
+		d.description     = "Compare all delta tables in a scenario against the base, returning a summary of changes per table with insert, update, and delete counts.";
+		d.examples        = {"SELECT * FROM scenario_compare_all('forecast_q1')"};
+		d.categories      = {"comparison"};
+		d.parameter_names = {"scenario_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb

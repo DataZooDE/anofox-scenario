@@ -1,4 +1,6 @@
 #include "scenario_manager.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/exception.hpp"
@@ -947,28 +949,88 @@ void ScenarioManager::RegisterFunctions(ExtensionLoader &loader) {
 	                                  FunctionNullHandling::SPECIAL_HANDLING);
 	scenario_create_set.AddFunction(scenario_create_1);
 
-	loader.RegisterFunction(scenario_create_set);
+	{
+		CreateScalarFunctionInfo info(scenario_create_set);
+		{
+			FunctionDescription d;
+			d.description    = "Create a new scenario branching from the current database state, with optional description and row-id capture.";
+			d.examples       = {"scenario_create('forecast_q1', 'Q1 forecast what-if', true)"};
+			d.categories     = {"scenario"};
+			d.parameter_names = {"scenario_name", "description", "capture_rowids"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN};
+			info.descriptions.push_back(std::move(d));
+		}
+		{
+			FunctionDescription d;
+			d.description    = "Create a new scenario branching from the current database state with a description.";
+			d.examples       = {"scenario_create('forecast_q1', 'Q1 forecast what-if')"};
+			d.categories     = {"scenario"};
+			d.parameter_names = {"scenario_name", "description"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		{
+			FunctionDescription d;
+			d.description    = "Create a new scenario branching from the current database state.";
+			d.examples       = {"scenario_create('forecast_q1')"};
+			d.categories     = {"scenario"};
+			d.parameter_names = {"scenario_name"};
+			d.parameter_types = {LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_drop(name) - returns boolean
 	ScalarFunction scenario_drop("scenario_drop", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                              ScenarioDropFunction, ScenarioDropBind, nullptr, nullptr, nullptr,
 	                              LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                              FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(scenario_drop);
+	{
+		CreateScalarFunctionInfo info(scenario_drop);
+		FunctionDescription d;
+		d.description    = "Drop a scenario and remove all its delta tables.";
+		d.examples       = {"scenario_drop('forecast_q1')"};
+		d.categories     = {"scenario"};
+		d.parameter_names = {"scenario_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_archive(name) - returns boolean
 	ScalarFunction scenario_archive("scenario_archive", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                 ScenarioArchiveFunction, ScenarioArchiveBind, nullptr, nullptr, nullptr,
 	                                 LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                                 FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(scenario_archive);
+	{
+		CreateScalarFunctionInfo info(scenario_archive);
+		FunctionDescription d;
+		d.description    = "Archive a scenario, preserving its delta data but removing it from the active list.";
+		d.examples       = {"scenario_archive('forecast_q1')"};
+		d.categories     = {"scenario"};
+		d.parameter_names = {"scenario_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_unarchive(name) - returns boolean
 	ScalarFunction scenario_unarchive("scenario_unarchive", {LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                   ScenarioUnarchiveFunction, ScenarioUnarchiveBind, nullptr, nullptr, nullptr,
 	                                   LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                                   FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(scenario_unarchive);
+	{
+		CreateScalarFunctionInfo info(scenario_unarchive);
+		FunctionDescription d;
+		d.description    = "Restore an archived scenario back to active status.";
+		d.examples       = {"scenario_unarchive('forecast_q1')"};
+		d.categories     = {"scenario"};
+		d.parameter_names = {"scenario_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_branch(source_scenario, new_name, description?) - returns boolean
 	ScalarFunctionSet scenario_branch_set("scenario_branch");
@@ -985,15 +1047,54 @@ void ScenarioManager::RegisterFunctions(ExtensionLoader &loader) {
 	                                  FunctionNullHandling::SPECIAL_HANDLING);
 	scenario_branch_set.AddFunction(scenario_branch_2);
 
-	loader.RegisterFunction(scenario_branch_set);
+	{
+		CreateScalarFunctionInfo info(scenario_branch_set);
+		{
+			FunctionDescription d;
+			d.description    = "Create a new scenario as a branch of an existing scenario, with a description.";
+			d.examples       = {"scenario_branch('forecast_q1', 'forecast_q1_v2', 'revised assumptions')"};
+			d.categories     = {"scenario"};
+			d.parameter_names = {"source_scenario", "new_name", "description"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		{
+			FunctionDescription d;
+			d.description    = "Create a new scenario as a branch of an existing scenario.";
+			d.examples       = {"scenario_branch('forecast_q1', 'forecast_q1_v2')"};
+			d.categories     = {"scenario"};
+			d.parameter_names = {"source_scenario", "new_name"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_list() - returns table
 	TableFunction scenario_list("scenario_list", {}, ScenarioListFunction, ScenarioListBind, ScenarioListInit);
-	loader.RegisterFunction(scenario_list);
+	{
+		CreateTableFunctionInfo info(scenario_list);
+		FunctionDescription d;
+		d.description = "List all scenarios with their name, status, description, parent, and creation time.";
+		d.examples    = {"SELECT * FROM scenario_list()"};
+		d.categories  = {"scenario"};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_stats(name) - returns table with statistics
 	TableFunction scenario_stats("scenario_stats", {LogicalType::VARCHAR}, ScenarioStatsFunction, ScenarioStatsBind, ScenarioStatsInit);
-	loader.RegisterFunction(scenario_stats);
+	{
+		CreateTableFunctionInfo info(scenario_stats);
+		FunctionDescription d;
+		d.description     = "Return per-table delta statistics for a scenario: insert, update, and delete counts.";
+		d.examples        = {"SELECT * FROM scenario_stats('forecast_q1')"};
+		d.categories      = {"scenario"};
+		d.parameter_names = {"scenario_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_schema(name) - returns the schema name for a scenario (for use with SET search_path)
 	ScalarFunction scenario_schema("scenario_schema", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
@@ -1011,7 +1112,17 @@ void ScenarioManager::RegisterFunctions(ExtensionLoader &loader) {
 	    },
 	    nullptr, nullptr, nullptr, nullptr, LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	    FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(scenario_schema);
+	{
+		CreateScalarFunctionInfo info(scenario_schema);
+		FunctionDescription d;
+		d.description    = "Return the internal DuckDB schema name for a scenario, for use with SET search_path.";
+		d.examples       = {"scenario_schema('forecast_q1')"};
+		d.categories     = {"scenario"};
+		d.parameter_names = {"scenario_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb
