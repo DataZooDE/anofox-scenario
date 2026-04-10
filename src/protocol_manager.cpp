@@ -1,4 +1,6 @@
 #include "protocol_manager.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/exception.hpp"
@@ -654,41 +656,111 @@ void ProtocolManager::RegisterFunctions(ExtensionLoader &loader) {
 	ScalarFunction protocol_set_why("protocol_set_why", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                 ProtocolSetWhyFunction, ProtocolSetWhyBind, nullptr, nullptr, nullptr,
 	                                 LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	loader.RegisterFunction(protocol_set_why);
+	{
+		CreateScalarFunctionInfo info(protocol_set_why);
+		FunctionDescription d;
+		d.description     = "Set the 'why' rationale section of a scenario's protocol documentation.";
+		d.examples        = {"protocol_set_why('forecast_q1', 'Testing impact of 10% price increase on revenue')"};
+		d.categories      = {"protocol"};
+		d.parameter_names = {"scenario_name", "why_text"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// protocol_log_change(scenario_name, change_text) - returns boolean
 	ScalarFunction protocol_log_change("protocol_log_change", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                    ProtocolLogChangeFunction, ProtocolLogChangeBind, nullptr, nullptr, nullptr,
 	                                    LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	loader.RegisterFunction(protocol_log_change);
+	{
+		CreateScalarFunctionInfo info(protocol_log_change);
+		FunctionDescription d;
+		d.description     = "Append a timestamped change entry to a scenario's protocol change log.";
+		d.examples        = {"protocol_log_change('forecast_q1', 'Updated price column in products table')"};
+		d.categories      = {"protocol"};
+		d.parameter_names = {"scenario_name", "change_text"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// protocol_add_finding(scenario_name, finding_text) - returns boolean
 	ScalarFunction protocol_add_finding("protocol_add_finding", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                     ProtocolAddFindingFunction, ProtocolAddFindingBind, nullptr, nullptr, nullptr,
 	                                     LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	loader.RegisterFunction(protocol_add_finding);
+	{
+		CreateScalarFunctionInfo info(protocol_add_finding);
+		FunctionDescription d;
+		d.description     = "Append a finding or observation to a scenario's protocol findings section.";
+		d.examples        = {"protocol_add_finding('forecast_q1', 'Revenue increased 8% under new pricing')"};
+		d.categories      = {"protocol"};
+		d.parameter_names = {"scenario_name", "finding_text"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// protocol_set_plan(scenario_name, plan_text) - returns boolean
 	ScalarFunction protocol_set_plan("protocol_set_plan", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                  ProtocolSetPlanFunction, ProtocolSetPlanBind, nullptr, nullptr, nullptr,
 	                                  LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	loader.RegisterFunction(protocol_set_plan);
+	{
+		CreateScalarFunctionInfo info(protocol_set_plan);
+		FunctionDescription d;
+		d.description     = "Set the analysis plan section of a scenario's protocol documentation.";
+		d.examples        = {"protocol_set_plan('forecast_q1', 'Step 1: adjust prices; Step 2: rerun revenue model')"};
+		d.categories      = {"protocol"};
+		d.parameter_names = {"scenario_name", "plan_text"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// protocol_set_decision(scenario_name, decision_text) - returns boolean
 	ScalarFunction protocol_set_decision("protocol_set_decision", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                      ProtocolSetDecisionFunction, ProtocolSetDecisionBind, nullptr, nullptr, nullptr,
 	                                      LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	loader.RegisterFunction(protocol_set_decision);
+	{
+		CreateScalarFunctionInfo info(protocol_set_decision);
+		FunctionDescription d;
+		d.description     = "Record the final decision or conclusion in a scenario's protocol documentation.";
+		d.examples        = {"protocol_set_decision('forecast_q1', 'Approved: roll out 10% price increase in Q2')"};
+		d.categories      = {"protocol"};
+		d.parameter_names = {"scenario_name", "decision_text"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// protocol_read(scenario_name) - table function returning all protocol sections
 	TableFunction protocol_read("protocol_read", {LogicalType::VARCHAR}, ProtocolReadFunction, ProtocolReadBind, ProtocolReadInit);
-	loader.RegisterFunction(protocol_read);
+	{
+		CreateTableFunctionInfo info(protocol_read);
+		FunctionDescription d;
+		d.description     = "Read all protocol documentation sections for a scenario, returning section name, content, and last-updated timestamp.";
+		d.examples        = {"SELECT * FROM protocol_read('forecast_q1')"};
+		d.categories      = {"protocol"};
+		d.parameter_names = {"scenario_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// protocol_export_markdown(scenario_name, file_path) - export to markdown file
 	ScalarFunction protocol_export_markdown("protocol_export_markdown", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                                         ProtocolExportMarkdownFunction, ProtocolExportMarkdownBind, nullptr, nullptr, nullptr,
 	                                         LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	loader.RegisterFunction(protocol_export_markdown);
+	{
+		CreateScalarFunctionInfo info(protocol_export_markdown);
+		FunctionDescription d;
+		d.description     = "Export all protocol documentation for a scenario to a Markdown file.";
+		d.examples        = {"protocol_export_markdown('forecast_q1', '/tmp/forecast_q1_protocol.md')"};
+		d.categories      = {"protocol"};
+		d.parameter_names = {"scenario_name", "file_path"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb

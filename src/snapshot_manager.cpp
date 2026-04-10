@@ -1,4 +1,6 @@
 #include "snapshot_manager.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/exception.hpp"
@@ -842,16 +844,55 @@ void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
 	                                  LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
 	snapshot_create_set.AddFunction(snapshot_create_2);
 
-	loader.RegisterFunction(snapshot_create_set);
+	{
+		CreateScalarFunctionInfo info(snapshot_create_set);
+		{
+			FunctionDescription d;
+			d.description     = "Capture an immutable point-in-time snapshot of a scenario with a description.";
+			d.examples        = {"snapshot_create('forecast_q1', 'baseline_2024', 'end-of-year baseline')"};
+			d.categories      = {"snapshot"};
+			d.parameter_names = {"scenario_name", "snapshot_name", "description"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		{
+			FunctionDescription d;
+			d.description     = "Capture an immutable point-in-time snapshot of a scenario.";
+			d.examples        = {"snapshot_create('forecast_q1', 'baseline_2024')"};
+			d.categories      = {"snapshot"};
+			d.parameter_names = {"scenario_name", "snapshot_name"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// snapshot_list() - returns table of snapshots
 	TableFunction snapshot_list("snapshot_list", {}, SnapshotListFunction, SnapshotListBind, SnapshotListInit);
-	loader.RegisterFunction(snapshot_list);
+	{
+		CreateTableFunctionInfo info(snapshot_list);
+		FunctionDescription d;
+		d.description = "List all snapshots with their name, source scenario, description, and creation time.";
+		d.examples    = {"SELECT * FROM snapshot_list()"};
+		d.categories  = {"snapshot"};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// snapshot_compare(snapshot_name, table_name) - compare current state against snapshot
 	TableFunction snapshot_compare("snapshot_compare", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                               SnapshotCompareFunction, SnapshotCompareBind, SnapshotCompareInit);
-	loader.RegisterFunction(snapshot_compare);
+	{
+		CreateTableFunctionInfo info(snapshot_compare);
+		FunctionDescription d;
+		d.description     = "Compare the current state of a table against a previously captured snapshot, returning row-level differences.";
+		d.examples        = {"SELECT * FROM snapshot_compare('baseline_2024', 'sales')"};
+		d.categories      = {"snapshot"};
+		d.parameter_names = {"snapshot_name", "table_name"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_from_snapshot(snapshot_name, scenario_name, description) - create scenario from snapshot
 	ScalarFunctionSet scenario_from_snapshot_set("scenario_from_snapshot");
@@ -870,14 +911,45 @@ void SnapshotManager::RegisterFunctions(ExtensionLoader &loader) {
 	                                         LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
 	scenario_from_snapshot_set.AddFunction(scenario_from_snapshot_2);
 
-	loader.RegisterFunction(scenario_from_snapshot_set);
+	{
+		CreateScalarFunctionInfo info(scenario_from_snapshot_set);
+		{
+			FunctionDescription d;
+			d.description     = "Create a new scenario restored from a snapshot, with a description.";
+			d.examples        = {"scenario_from_snapshot('baseline_2024', 'restored_q1', 'restored for audit')"};
+			d.categories      = {"snapshot"};
+			d.parameter_names = {"snapshot_name", "scenario_name", "description"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		{
+			FunctionDescription d;
+			d.description     = "Create a new scenario restored from a snapshot.";
+			d.examples        = {"scenario_from_snapshot('baseline_2024', 'restored_q1')"};
+			d.categories      = {"snapshot"};
+			d.parameter_names = {"snapshot_name", "scenario_name"};
+			d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+			info.descriptions.push_back(std::move(d));
+		}
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// snapshot_drop(snapshot_name) - delete a snapshot
 	ScalarFunction snapshot_drop("snapshot_drop", {LogicalType::VARCHAR},
 	                              LogicalType::BOOLEAN,
 	                              SnapshotDropFunction, SnapshotDropBind, nullptr, nullptr, nullptr,
 	                              LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE);
-	loader.RegisterFunction(snapshot_drop);
+	{
+		CreateScalarFunctionInfo info(snapshot_drop);
+		FunctionDescription d;
+		d.description     = "Permanently delete a snapshot and its stored delta data.";
+		d.examples        = {"snapshot_drop('baseline_2024')"};
+		d.categories      = {"snapshot"};
+		d.parameter_names = {"snapshot_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb

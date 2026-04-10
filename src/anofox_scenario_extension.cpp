@@ -39,6 +39,11 @@ static void SetScenarioSchemaPrefix(ClientContext &context, SetScope scope, Valu
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
+	loader.SetDescription("Git-like branching for analytical databases: create isolated what-if scenarios, "
+	                      "track row-level changes with copy-on-write delta storage, compare scenarios against "
+	                      "baselines or each other, capture immutable snapshots, and document analysis rationale "
+	                      "with embedded protocol notes.");
+
 	// Register configuration options
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("scenario_schema_prefix",

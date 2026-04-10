@@ -1,5 +1,7 @@
 #include "delta_storage_engine.hpp"
 #include "scenario_manager.hpp"
+#include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
@@ -955,14 +957,34 @@ void DeltaStorageEngine::RegisterFunctions(ExtensionLoader &loader) {
 	                            DeltaCreateFunction, DeltaCreateBind, nullptr, nullptr, nullptr,
 	                            LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                            FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(delta_create);
+	{
+		CreateScalarFunctionInfo info(delta_create);
+		FunctionDescription d;
+		d.description     = "Initialize a delta table for a given table within a scenario, enabling copy-on-write tracking.";
+		d.examples        = {"delta_create('forecast_q1', 'products')"};
+		d.categories      = {"delta"};
+		d.parameter_names = {"scenario_name", "table_name"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// delta_drop(scenario_name, table_name) -> BOOLEAN
 	ScalarFunction delta_drop("delta_drop", {LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::BOOLEAN,
 	                          DeltaDropFunction, DeltaDropBind, nullptr, nullptr, nullptr,
 	                          LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                          FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(delta_drop);
+	{
+		CreateScalarFunctionInfo info(delta_drop);
+		FunctionDescription d;
+		d.description     = "Remove the delta table for a given table within a scenario, discarding all scenario-specific changes for that table.";
+		d.examples        = {"delta_drop('forecast_q1', 'products')"};
+		d.categories      = {"delta"};
+		d.parameter_names = {"scenario_name", "table_name"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_write(scenario_name, table_name, operation, row_data) -> BOOLEAN
 	// operation: 'I' for insert, 'U' for update, 'D' for delete
@@ -972,13 +994,33 @@ void DeltaStorageEngine::RegisterFunctions(ExtensionLoader &loader) {
 	                              LogicalType::BOOLEAN, ScenarioWriteFunction, ScenarioWriteBind, nullptr, nullptr, nullptr,
 	                              LogicalType(LogicalTypeId::INVALID), FunctionStability::VOLATILE,
 	                              FunctionNullHandling::SPECIAL_HANDLING);
-	loader.RegisterFunction(scenario_write);
+	{
+		CreateScalarFunctionInfo info(scenario_write);
+		FunctionDescription d;
+		d.description     = "Write a single row change to a scenario's delta table. Operation is 'I' (insert), 'U' (update), or 'D' (delete); row_data is a struct of column values.";
+		d.examples        = {"scenario_write('forecast_q1', 'products', 'U', {id: 42, price: 19.99})"};
+		d.categories      = {"delta"};
+		d.parameter_names = {"scenario_name", "table_name", "operation", "row_data"};
+		d.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::ANY};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	// scenario_validate(scenario_name) -> TABLE
 	// Returns validation status for each table in the scenario
 	TableFunction scenario_validate("scenario_validate", {LogicalType::VARCHAR}, ScenarioValidateScan,
 	                                 ScenarioValidateBind, ScenarioValidateInit);
-	loader.RegisterFunction(scenario_validate);
+	{
+		CreateTableFunctionInfo info(scenario_validate);
+		FunctionDescription d;
+		d.description     = "Validate delta integrity for all tables in a scenario, returning per-table status and any constraint violations.";
+		d.examples        = {"SELECT * FROM scenario_validate('forecast_q1')"};
+		d.categories      = {"delta"};
+		d.parameter_names = {"scenario_name"};
+		d.parameter_types = {LogicalType::VARCHAR};
+		info.descriptions.push_back(std::move(d));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb
