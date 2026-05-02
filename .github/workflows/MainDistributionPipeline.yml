@@ -75,6 +75,33 @@ jobs:
       artifact_postfix: _v1.5.1
       exclude_archs: windows_amd64_mingw
 
+  # Smoke test: downloads the built artifact and verifies it loads with a real pip-installed DuckDB,
+  # exercising the same path a user would take (not build-internal binaries).
+  smoke-test-v1_5_1:
+    name: Smoke test (DuckDB v1.5.1, linux_amd64)
+    runs-on: ubuntu-latest
+    needs: duckdb-v1_5_1-build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Checkout DuckDB submodule to v1.5.1
+        run: cd duckdb && git checkout v1.5.1
+
+      - name: Download linux_amd64 extension artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: anofox_scenario-v1.5.1-extension-linux_amd64_v1.5.1
+          path: /tmp/extension
+
+      - name: Run smoke test
+        run: |
+          ext=$(find /tmp/extension -name "*.duckdb_extension" | head -1)
+          echo "Artifact: $ext"
+          python3 scripts/smoke_test.py --extension "$ext" --duckdb-version 1.5.1
+
   duckdb-v1_5_1-deploy:
     name: Deploy extension (DuckDB v1.5.1)
     needs: duckdb-v1_5_1-build
