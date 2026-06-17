@@ -29,7 +29,7 @@ anofox-scenario is a DuckDB extension that enables Git-like branching for analyt
 
 | Constraint | Description |
 |------------|-------------|
-| DuckDB v1.4.3+ | Target extension API version |
+| DuckDB v1.4.5+ | Target extension API version |
 | C++17 | DuckDB extension language requirement |
 | Single-writer | DuckDB's concurrency model |
 | No DDL in scenarios | Schema changes not supported in scenario branches |
