@@ -55,6 +55,19 @@ set(EXTENSION_SOURCES
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
+# Fix "multiple definition of duckdb::LogicalType::VARCHAR/BIGINT/TIMESTAMP".
+# DuckDB core is built as C++11 and emits strong out-of-line definitions of its
+# `static constexpr` LogicalType members. This extension is C++17, so when its
+# sources ODR-use those members (e.g. emplace_back(LogicalType::VARCHAR) in
+# scenario_manager.cpp) GCC emits them as STB_GNU_UNIQUE symbols, which collide
+# with core's strong definitions at link time. -fno-gnu-unique emits them as
+# weak instead, so they resolve against core's definition. GCC-only (Clang/MSVC
+# do not use GNU_UNIQUE). Broke at the DuckDB v1.5.3 upgrade.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(${EXTENSION_NAME} PRIVATE -fno-gnu-unique)
+    target_compile_options(${LOADABLE_EXTENSION_NAME} PRIVATE -fno-gnu-unique)
+endif()
+
 # Telemetry library + OpenSSL (only when OpenSSL was found)
 set(TELEMETRY_LIBS "")
 if(TELEMETRY_SUPPORTED AND OPENSSL_FOUND)
