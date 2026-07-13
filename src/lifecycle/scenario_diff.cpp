@@ -107,6 +107,37 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	return target;
 }
 
+//! SQL of the merged relation of one diff side: 'main' = the live base;
+//! otherwise the scenario's merged state (base source + its delta overlay)
+string MergedRelationSQL(ClientContext &context, const string &side, const string &table_name,
+                         const DiffTarget &shape) {
+	auto &host_catalog = GetHostCatalogForDiff(context);
+	auto host_prefix = Q(host_catalog.GetName()) + ".";
+	if (side == "main") {
+		return "(SELECT * FROM " + host_prefix + Q(string(DEFAULT_SCHEMA)) + "." + Q(table_name) + ")";
+	}
+	auto target = ResolveDiffTarget(context, side, table_name);
+	string pk_match;
+	for (auto &pk : shape.pk_columns) {
+		if (!pk_match.empty()) {
+			pk_match += " AND ";
+		}
+		pk_match += "d." + Q(pk) + " = b." + Q(pk);
+	}
+	string cols_d, cols_b;
+	for (auto &pk : shape.pk_columns) {
+		cols_d += (cols_d.empty() ? "" : ", ") + string("d.") + Q(pk);
+		cols_b += (cols_b.empty() ? "" : ", ") + string("b.") + Q(pk);
+	}
+	for (auto &col : shape.payload_columns) {
+		cols_d += ", d." + Q(col);
+		cols_b += ", b." + Q(col);
+	}
+	return "(SELECT " + cols_d + " FROM " + target.delta_name + " d WHERE d._op IN ('I', 'U') UNION ALL SELECT " +
+	       cols_b + " FROM " + target.base_name + " b WHERE NOT EXISTS (SELECT 1 FROM " + target.delta_name +
+	       " d WHERE " + pk_match + " AND d._op IN ('U', 'D')))";
+}
+
 unique_ptr<TableRef> SQLToSubquery(ClientContext &context, const string &sql) {
 	Parser parser;
 	parser.ParseQuery(sql);
@@ -121,7 +152,53 @@ unique_ptr<TableRef> SQLToSubquery(ClientContext &context, const string &sql) {
 // scenario_diff(scenario, table)
 //===----------------------------------------------------------------------===//
 
+//! Generic two-relation diff: FULL-OUTER-JOIN shape over the merged
+//! relations of both sides ('added' = only in b, 'removed' = only in a,
+//! 'modified' = both sides differ; old = a, new = b)
+unique_ptr<TableRef> ScenarioDiffGenericBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	auto side_a = input.inputs[0].GetValue<string>();
+	auto side_b = input.inputs[1].GetValue<string>();
+	auto table_name = input.inputs[2].GetValue<string>();
+
+	// Column shape from whichever side is a scenario (identical table schema)
+	auto shape = ResolveDiffTarget(context, side_a == "main" ? side_b : side_a, table_name);
+	auto rel_a = MergedRelationSQL(context, side_a, table_name, shape);
+	auto rel_b = MergedRelationSQL(context, side_b, table_name, shape);
+
+	string pk_join, pk_list_a, pk_list_b, a_pk_null, b_pk_null;
+	for (auto &pk : shape.pk_columns) {
+		if (!pk_join.empty()) {
+			pk_join += " AND ";
+			a_pk_null += " AND ";
+			b_pk_null += " AND ";
+		}
+		pk_join += "a." + Q(pk) + " = b." + Q(pk);
+		a_pk_null += "a." + Q(pk) + " IS NULL";
+		b_pk_null += "b." + Q(pk) + " IS NULL";
+		pk_list_a += (pk_list_a.empty() ? "" : ", ") + string("a.") + Q(pk) + " AS " + Q(pk);
+		pk_list_b += (pk_list_b.empty() ? "" : ", ") + string("b.") + Q(pk) + " AS " + Q(pk);
+	}
+
+	string sql;
+	sql += "SELECT " + pk_list_b +
+	       ", CAST('added' AS VARCHAR) AS change_type, CAST(NULL AS VARCHAR) AS column_name, CAST(NULL AS "
+	       "VARCHAR) AS old_value, CAST(NULL AS VARCHAR) AS new_value FROM " +
+	       rel_b + " b LEFT JOIN " + rel_a + " a ON (" + pk_join + ") WHERE " + a_pk_null;
+	sql += " UNION ALL SELECT " + pk_list_a +
+	       ", 'removed', CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR) FROM " + rel_a +
+	       " a LEFT JOIN " + rel_b + " b ON (" + pk_join + ") WHERE " + b_pk_null;
+	for (auto &col : shape.payload_columns) {
+		sql += " UNION ALL SELECT " + pk_list_a + ", 'modified', CAST('" + col + "' AS VARCHAR), CAST(a." + Q(col) +
+		       " AS VARCHAR), CAST(b." + Q(col) + " AS VARCHAR) FROM " + rel_a + " a JOIN " + rel_b + " b ON (" +
+		       pk_join + ") WHERE (a." + Q(col) + " IS DISTINCT FROM b." + Q(col) + ")";
+	}
+	return SQLToSubquery(context, sql);
+}
+
 unique_ptr<TableRef> ScenarioDiffBindReplace(ClientContext &context, TableFunctionBindInput &input) {
+	if (input.inputs.size() == 3) {
+		return ScenarioDiffGenericBindReplace(context, input);
+	}
 	auto scenario_name = input.inputs[0].GetValue<string>();
 	auto table_name = input.inputs[1].GetValue<string>();
 	auto target = ResolveDiffTarget(context, scenario_name, table_name);
@@ -200,9 +277,15 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 } // namespace
 
 void ScenarioDiff::RegisterFunctions(ExtensionLoader &loader) {
-	TableFunction diff("scenario_diff", {LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr);
-	diff.bind_replace = ScenarioDiffBindReplace;
-	loader.RegisterFunction(diff);
+	TableFunctionSet diff_set("scenario_diff");
+	TableFunction diff2("scenario_diff", {LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr);
+	diff2.bind_replace = ScenarioDiffBindReplace;
+	diff_set.AddFunction(diff2);
+	TableFunction diff3("scenario_diff", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                    nullptr);
+	diff3.bind_replace = ScenarioDiffBindReplace;
+	diff_set.AddFunction(diff3);
+	loader.RegisterFunction(diff_set);
 
 	TableFunction summary("scenario_diff_summary", {LogicalType::VARCHAR}, nullptr);
 	summary.bind_replace = ScenarioDiffSummaryBindReplace;
