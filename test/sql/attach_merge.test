@@ -1,0 +1,127 @@
+# name: test/sql/attach_merge.test
+# description: Phase 5 WP5.2/5.4: MERGE INTO and ON CONFLICT on scenario tables
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
+
+statement ok
+CALL scenario_create('m');
+
+statement ok
+ATTACH 'm' AS s (TYPE scenario);
+
+# --- MERGE INTO: update matched, insert unmatched ------------------------------
+
+statement ok
+CREATE TABLE updates (id INTEGER, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO updates VALUES (2, 'US', 999), (10, 'LATAM', 500);
+
+statement ok
+MERGE INTO s.forecast t USING updates u ON t.id = u.id
+WHEN MATCHED THEN UPDATE SET qty = u.qty
+WHEN NOT MATCHED THEN INSERT VALUES (u.id, u.region, u.qty);
+
+query ITI
+SELECT id, region, qty FROM s.forecast ORDER BY id;
+----
+1	EU	100
+2	US	999
+3	APAC	300
+10	LATAM	500
+
+# base untouched
+query I
+SELECT qty FROM forecast WHERE id = 2;
+----
+200
+
+# --- MERGE with DELETE action ---------------------------------------------------
+
+statement ok
+CREATE TABLE removals (id INTEGER);
+
+statement ok
+INSERT INTO removals VALUES (3);
+
+statement ok
+MERGE INTO s.forecast t USING removals r ON t.id = r.id
+WHEN MATCHED THEN DELETE;
+
+query I
+SELECT count(*) FROM s.forecast WHERE id = 3;
+----
+0
+
+query I
+SELECT count(*) FROM forecast WHERE id = 3;
+----
+1
+
+# --- ON CONFLICT (lowered through the merge machinery) ---------------------------
+
+statement ok
+INSERT INTO s.forecast VALUES (1, 'EU', 100) ON CONFLICT DO NOTHING;
+
+# unchanged
+query I
+SELECT qty FROM s.forecast WHERE id = 1;
+----
+100
+
+statement ok
+INSERT INTO s.forecast VALUES (1, 'EU', 111) ON CONFLICT DO UPDATE SET qty = EXCLUDED.qty;
+
+query I
+SELECT qty FROM s.forecast WHERE id = 1;
+----
+111
+
+# INSERT OR REPLACE: conflict with a scenario-inserted row
+statement ok
+INSERT OR REPLACE INTO s.forecast VALUES (10, 'LATAM2', 501);
+
+query ITI
+SELECT id, region, qty FROM s.forecast WHERE id = 10;
+----
+10	LATAM2	501
+
+# plain conflicting insert still errors
+statement error
+INSERT INTO s.forecast VALUES (1, 'DUP', 0);
+----
+<REGEX>:.*primary key.*
+
+# --- frozen scenarios reject MERGE too ---------------------------------------------
+
+statement ok
+CALL scenario_freeze('m');
+
+statement error
+MERGE INTO s.forecast t USING updates u ON t.id = u.id WHEN MATCHED THEN UPDATE SET qty = u.qty;
+----
+<REGEX>:.*frozen.*
+
+statement ok
+CALL scenario_unfreeze('m');
+
+# --- diff stays coherent after merges ------------------------------------------------
+
+query TIII
+SELECT table_name, rows_added, rows_modified, rows_removed
+FROM scenario_diff_summary('m') WHERE table_name = 'forecast';
+----
+forecast	1	2	1
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('m');

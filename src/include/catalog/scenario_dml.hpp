@@ -9,7 +9,9 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/execution/physical_operator.hpp"
 
 namespace duckdb {
 
@@ -40,6 +42,35 @@ struct ScenarioDeltaKeyMap {
 //! Evaluate the base table's NOT NULL and CHECK constraints on scenario rows
 void ScenarioVerifyNotNullAndCheck(ClientContext &context, TableCatalogEntry &entry,
                                    const vector<unique_ptr<BoundConstraint>> &bound_constraints, DataChunk &chunk);
+
+class PhysicalPlanGenerator;
+class ScenarioTableEntry;
+class Expression;
+
+//! Operator factories (used by both the DML plan hooks and PlanMergeInto)
+PhysicalOperator &MakeScenarioInsertOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
+                                             ScenarioTableEntry &entry,
+                                             vector<unique_ptr<BoundConstraint>> bound_constraints,
+                                             idx_t estimated_cardinality, bool return_chunk);
+PhysicalOperator &MakeScenarioUpdateOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
+                                             ScenarioTableEntry &entry, vector<PhysicalIndex> columns,
+                                             vector<unique_ptr<Expression>> expressions,
+                                             vector<unique_ptr<Expression>> bound_defaults,
+                                             vector<unique_ptr<BoundConstraint>> bound_constraints,
+                                             idx_t estimated_cardinality, bool return_chunk,
+                                             optional_idx row_id_start);
+PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
+                                             ScenarioTableEntry &entry, idx_t row_id_start,
+                                             idx_t estimated_cardinality);
+
+//! Source-side state for DML operators: emits either the affected-count row
+//! or, with RETURNING, the collected result rows
+class ScenarioDMLSourceState : public GlobalSourceState {
+public:
+	ColumnDataScanState scan_state;
+	bool initialized = false;
+	bool count_emitted = false;
+};
 
 //! Append a delta-layout chunk. When rows with the same PK were deleted from
 //! the delta earlier in this statement (op transitions D->U and U->D), their

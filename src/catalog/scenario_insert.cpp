@@ -123,6 +123,8 @@ public:
 	//! Base-side unique/PK verification (same machinery as a real base INSERT)
 	vector<unique_ptr<BoundConstraint>> base_constraints;
 	unique_ptr<ConstraintState> base_constraint_state;
+	//! RETURNING: collected result rows
+	unique_ptr<ColumnDataCollection> return_collection;
 	idx_t insert_count = 0;
 	//! Chunk in delta layout, reused across Sink calls
 	DataChunk delta_chunk;
@@ -133,13 +135,15 @@ public:
 class PhysicalScenarioInsert : public PhysicalOperator {
 public:
 	PhysicalScenarioInsert(PhysicalPlan &physical_plan, vector<LogicalType> types, ScenarioTableEntry &entry,
-	                       vector<unique_ptr<BoundConstraint>> bound_constraints, idx_t estimated_cardinality)
+	                       vector<unique_ptr<BoundConstraint>> bound_constraints, idx_t estimated_cardinality,
+	                       bool return_chunk)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-	      entry(entry), bound_constraints(std::move(bound_constraints)) {
+	      entry(entry), bound_constraints(std::move(bound_constraints)), return_chunk(return_chunk) {
 	}
 
 	ScenarioTableEntry &entry;
 	vector<unique_ptr<BoundConstraint>> bound_constraints;
+	bool return_chunk;
 
 public:
 	string GetName() const override {
@@ -156,9 +160,12 @@ public:
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override;
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
 
-	// Source interface (returns the insert count)
+	// Source interface (insert count, or the RETURNING rows)
 	bool IsSource() const override {
 		return true;
+	}
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		return make_uniq<ScenarioDMLSourceState>();
 	}
 
 protected:
@@ -317,6 +324,12 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		                         &deleted_chunk);
 	}
 
+	if (return_chunk) {
+		if (!gstate.return_collection) {
+			gstate.return_collection = make_uniq<ColumnDataCollection>(Allocator::Get(client), entry.GetTypes());
+		}
+		gstate.return_collection->Append(chunk);
+	}
 	gstate.insert_count += chunk.size();
 	return SinkResultType::NEED_MORE_INPUT;
 }
@@ -324,12 +337,36 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 SourceResultType PhysicalScenarioInsert::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                          OperatorSourceInput &input) const {
 	auto &gstate = sink_state->Cast<ScenarioInsertGlobalState>();
+	auto &source = input.global_state.Cast<ScenarioDMLSourceState>();
+	if (return_chunk) {
+		if (!gstate.return_collection) {
+			return SourceResultType::FINISHED;
+		}
+		if (!source.initialized) {
+			gstate.return_collection->InitializeScan(source.scan_state);
+			source.initialized = true;
+		}
+		gstate.return_collection->Scan(source.scan_state, chunk);
+		return chunk.size() == 0 ? SourceResultType::FINISHED : SourceResultType::HAVE_MORE_OUTPUT;
+	}
+	if (source.count_emitted) {
+		return SourceResultType::FINISHED;
+	}
+	source.count_emitted = true;
 	chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
 	chunk.SetCardinality(1);
 	return SourceResultType::FINISHED;
 }
 
 } // namespace
+
+PhysicalOperator &MakeScenarioInsertOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
+                                             ScenarioTableEntry &entry,
+                                             vector<unique_ptr<BoundConstraint>> bound_constraints,
+                                             idx_t estimated_cardinality, bool return_chunk) {
+	return planner.Make<PhysicalScenarioInsert>(std::move(types), entry, std::move(bound_constraints),
+	                                            estimated_cardinality, return_chunk);
+}
 
 //===----------------------------------------------------------------------===//
 // ScenarioCatalog::PlanInsert
@@ -354,15 +391,12 @@ PhysicalOperator &ScenarioCatalog::PlanInsert(ClientContext &context, PhysicalPl
 		throw NotImplementedException(
 		    "ON CONFLICT clauses on scenario tables are not supported yet (planned for v0.4)");
 	}
-	if (op.return_chunk) {
-		throw NotImplementedException("RETURNING on scenario tables is not supported yet (planned for v0.4)");
-	}
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
 	if (!op.column_index_map.empty()) {
 		plan = planner.ResolveDefaultsProjection(op, *plan);
 	}
 	auto &insert = planner.Make<PhysicalScenarioInsert>(op.types, entry, std::move(op.bound_constraints),
-	                                                    op.estimated_cardinality);
+	                                                    op.estimated_cardinality, op.return_chunk);
 	insert.children.push_back(*plan);
 	return insert;
 }

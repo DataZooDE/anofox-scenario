@@ -71,23 +71,9 @@ vector<column_t> ScenarioTableEntry::GetRowIdColumns() const {
 
 void ScenarioTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj,
                                                LogicalUpdate &update, ClientContext &context) {
-	// v1 gate: updating PK columns needs D+I pair semantics (planned v0.4).
-	// Checked before extra columns are projected, so update.columns still
-	// reflects only the user's SET targets.
-	auto pk_columns = ScenarioDelta::GetPKColumns(base_entry);
-	for (auto pk_col : pk_columns) {
-		auto pk_physical = GetColumns().GetColumn(LogicalIndex(pk_col)).Physical();
-		for (auto &updated : update.columns) {
-			if (updated == pk_physical) {
-				throw NotImplementedException(
-				    "Updating PRIMARY KEY columns of scenario tables is not supported yet (planned for v0.4). "
-				    "Use DELETE + INSERT instead");
-			}
-		}
-	}
 	// The scenario update sink writes complete post-image rows into the
-	// delta: project every column (the same mechanism core uses for
-	// update_is_del_and_insert)
+	// delta (and decomposes PK-moving updates into D+I): project every
+	// column (the same mechanism core uses for update_is_del_and_insert)
 	physical_index_set_t all_columns;
 	for (auto &column : GetColumns().Physical()) {
 		all_columns.insert(column.Physical());

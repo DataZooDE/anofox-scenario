@@ -20,6 +20,7 @@ set(EXTENSION_SOURCES
     src/catalog/scenario_delta.cpp
     src/catalog/scenario_insert.cpp
     src/catalog/scenario_update_delete.cpp
+    src/catalog/scenario_merge_into.cpp
     src/catalog/scenario_transaction.cpp
     src/catalog/scenario_storage_extension.cpp
     src/lifecycle/scenario_lifecycle.cpp
