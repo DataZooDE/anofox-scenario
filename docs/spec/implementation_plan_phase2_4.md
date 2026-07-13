@@ -101,6 +101,27 @@ schema matches REQ-COMP-001 with native PK types, all four COMP requirements cov
 
 ---
 
+## Phase 4 — Spike findings (July 2026, recorded during implementation)
+
+1. **Binary ducklake + debug/ASAN dev builds crash at shutdown** (allocator teardown
+   assertion). P4 development and its SQLLogicTests must run against a **release build**
+   (`make release`); CI needs a release-mode job for the ducklake tests, guarded by
+   `require ducklake`.
+2. **Time-travel pinning via `AT (TIMESTAMP => created_at)`**, not snapshot ids: the 3-arg
+   `TableCatalogEntry::GetScanFunction(context, bind_data, EntryLookupInfo)` accepts a
+   `BoundAtClause`, and the registry already records `created_at`. This avoids reading
+   ducklake's internal snapshot tables at create time (`base_snapshot_id` stays reserved).
+3. **The merge scan's base side is DataTable-driven** and DuckLake entries have no DataTable:
+   foreign bases need a third BaseSource variant that drives the base entry's own
+   TableFunction (bind via GetScanFunction-with-at-clause, then init_global/init_local/
+   function). The Duck-native path stays as-is (lower regression risk than unifying).
+4. **DuckLake tables have no PRIMARY KEY constraints**, so lake-based scenarios fall under
+   the existing no-PK rule: reads (snapshot-isolated overlay) and INSERTs work;
+   UPDATE/DELETE remain gated until user-declared key columns (backlog:
+   `scenario_create(..., key_columns := [...])`).
+5. **Registry needs a `base_catalog VARCHAR` column** (NULL = host default database) —
+   added in the pre-release window without migration concerns.
+
 ## Phase 4 — Snapshot-isolation tiers and DuckLake bases (~2–3 weeks + 1 week spike)
 
 Goal: honest isolation semantics per the redesign §3.3 — documented overlay by default,
