@@ -7,6 +7,7 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -23,18 +24,99 @@ string ScenarioDelta::DeltaTableName(int64_t scenario_id, const string &table_na
 	return "s" + to_string(scenario_id) + "_delta_" + table_name;
 }
 
-optional_ptr<DuckTableEntry> ScenarioDelta::TryGetDeltaTable(ClientContext &context, Catalog &host_catalog,
-                                                             int64_t scenario_id, const string &table_name) {
+string ScenarioDelta::MatTableName(int64_t scenario_id, const string &table_name) {
+	return "s" + to_string(scenario_id) + "_mat_" + table_name;
+}
+
+//! Internal: look up a table in the internal schema by exact name
+static optional_ptr<DuckTableEntry> TryGetInternalTable(ClientContext &context, Catalog &host_catalog,
+                                                        const string &table_name) {
 	auto schema = host_catalog.GetSchema(context, ScenarioRegistry::SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
 	if (!schema) {
 		return nullptr;
 	}
-	auto entry = schema->GetEntry(schema->GetCatalogTransaction(context), CatalogType::TABLE_ENTRY,
-	                              DeltaTableName(scenario_id, table_name));
+	auto entry = schema->GetEntry(schema->GetCatalogTransaction(context), CatalogType::TABLE_ENTRY, table_name);
 	if (!entry || entry->type != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
 	return &entry->Cast<DuckTableEntry>();
+}
+
+optional_ptr<DuckTableEntry> ScenarioDelta::TryGetDeltaTable(ClientContext &context, Catalog &host_catalog,
+                                                             int64_t scenario_id, const string &table_name) {
+	return TryGetInternalTable(context, host_catalog, DeltaTableName(scenario_id, table_name));
+}
+
+optional_ptr<DuckTableEntry> ScenarioDelta::TryGetMatTable(ClientContext &context, Catalog &host_catalog,
+                                                           int64_t scenario_id, const string &table_name) {
+	return TryGetInternalTable(context, host_catalog, MatTableName(scenario_id, table_name));
+}
+
+DuckTableEntry &ScenarioDelta::CreateMatTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                              TableCatalogEntry &base_entry) {
+	// Full schema copy (columns + constraints, so the PK survives)
+	auto create_info = base_entry.GetInfo();
+	auto &info = create_info->Cast<CreateTableInfo>();
+	info.catalog = host_catalog.GetName();
+	info.schema = ScenarioRegistry::SCHEMA_NAME;
+	info.table = MatTableName(scenario_id, base_entry.name);
+	info.on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
+	info.temporary = false;
+	host_catalog.CreateTable(context, unique_ptr_cast<CreateInfo, CreateTableInfo>(std::move(create_info)));
+
+	auto created = TryGetMatTable(context, host_catalog, scenario_id, base_entry.name);
+	if (!created) {
+		throw InternalException("anofox_scenario: failed to create materialized table for '%s'", base_entry.name);
+	}
+	CopyTableData(context, base_entry.Cast<DuckTableEntry>(), *created);
+	return *created;
+}
+
+void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_table, DuckTableEntry &to_table,
+                                  idx_t target_column_offset) {
+	auto &from_storage = from_table.GetStorage();
+	auto &to_storage = to_table.GetStorage();
+	auto from_types = from_storage.GetTypes();
+	auto to_types = to_storage.GetTypes();
+
+	vector<StorageIndex> column_ids;
+	for (idx_t i = 0; i < from_types.size(); i++) {
+		column_ids.emplace_back(i);
+	}
+	auto binder = Binder::CreateBinder(context);
+	auto to_constraints = binder->BindConstraints(to_table);
+
+	auto &transaction = DuckTransaction::Get(context, from_table.catalog);
+	ParallelTableScanState parallel_state;
+	from_storage.InitializeParallelScan(context, parallel_state, {});
+	TableScanState state;
+	state.Initialize(std::move(column_ids), context);
+
+	DataChunk scan_chunk;
+	scan_chunk.Initialize(Allocator::Get(context), from_types);
+	DataChunk append_chunk;
+	if (target_column_offset > 0) {
+		append_chunk.Initialize(Allocator::Get(context), to_types);
+	}
+	while (from_storage.NextParallelScan(context, parallel_state, state) > 0) {
+		while (true) {
+			scan_chunk.Reset();
+			from_storage.Scan(transaction, scan_chunk, state);
+			if (scan_chunk.size() == 0) {
+				break;
+			}
+			if (target_column_offset == 0) {
+				to_storage.LocalAppend(to_table, context, scan_chunk, to_constraints);
+			} else {
+				append_chunk.Reset();
+				for (idx_t col = 0; col < from_types.size(); col++) {
+					append_chunk.data[target_column_offset + col].Reference(scan_chunk.data[col]);
+				}
+				append_chunk.SetCardinality(scan_chunk.size());
+				to_storage.LocalAppend(to_table, context, append_chunk, to_constraints);
+			}
+		}
+	}
 }
 
 DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,

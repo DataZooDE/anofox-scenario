@@ -31,12 +31,25 @@ public:
 	static constexpr idx_t PAYLOAD_START = 2;
 
 	static string DeltaTableName(int64_t scenario_id, const string &table_name);
+	//! Materialized base copy: __anofox_scenario.s<id>_mat_<table> (Phase 2)
+	static string MatTableName(int64_t scenario_id, const string &table_name);
 	//! The delta table for a scenario table, if any writes happened yet
 	static optional_ptr<DuckTableEntry> TryGetDeltaTable(ClientContext &context, Catalog &host_catalog,
 	                                                     int64_t scenario_id, const string &table_name);
+	//! The materialized base copy for a scenario table, if any
+	static optional_ptr<DuckTableEntry> TryGetMatTable(ClientContext &context, Catalog &host_catalog,
+	                                                   int64_t scenario_id, const string &table_name);
 	//! Create the delta table lazily (caller's transaction); returns it
 	static DuckTableEntry &EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
 	                                        TableCatalogEntry &base_entry);
+	//! Create the materialized copy of a base table (schema incl. PK) and
+	//! bulk-copy its rows, all in the caller's transaction
+	static DuckTableEntry &CreateMatTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                                      TableCatalogEntry &base_entry);
+	//! Vectorized row copy between two tables with identical column layout
+	//! (offset maps source column i -> target column i + offset)
+	static void CopyTableData(ClientContext &context, DuckTableEntry &from_table, DuckTableEntry &to_table,
+	                          idx_t target_column_offset = 0);
 
 	//! Logical column ids of the base table's PRIMARY KEY (empty when none)
 	static vector<idx_t> GetPKColumns(const TableCatalogEntry &base_entry);

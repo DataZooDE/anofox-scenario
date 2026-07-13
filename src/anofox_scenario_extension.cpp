@@ -2,6 +2,7 @@
 
 #include "anofox_scenario_extension.hpp"
 #include "catalog/scenario_storage_extension.hpp"
+#include "lifecycle/scenario_diff.hpp"
 #include "lifecycle/scenario_lifecycle.hpp"
 #include "metadata_store.hpp"
 #include "scenario_manager.hpp"
@@ -81,6 +82,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	StorageExtension::Register(config, "scenario", make_shared_ptr<ScenarioStorageExtension>());
 	// CALL scenario_create/drop/freeze/unfreeze against registry v2
 	ScenarioLifecycle::RegisterFunctions(loader);
+	// scenario_diff / scenario_diff_summary (streaming, bind-replaced)
+	ScenarioDiff::RegisterFunctions(loader);
 }
 
 void AnofoxScenarioExtension::Load(ExtensionLoader &loader) {

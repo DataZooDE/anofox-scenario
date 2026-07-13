@@ -1,4 +1,5 @@
 #include "catalog/scenario_catalog.hpp"
+#include "catalog/scenario_delta.hpp"
 #include "catalog/scenario_registry.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -32,23 +33,30 @@ bool ScenarioSchemaEntry::ShouldExpose(CatalogEntry &base_entry) {
 }
 
 CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table) {
+	return GetOrCreateTableEntryAs(context, base_table, base_table.name);
+}
+
+CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &context, TableCatalogEntry &base_table,
+                                                           const string &logical_name) {
 	auto &scenario_catalog = GetScenarioCatalog();
 	auto &transaction = scenario_catalog.GetScenarioTransaction(context);
 
-	auto cached = transaction.table_entries.find(base_table.name);
+	auto cached = transaction.table_entries.find(logical_name);
 	if (cached != transaction.table_entries.end()) {
 		return *cached->second;
 	}
 
-	// Mirror the base table's columns and constraints
+	// Mirror the base table's columns and constraints. For materialized
+	// bases the physical name (s<id>_mat_<t>) is replaced by the logical one.
 	auto create_info = base_table.GetInfo();
 	auto &table_info = create_info->Cast<CreateTableInfo>();
 	table_info.catalog = scenario_catalog.GetName();
 	table_info.schema = name;
+	table_info.table = logical_name;
 
 	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table);
 	auto &result = *entry;
-	transaction.table_entries[base_table.name] = std::move(entry);
+	transaction.table_entries[logical_name] = std::move(entry);
 	return result;
 }
 
@@ -59,6 +67,24 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 	}
 	auto &scenario_catalog = GetScenarioCatalog();
 	auto &host_catalog = scenario_catalog.GetHostCatalog(context);
+	if (scenario_catalog.mat_base_scenario_id >= 0) {
+		// Materialized base: enumerate the frozen copies, exposing them
+		// under their logical names (full isolation from the live base)
+		auto internal_schema =
+		    host_catalog.GetSchema(context, ScenarioRegistry::SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
+		if (!internal_schema) {
+			return;
+		}
+		string prefix = "s" + to_string(scenario_catalog.mat_base_scenario_id) + "_mat_";
+		internal_schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &mat_entry) {
+			if (mat_entry.type != CatalogType::TABLE_ENTRY || !StringUtil::StartsWith(mat_entry.name, prefix)) {
+				return;
+			}
+			auto logical_name = mat_entry.name.substr(prefix.size());
+			callback(GetOrCreateTableEntryAs(context, mat_entry.Cast<TableCatalogEntry>(), logical_name));
+		});
+		return;
+	}
 	auto &host_schema = host_catalog.GetSchema(context, DEFAULT_SCHEMA);
 	host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &base_entry) {
 		if (!ShouldExpose(base_entry)) {
@@ -86,8 +112,18 @@ optional_ptr<CatalogEntry> ScenarioSchemaEntry::LookupEntry(CatalogTransaction t
 	auto &context = *transaction.context;
 	auto &scenario_catalog = GetScenarioCatalog();
 	auto &host_catalog = scenario_catalog.GetHostCatalog(context);
-	auto &host_schema = host_catalog.GetSchema(context, DEFAULT_SCHEMA);
 
+	if (scenario_catalog.mat_base_scenario_id >= 0) {
+		// Materialized base: resolve against the frozen copy
+		auto mat_entry = ScenarioDelta::TryGetMatTable(context, host_catalog, scenario_catalog.mat_base_scenario_id,
+		                                               lookup_info.GetEntryName());
+		if (!mat_entry) {
+			return nullptr;
+		}
+		return &GetOrCreateTableEntryAs(context, *mat_entry, lookup_info.GetEntryName());
+	}
+
+	auto &host_schema = host_catalog.GetSchema(context, DEFAULT_SCHEMA);
 	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, lookup_info.GetEntryName());
 	auto base_entry = host_schema.LookupEntry(host_catalog.GetCatalogTransaction(context), table_lookup);
 	if (!base_entry || !ShouldExpose(*base_entry)) {

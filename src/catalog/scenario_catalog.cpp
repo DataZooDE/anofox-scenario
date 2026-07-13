@@ -17,9 +17,9 @@ void ThrowScenarioDDLError() {
 }
 
 ScenarioCatalog::ScenarioCatalog(AttachedDatabase &db, string scenario_name_p, string host_catalog_name_p,
-                                 int64_t scenario_id_p)
+                                 int64_t scenario_id_p, int64_t mat_base_scenario_id_p)
     : Catalog(db), scenario_name(std::move(scenario_name_p)), host_catalog_name(std::move(host_catalog_name_p)),
-      scenario_id(scenario_id_p) {
+      scenario_id(scenario_id_p), mat_base_scenario_id(mat_base_scenario_id_p) {
 }
 
 void ScenarioCatalog::Initialize(bool load_builtin) {

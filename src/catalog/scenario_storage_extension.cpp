@@ -30,7 +30,25 @@ static unique_ptr<Catalog> ScenarioAttach(optional_ptr<StorageExtensionInfo> sto
 		    "Scenario '%s' not found in database '%s'. Create it first with CALL scenario_create('%s')",
 		    scenario_name, host_catalog_name, scenario_name);
 	}
-	return make_uniq<ScenarioCatalog>(db, entry->name, host_catalog_name, entry->scenario_id);
+	// BaseSource resolution: the nearest materialized scenario in the parent
+	// chain (including self) provides the base tables; otherwise the live host.
+	int64_t mat_base_scenario_id = -1;
+	auto current = make_uniq<ScenarioRegistryEntry>(*entry);
+	idx_t depth = 0;
+	while (current) {
+		if (current->mode == "materialized") {
+			mat_base_scenario_id = current->scenario_id;
+			break;
+		}
+		if (current->parent_id < 0) {
+			break;
+		}
+		current = ScenarioRegistry::LookupById(context, host_catalog, current->parent_id);
+		if (++depth > 1000) {
+			throw InternalException("anofox_scenario: cycle detected in scenario parent chain");
+		}
+	}
+	return make_uniq<ScenarioCatalog>(db, entry->name, host_catalog_name, entry->scenario_id, mat_base_scenario_id);
 }
 
 static unique_ptr<TransactionManager> ScenarioCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,

@@ -46,6 +46,10 @@ struct LifecycleBindData : public TableFunctionData {
 	string name;
 	string description;
 	bool has_description = false;
+	//! Phase 2: 'delta' (default) or 'materialized'
+	string mode = "delta";
+	//! Phase 2: branch source (empty = none)
+	string from_scenario;
 };
 
 struct LifecycleGlobalState : public GlobalTableFunctionState {
@@ -69,6 +73,25 @@ unique_ptr<FunctionData> LifecycleBind(TableFunctionBindInput &input, vector<Log
 			result->description = input.inputs[1].GetValue<string>();
 			result->has_description = true;
 		}
+	}
+	for (auto &param : input.named_parameters) {
+		if (param.second.IsNull()) {
+			continue;
+		}
+		if (param.first == "mode") {
+			result->mode = StringUtil::Lower(param.second.GetValue<string>());
+			if (result->mode != "delta" && result->mode != "materialized") {
+				throw InvalidInputException("Invalid scenario mode '%s': expected 'delta' or 'materialized'",
+				                            result->mode);
+			}
+		} else if (param.first == "from_scenario") {
+			result->from_scenario = param.second.GetValue<string>();
+		}
+	}
+	if (!result->from_scenario.empty() && result->mode == "materialized") {
+		throw InvalidInputException(
+		    "Branching (from_scenario) and mode := 'materialized' cannot be combined: a branch overlays its "
+		    "parent's state");
 	}
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.push_back("success");
@@ -105,9 +128,20 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	if (ScenarioRegistry::Lookup(context, host_catalog, bind_data.name)) {
 		throw InvalidInputException("Scenario '%s' already exists", bind_data.name);
 	}
+	// Branching: resolve the parent first
+	unique_ptr<ScenarioRegistryEntry> parent;
+	if (!bind_data.from_scenario.empty()) {
+		parent = ScenarioRegistry::Lookup(context, host_catalog, bind_data.from_scenario);
+		if (!parent) {
+			throw InvalidInputException("Cannot branch from scenario '%s': not found", bind_data.from_scenario);
+		}
+	}
+
 	ScenarioRegistryEntry entry;
 	entry.scenario_id = ScenarioRegistry::NextId(context, host_catalog);
 	entry.name = bind_data.name;
+	entry.mode = bind_data.mode;
+	entry.parent_id = parent ? parent->scenario_id : -1;
 	entry.created_at = Timestamp::GetCurrentTimestamp();
 	entry.description = bind_data.description;
 	entry.has_description = bind_data.has_description;
@@ -118,6 +152,7 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	// creating catalog entries in the host from within scenario DML, so all
 	// delta DDL happens here, where the host *is* the modified database.
 	// Cost: O(#tables) empty tables -- metadata only, no row data copied.
+	// Materialized mode additionally CTAS-copies every base table.
 	auto &host_schema = host_catalog.GetSchema(context, DEFAULT_SCHEMA);
 	vector<reference<TableCatalogEntry>> base_tables;
 	host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
@@ -130,7 +165,20 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
 	});
 	for (auto &base_table : base_tables) {
-		ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry.scenario_id, base_table.get());
+		auto &delta =
+		    ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry.scenario_id, base_table.get());
+		if (bind_data.mode == "materialized") {
+			ScenarioDelta::CreateMatTable(context, host_catalog, entry.scenario_id, base_table.get());
+		}
+		if (parent) {
+			// Branch: inherit the parent's modifications by copying its
+			// delta rows (cheap - deltas are small by invariant)
+			auto parent_delta =
+			    ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id, base_table.get().name);
+			if (parent_delta) {
+				ScenarioDelta::CopyTableData(context, *parent_delta, delta);
+			}
+		}
 	}
 }
 
@@ -150,16 +198,18 @@ void ThrowIfAttached(ClientContext &context, const string &scenario_name) {
 	}
 }
 
-//! Drop all physical delta tables of a scenario (s<id>_delta_*)
+//! Drop all physical tables of a scenario (s<id>_delta_* and s<id>_mat_*)
 void DropDeltaTables(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {
 	auto schema = host_catalog.GetSchema(context, ScenarioRegistry::SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
 	if (!schema) {
 		return;
 	}
-	string prefix = "s" + to_string(scenario_id) + "_delta_";
+	string delta_prefix = "s" + to_string(scenario_id) + "_delta_";
+	string mat_prefix = "s" + to_string(scenario_id) + "_mat_";
 	vector<string> to_drop;
 	schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-		if (entry.type == CatalogType::TABLE_ENTRY && StringUtil::StartsWith(entry.name, prefix)) {
+		if (entry.type == CatalogType::TABLE_ENTRY && (StringUtil::StartsWith(entry.name, delta_prefix) ||
+		                                               StringUtil::StartsWith(entry.name, mat_prefix))) {
 			to_drop.push_back(entry.name);
 		}
 	});
@@ -209,13 +259,70 @@ void ScenarioUnfreezeVerb(ClientContext &context, const LifecycleBindData &bind_
 	ScenarioRegistry::SetFrozen(context, host_catalog, entry->scenario_id, false);
 }
 
-TableFunctionSet MakeVerbSet(const string &name, table_function_t function, bool with_description) {
+//===----------------------------------------------------------------------===//
+// scenario_list_v2: the registry v2 view
+//===----------------------------------------------------------------------===//
+
+struct ScenarioListState : public GlobalTableFunctionState {
+	vector<ScenarioRegistryEntry> entries;
+	//! parent names resolved by id
+	unordered_map<int64_t, string> names_by_id;
+	idx_t offset = 0;
+};
+
+unique_ptr<FunctionData> ScenarioListBind(ClientContext &context, TableFunctionBindInput &input,
+                                          vector<LogicalType> &return_types, vector<string> &names) {
+	return_types = {LogicalType::BIGINT,  LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::BOOLEAN,
+	                LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR};
+	names = {"scenario_id", "name", "mode", "frozen", "parent", "created_at", "description"};
+	return make_uniq<TableFunctionData>();
+}
+
+unique_ptr<GlobalTableFunctionState> ScenarioListInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto result = make_uniq<ScenarioListState>();
+	result->entries = ScenarioRegistry::List(context, GetHostCatalog(context));
+	for (auto &entry : result->entries) {
+		result->names_by_id[entry.scenario_id] = entry.name;
+	}
+	return std::move(result);
+}
+
+void ScenarioListExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<ScenarioListState>();
+	idx_t count = 0;
+	while (state.offset < state.entries.size() && count < STANDARD_VECTOR_SIZE) {
+		auto &entry = state.entries[state.offset++];
+		output.SetValue(0, count, Value::BIGINT(entry.scenario_id));
+		output.SetValue(1, count, Value(entry.name));
+		output.SetValue(2, count, Value(entry.mode));
+		output.SetValue(3, count, Value::BOOLEAN(entry.frozen));
+		if (entry.parent_id >= 0) {
+			auto parent = state.names_by_id.find(entry.parent_id);
+			output.SetValue(4, count,
+			                parent != state.names_by_id.end() ? Value(parent->second) : Value(LogicalType::VARCHAR));
+		} else {
+			output.SetValue(4, count, Value(LogicalType::VARCHAR));
+		}
+		output.SetValue(5, count, Value::TIMESTAMP(entry.created_at));
+		output.SetValue(6, count, entry.has_description ? Value(entry.description) : Value(LogicalType::VARCHAR));
+		count++;
+	}
+	output.SetCardinality(count);
+}
+
+TableFunctionSet MakeVerbSet(const string &name, table_function_t function, bool is_create) {
 	TableFunctionSet set(name);
 	TableFunction one_arg({LogicalType::VARCHAR}, function, LifecycleBindWrapper, LifecycleInit);
+	if (is_create) {
+		one_arg.named_parameters["mode"] = LogicalType::VARCHAR;
+		one_arg.named_parameters["from_scenario"] = LogicalType::VARCHAR;
+	}
 	set.AddFunction(one_arg);
-	if (with_description) {
+	if (is_create) {
 		TableFunction two_arg({LogicalType::VARCHAR, LogicalType::VARCHAR}, function, LifecycleBindWrapper,
 		                      LifecycleInit);
+		two_arg.named_parameters["mode"] = LogicalType::VARCHAR;
+		two_arg.named_parameters["from_scenario"] = LogicalType::VARCHAR;
 		set.AddFunction(two_arg);
 	}
 	return set;
@@ -228,6 +335,9 @@ void ScenarioLifecycle::RegisterFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(MakeVerbSet("scenario_drop", LifecycleExecute<ScenarioDropVerb>, false));
 	loader.RegisterFunction(MakeVerbSet("scenario_freeze", LifecycleExecute<ScenarioFreezeVerb>, false));
 	loader.RegisterFunction(MakeVerbSet("scenario_unfreeze", LifecycleExecute<ScenarioUnfreezeVerb>, false));
+	// Registry v2 listing (replaces legacy scenario_list in v0.2)
+	loader.RegisterFunction(TableFunction("scenario_list_v2", {}, ScenarioListExecute, ScenarioListBind,
+	                                      ScenarioListInit));
 }
 
 } // namespace duckdb

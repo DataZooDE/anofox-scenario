@@ -10,6 +10,16 @@ no special functions. The legacy function surface below remains available until 
 ```sql
 CALL scenario_create('optimistic', 'demand +10%');   -- description optional
 
+-- Phase 2 options:
+CALL scenario_create('baseline', mode := 'materialized');       -- frozen full copy: immune to base changes
+CALL scenario_create('variant', from_scenario := 'optimistic'); -- branch: inherits the parent's changes
+
+SELECT * FROM scenario_list_v2();                    -- name, mode, frozen, parent, created_at, description
+
+-- Phase 3: streaming, typed diffs (the delta IS the changelog)
+SELECT * FROM scenario_diff('optimistic', 'forecast');  -- <pk cols>, change_type, column_name, old/new_value
+SELECT * FROM scenario_diff_summary('optimistic');      -- per-table rows_added/modified/removed
+
 ATTACH 'optimistic' AS opt (TYPE scenario);
 
 SELECT * FROM opt.forecast;                          -- merged view: base + scenario changes

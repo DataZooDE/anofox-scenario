@@ -130,6 +130,10 @@ private:
 	bool ShouldExpose(CatalogEntry &base_entry);
 	//! Wrap a base table in a ScenarioTableEntry cached on the scenario transaction
 	CatalogEntry &GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table);
+	//! Same, exposing the entry under a different (logical) name than the
+	//! physical base table's (materialized copies)
+	CatalogEntry &GetOrCreateTableEntryAs(ClientContext &context, TableCatalogEntry &base_table,
+	                                      const string &logical_name);
 	ScenarioCatalog &GetScenarioCatalog();
 };
 
@@ -139,7 +143,8 @@ private:
 
 class ScenarioCatalog : public Catalog {
 public:
-	ScenarioCatalog(AttachedDatabase &db, string scenario_name, string host_catalog_name, int64_t scenario_id);
+	ScenarioCatalog(AttachedDatabase &db, string scenario_name, string host_catalog_name, int64_t scenario_id,
+	                int64_t mat_base_scenario_id);
 
 	//! Name of the scenario in the registry
 	const string scenario_name;
@@ -147,6 +152,11 @@ public:
 	const string host_catalog_name;
 	//! Registry id of the scenario
 	const int64_t scenario_id;
+	//! BaseSource selector: -1 = live host tables (overlay); otherwise the
+	//! scenario id whose materialized copies (s<id>_mat_*) serve as the base
+	//! (self for materialized scenarios, nearest materialized ancestor for
+	//! branches of one). Phase 4 adds the versioned-DuckLake variant.
+	const int64_t mat_base_scenario_id;
 
 public:
 	void Initialize(bool load_builtin) override;
