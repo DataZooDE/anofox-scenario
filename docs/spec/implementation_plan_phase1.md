@@ -1,6 +1,24 @@
 # Implementation Plan — Phase 1: Transparent Scenario DML via a Scenario Catalog
 
 **Status:** Approved-for-planning draft | July 2026
+**Implementation deviations (July 2026, discovered during WP3):**
+1. **Delta tables are created eagerly by `scenario_create`** (one empty table per base table),
+   not lazily on first write. DuckDB's single-writer-per-transaction rule
+   (`MetaTransaction::ModifyDatabase` + the `DuckSchemaEntry::AddEntryInternal` assertion)
+   forbids creating catalog entries in the *host* database while the statement's registered
+   write target is the *scenario* catalog — and the bind-time registration cannot be rewritten
+   after `Planner::CreatePlan` copies the statement properties. Eager creation keeps all delta
+   DDL in `scenario_create`'s transaction (where the host **is** the modified database), keeps
+   EXPLAIN side-effect free, and is O(#tables) metadata only. Consequences: tables created in
+   the base after `scenario_create` are read-only in the scenario (clear error, lifted in
+   Phase 2); row data cost is unchanged (~0 for empty deltas).
+2. **Host writes and scenario writes cannot mix in one explicit transaction** (clear
+   TransactionException; DuckDB's single-writer rule sees two attached databases even though
+   the rows physically land in one). Scenario DML marks the host transaction read-write
+   directly (`ScenarioCatalog::MarkHostWrite`) without claiming a second modified-database slot.
+3. **Row identity for UPDATE/DELETE is `__scenario_origin` + `__scenario_key_<k>` (PK values)**
+   rather than `__scenario_delta_rowid`: `Binder::BindRowIdColumns` requires virtual columns,
+   and PK identity lets the sinks drive the whole op-transition matrix from one delta key map.
 **Prerequisite reading:** `docs/spec/diagnosis_and_redesign.md` (§2.2 for why the catalog layer
 is the only viable substrate; §3 for the target architecture).
 **Scope:** The *Critical* missing parts only — REQ-COW-001..007 (transparent read/write,

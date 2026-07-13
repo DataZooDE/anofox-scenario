@@ -1,6 +1,7 @@
 #include "lifecycle/scenario_lifecycle.hpp"
 
 #include "catalog/scenario_catalog.hpp"
+#include "catalog/scenario_delta.hpp"
 #include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/types/timestamp.hpp"
@@ -9,6 +10,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
 
@@ -110,6 +112,26 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	entry.description = bind_data.description;
 	entry.has_description = bind_data.has_description;
 	ScenarioRegistry::Insert(context, host_catalog, entry);
+
+	// Eagerly create one (empty) delta table per base table, in this same
+	// transaction. DuckDB's single-writer-per-transaction rule prevents
+	// creating catalog entries in the host from within scenario DML, so all
+	// delta DDL happens here, where the host *is* the modified database.
+	// Cost: O(#tables) empty tables -- metadata only, no row data copied.
+	auto &host_schema = host_catalog.GetSchema(context, DEFAULT_SCHEMA);
+	vector<reference<TableCatalogEntry>> base_tables;
+	host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
+		if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal) {
+			return;
+		}
+		if (StringUtil::StartsWith(table_entry.name, "_scenario_")) {
+			return; // legacy v0.1 metadata
+		}
+		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
+	});
+	for (auto &base_table : base_tables) {
+		ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry.scenario_id, base_table.get());
+	}
 }
 
 //! Throw if the scenario is currently attached in this database instance
@@ -161,6 +183,10 @@ void ScenarioDropVerb(ClientContext &context, const LifecycleBindData &bind_data
 	if (ScenarioRegistry::HasChildren(context, host_catalog, entry->scenario_id)) {
 		throw ConstraintException("Cannot drop scenario '%s': other scenarios branch from it", bind_data.name);
 	}
+	// Mark the host writable before dropping catalog entries
+	MetaTransaction::Get(context).ModifyDatabase(host_catalog.GetAttached(),
+	                                             DatabaseModificationType::DROP_CATALOG_ENTRY |
+	                                                 DatabaseModificationType::DELETE_DATA);
 	DropDeltaTables(context, host_catalog, entry->scenario_id);
 	ScenarioRegistry::Delete(context, host_catalog, entry->scenario_id);
 }

@@ -8,7 +8,7 @@ statement ok
 CREATE TABLE forecast (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
 
 statement ok
-INSERT INTO forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
+INSERT INTO forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300), (4, 'UNTOUCHED', 400);
 
 statement ok
 CALL scenario_create('w', 'write tests');
@@ -24,7 +24,7 @@ INSERT INTO s.forecast VALUES (10, 'LATAM', 500);
 query I
 SELECT count(*) FROM s.forecast;
 ----
-4
+5
 
 query ITI
 SELECT id, region, qty FROM s.forecast WHERE id = 10;
@@ -35,7 +35,7 @@ SELECT id, region, qty FROM s.forecast WHERE id = 10;
 query I
 SELECT count(*) FROM forecast;
 ----
-3
+4
 
 # multi-row insert + INSERT ... SELECT
 statement ok
@@ -47,7 +47,7 @@ INSERT INTO s.forecast SELECT id + 100, region, qty FROM forecast WHERE id = 1;
 query I
 SELECT count(*) FROM s.forecast;
 ----
-7
+8
 
 query ITI
 SELECT id, region, qty FROM s.forecast WHERE id = 101;
@@ -74,7 +74,7 @@ SELECT qty FROM forecast WHERE id = 2;
 query I
 SELECT count(*) FROM s.forecast;
 ----
-7
+8
 
 # --- UPDATE of an updated row (U -> U) -------------------------------------------
 
@@ -135,7 +135,7 @@ SELECT count(*) FROM s.forecast WHERE id = 3;
 query I
 SELECT count(*) FROM s.forecast;
 ----
-6
+7
 
 # base unchanged
 query I
@@ -188,13 +188,19 @@ SELECT id, region FROM forecast WHERE id = 3;
 
 # vs base row
 statement error
-INSERT INTO s.forecast VALUES (1, 'DUP', 0);
+INSERT INTO s.forecast VALUES (4, 'DUP', 0);
 ----
 <REGEX>:.*primary key.*base.*
 
 # vs scenario-inserted row
 statement error
 INSERT INTO s.forecast VALUES (10, 'DUP', 0);
+----
+<REGEX>:.*primary key.*scenario.*
+
+# duplicate keys within one INSERT statement (same chunk)
+statement error
+INSERT INTO s.forecast VALUES (60, 'A', 1), (60, 'B', 2);
 ----
 <REGEX>:.*primary key.*scenario.*
 
@@ -239,7 +245,7 @@ SELECT count(*) FROM s.forecast;
 query I
 SELECT count(*) FROM forecast;
 ----
-3
+4
 
 statement ok
 DETACH s;

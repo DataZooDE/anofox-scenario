@@ -79,6 +79,15 @@ public:
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 	DataTable &GetStorage() override;
 
+	//! Adds __scenario_origin and __scenario_key_<k> (PK-based row identity)
+	virtual_column_map_t GetVirtualColumns() const override;
+	//! Row identity for DML: origin + PK values (falls back to rowid for
+	//! no-PK tables, whose UPDATE/DELETE the plan hooks reject in v1)
+	vector<column_t> GetRowIdColumns() const override;
+	//! Rejects PK-column updates (v1) and projects the full post-image row
+	void BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj, LogicalUpdate &update,
+	                           ClientContext &context) override;
+
 	ScenarioCatalog &GetScenarioCatalog();
 };
 
@@ -175,6 +184,13 @@ public:
 	Catalog &GetHostCatalog(ClientContext &context);
 	//! The scenario transaction for this catalog in the current context
 	ScenarioTransaction &GetScenarioTransaction(ClientContext &context);
+	//! Throws when the scenario is frozen (single chokepoint for all writes)
+	void ThrowIfFrozen(ClientContext &context, const char *operation);
+	//! Register a physical write to the host database from a scenario DML
+	//! statement. The scenario catalog is the meta-transaction's registered
+	//! write target (bind-time), so the host transaction is marked read-write
+	//! directly instead of claiming a second modified database.
+	void MarkHostWrite(ClientContext &context, DatabaseModificationType type);
 
 private:
 	//! The single synthetic schema ("main")

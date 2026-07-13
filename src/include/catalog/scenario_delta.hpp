@@ -1,0 +1,57 @@
+//===----------------------------------------------------------------------===//
+//                         anofox-scenario
+//
+// catalog/scenario_delta.hpp
+//
+// Delta storage contract. One delta table per modified scenario table:
+// __anofox_scenario.s<id>_delta_<table>(_op, _ts, <base columns>) with the
+// base PK as its PRIMARY KEY. The delta is a changelog consumed by three
+// later phases (diff, branching, merge-back) -- its shape and the
+// op-transition matrix are a frozen contract.
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
+#include "duckdb/storage/storage_index.hpp"
+
+namespace duckdb {
+
+class Catalog;
+class ClientContext;
+class DuckTableEntry;
+class TableCatalogEntry;
+
+class ScenarioDelta {
+public:
+	//! Delta column layout: _op, _ts, then all base columns in base order
+	static constexpr idx_t OP_COL = 0;
+	static constexpr idx_t TS_COL = 1;
+	static constexpr idx_t PAYLOAD_START = 2;
+
+	static string DeltaTableName(int64_t scenario_id, const string &table_name);
+	//! The delta table for a scenario table, if any writes happened yet
+	static optional_ptr<DuckTableEntry> TryGetDeltaTable(ClientContext &context, Catalog &host_catalog,
+	                                                     int64_t scenario_id, const string &table_name);
+	//! Create the delta table lazily (caller's transaction); returns it
+	static DuckTableEntry &EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                                        TableCatalogEntry &base_entry);
+
+	//! Logical column ids of the base table's PRIMARY KEY (empty when none)
+	static vector<idx_t> GetPKColumns(const TableCatalogEntry &base_entry);
+
+	//! Serialize the key columns of a row into a canonical comparable string
+	//! (length-prefixed, NULL-tagged). Used for suppression sets and the
+	//! delta key map; deltas are small by invariant.
+	static string MakeKey(DataChunk &chunk, idx_t row, const vector<idx_t> &key_positions);
+
+	//! Scan the given columns of a table in the caller's transaction,
+	//! invoking the callback per row until it returns false. Copes with
+	//! freshly created tables and covers transaction-local storage.
+	static void ScanTableRows(ClientContext &context, DuckTableEntry &table, vector<StorageIndex> column_ids,
+	                          const vector<LogicalType> &scan_types,
+	                          const std::function<bool(DataChunk &, idx_t)> &callback);
+};
+
+} // namespace duckdb

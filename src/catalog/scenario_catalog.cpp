@@ -1,9 +1,11 @@
 #include "catalog/scenario_catalog.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/parser/parsed_data/create_schema_info.hpp"
 #include "duckdb/storage/database_size.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/transaction/transaction.hpp"
 
 namespace duckdb {
@@ -77,21 +79,6 @@ unique_ptr<LogicalOperator> ScenarioCatalog::BindAlterAddIndex(Binder &binder, T
 	ThrowScenarioDDLError();
 }
 
-PhysicalOperator &ScenarioCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
-                                              LogicalInsert &op, optional_ptr<PhysicalOperator> plan) {
-	throw NotImplementedException("INSERT into scenario tables is not yet implemented (Phase 1 WP3)");
-}
-
-PhysicalOperator &ScenarioCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
-                                              LogicalDelete &op, PhysicalOperator &plan) {
-	throw NotImplementedException("DELETE on scenario tables is not yet implemented (Phase 1 WP3)");
-}
-
-PhysicalOperator &ScenarioCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
-                                              LogicalUpdate &op, PhysicalOperator &plan) {
-	throw NotImplementedException("UPDATE on scenario tables is not yet implemented (Phase 1 WP3)");
-}
-
 DatabaseSize ScenarioCatalog::GetDatabaseSize(ClientContext &context) {
 	// Real numbers (sum of delta table sizes) land with WP3/WP5.
 	return DatabaseSize();
@@ -123,6 +110,37 @@ Catalog &ScenarioCatalog::GetHostCatalog(ClientContext &context) {
 
 ScenarioTransaction &ScenarioCatalog::GetScenarioTransaction(ClientContext &context) {
 	return Transaction::Get(context, *this).Cast<ScenarioTransaction>();
+}
+
+void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModificationType type) {
+	auto &host_db = GetHostCatalog(context).GetAttached();
+	auto &meta = MetaTransaction::Get(context);
+	if (meta.IsReadOnly()) {
+		throw TransactionException("Cannot write to scenario \"%s\" - transaction is launched in read-only mode",
+		                           scenario_name);
+	}
+	if (host_db.IsReadOnly()) {
+		// Mirror the check MetaTransaction::ModifyDatabase's callers perform:
+		// scenario writes physically land in the host database
+		throw InvalidInputException(
+		    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode", scenario_name,
+		    host_db.GetName());
+	}
+	auto modified = meta.ModifiedDatabase();
+	if (modified && modified.get() == &GetAttached()) {
+		// DML targeting this scenario: the binder already registered the
+		// scenario catalog as the transaction's single write target. The
+		// physical rows land in the host database within the same
+		// meta-transaction; mark its transaction read-write so commit
+		// flushes it, without violating the single-writer rule.
+		auto &host_transaction = meta.GetTransaction(host_db);
+		if (host_transaction.IsReadOnly()) {
+			host_transaction.SetReadWrite();
+		}
+		host_transaction.SetModifications(type);
+		return;
+	}
+	meta.ModifyDatabase(host_db, type);
 }
 
 } // namespace duckdb

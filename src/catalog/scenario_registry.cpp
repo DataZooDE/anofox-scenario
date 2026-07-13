@@ -1,5 +1,6 @@
 #include "catalog/scenario_registry.hpp"
 
+#include "catalog/scenario_delta.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -64,39 +65,6 @@ ScenarioRegistryEntry EntryFromChunk(DataChunk &chunk, idx_t row) {
 	return entry;
 }
 
-//! Scan the given columns of a table in the caller's transaction, invoking
-//! the callback per row. The callback returns false to stop scanning.
-//! Uses the parallel-scan API single-threaded: unlike DataTable::InitializeScan,
-//! it copes with freshly created tables (zero row groups) and covers
-//! transaction-local storage.
-void ScanTableRows(ClientContext &context, DuckTableEntry &table, vector<StorageIndex> column_ids,
-                   const vector<LogicalType> &scan_types, const std::function<bool(DataChunk &, idx_t)> &callback) {
-	auto &data_table = table.GetStorage();
-	auto &transaction = DuckTransaction::Get(context, table.catalog);
-
-	ParallelTableScanState parallel_state;
-	data_table.InitializeParallelScan(context, parallel_state, {});
-	TableScanState state;
-	state.Initialize(std::move(column_ids), context);
-
-	DataChunk chunk;
-	chunk.Initialize(Allocator::Get(context), scan_types);
-	while (data_table.NextParallelScan(context, parallel_state, state) > 0) {
-		while (true) {
-			chunk.Reset();
-			data_table.Scan(transaction, chunk, state);
-			if (chunk.size() == 0) {
-				break;
-			}
-			for (idx_t row = 0; row < chunk.size(); row++) {
-				if (!callback(chunk, row)) {
-					return;
-				}
-			}
-		}
-	}
-}
-
 //! Scan all registry rows (all columns), invoking the callback per row.
 //! The callback returns false to stop scanning.
 void ScanRegistry(ClientContext &context, Catalog &host_catalog, DuckTableEntry &table,
@@ -105,7 +73,7 @@ void ScanRegistry(ClientContext &context, Catalog &host_catalog, DuckTableEntry 
 	for (idx_t i = 0; i < REG_COL_COUNT; i++) {
 		column_ids.emplace_back(i);
 	}
-	ScanTableRows(context, table, std::move(column_ids), table.GetStorage().GetTypes(), callback);
+	ScenarioDelta::ScanTableRows(context, table, std::move(column_ids), table.GetStorage().GetTypes(), callback);
 }
 
 //! Scan (rowid, scenario_id) pairs; returns the rowid for the given scenario
@@ -115,14 +83,14 @@ row_t FindRowId(ClientContext &context, Catalog &host_catalog, DuckTableEntry &t
 	column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
 	column_ids.emplace_back(REG_COL_SCENARIO_ID);
 	row_t result = -1;
-	ScanTableRows(context, table, std::move(column_ids), {LogicalType::ROW_TYPE, LogicalType::BIGINT},
-	              [&](DataChunk &chunk, idx_t row) {
-		              if (chunk.GetValue(1, row).GetValue<int64_t>() == scenario_id) {
-			              result = chunk.GetValue(0, row).GetValue<row_t>();
-			              return false;
-		              }
-		              return true;
-	              });
+	ScenarioDelta::ScanTableRows(context, table, std::move(column_ids), {LogicalType::ROW_TYPE, LogicalType::BIGINT},
+	                             [&](DataChunk &chunk, idx_t row) {
+		                             if (chunk.GetValue(1, row).GetValue<int64_t>() == scenario_id) {
+			                             result = chunk.GetValue(0, row).GetValue<row_t>();
+			                             return false;
+		                             }
+		                             return true;
+	                             });
 	return result;
 }
 

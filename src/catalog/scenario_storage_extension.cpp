@@ -17,6 +17,12 @@ static unique_ptr<Catalog> ScenarioAttach(optional_ptr<StorageExtensionInfo> sto
 	// the database scenario_create ran against (documented Phase 1 scoping).
 	auto &host_catalog_name = DatabaseManager::GetDefaultDatabase(context);
 	auto &host_catalog = Catalog::GetCatalog(context, host_catalog_name);
+	if (host_catalog.GetCatalogType() == "scenario") {
+		throw InvalidInputException(
+		    "Cannot attach scenario '%s': the current default database '%s' is itself a scenario. "
+		    "Switch back to the base database first (USE <database>)",
+		    scenario_name, host_catalog_name);
+	}
 
 	auto entry = ScenarioRegistry::Lookup(context, host_catalog, scenario_name);
 	if (!entry) {

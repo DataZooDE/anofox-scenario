@@ -2,6 +2,55 @@
 
 This document describes the SQL API for the anofox-scenario DuckDB extension.
 
+## Scenario Catalogs (v2 surface, recommended)
+
+The v2 surface exposes a scenario as an **attached catalog**: ordinary SQL reads and writes,
+no special functions. The legacy function surface below remains available until v0.2.
+
+```sql
+CALL scenario_create('optimistic', 'demand +10%');   -- description optional
+
+ATTACH 'optimistic' AS opt (TYPE scenario);
+
+SELECT * FROM opt.forecast;                          -- merged view: base + scenario changes
+INSERT INTO opt.forecast VALUES (...);               -- transparent copy-on-write
+UPDATE opt.forecast SET qty = qty * 1.1 WHERE ...;   -- base is never modified
+DELETE FROM opt.forecast WHERE obsolete;
+TRUNCATE opt.forecast;
+
+DETACH opt;                                          -- handle gone, scenario data persists
+
+CALL scenario_freeze('optimistic');                  -- reject all writes (reads keep working)
+CALL scenario_unfreeze('optimistic');
+CALL scenario_drop('optimistic');                    -- refuses while attached
+```
+
+**Semantics**
+
+- **Copy-on-write:** modifications are stored per scenario in delta tables under the internal
+  `__anofox_scenario` schema of the host database; base tables are never written.
+- **Overlay reads:** a scenario sees the *live* base plus its own changes. Base rows
+  inserted/updated after scenario creation show through unless the scenario modified the same
+  primary key. (Point-in-time isolation: `mode := 'materialized'` in v0.2, DuckLake bases in v0.3.)
+- **Constraints:** base `NOT NULL`, `CHECK`, and PRIMARY KEY constraints are enforced for
+  scenario writes against the *merged* state, with distinct errors for conflicts with base rows
+  vs. scenario changes.
+- **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it.
+- **DDL:** not permitted inside scenarios (one canonical error; REQ-COW-007).
+- **Host database:** the scenario registry lives in the session's *default* database at
+  `scenario_create` / `ATTACH` time.
+
+**v1 limitations** (clean errors; roadmap in `docs/spec/implementation_plan_master.md`)
+
+| Limitation | Planned |
+| --- | --- |
+| `ON CONFLICT` / `INSERT OR REPLACE`, `RETURNING`, `MERGE INTO`, PK-column updates | v0.4 |
+| `UPDATE`/`DELETE` on tables without a PRIMARY KEY (insert/read work) | v0.4+ |
+| Secondary `UNIQUE` constraints: enforced against base rows, but not between scenario-written rows (PK is fully enforced) | v0.4 |
+| Tables created in the base *after* `scenario_create` are read-only in the scenario | v0.2 |
+| Host writes and scenario writes in the *same explicit transaction* | documented restriction |
+| Views are not exposed inside scenarios | v0.2 |
+
 ## Configuration Options
 
 ### scenario_schema_prefix
