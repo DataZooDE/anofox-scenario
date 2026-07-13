@@ -1,6 +1,8 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "anofox_scenario_extension.hpp"
+#include "catalog/scenario_storage_extension.hpp"
+#include "lifecycle/scenario_lifecycle.hpp"
 #include "metadata_store.hpp"
 #include "scenario_manager.hpp"
 #include "snapshot_manager.hpp"
@@ -73,6 +75,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register DDL blocker to prevent schema modifications in scenarios
 	DDLBlocker::Register(loader.GetDatabaseInstance());
+
+	// --- v2 architecture (ATTACH-based scenario catalog) ---
+	// ATTACH 'name' (TYPE scenario)
+	StorageExtension::Register(config, "scenario", make_shared_ptr<ScenarioStorageExtension>());
+	// CALL scenario_create/drop/freeze/unfreeze against registry v2
+	ScenarioLifecycle::RegisterFunctions(loader);
 }
 
 void AnofoxScenarioExtension::Load(ExtensionLoader &loader) {

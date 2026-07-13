@@ -1,0 +1,146 @@
+# name: test/sql/attach_basic.test
+# description: Phase 1 WP0/WP1: ATTACH (TYPE scenario), catalog listing, passthrough reads, DETACH
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# --- setup base data -------------------------------------------------------
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
+
+# --- attaching an unknown scenario fails cleanly ----------------------------
+
+statement error
+ATTACH 'no_such_scenario' AS nos (TYPE scenario);
+----
+<REGEX>:.*no_such_scenario.*not found.*
+
+# --- create + attach --------------------------------------------------------
+
+statement ok
+CALL scenario_create('optimistic', 'demand +10%');
+
+# duplicate name is rejected
+statement error
+CALL scenario_create('optimistic', 'again');
+----
+<REGEX>:.*optimistic.*already exists.*
+
+statement ok
+ATTACH 'optimistic' AS opt (TYPE scenario);
+
+# --- unmodified scenario reads == base (passthrough) ------------------------
+
+query I
+SELECT count(*) FROM opt.forecast;
+----
+3
+
+query ITI
+SELECT id, region, qty FROM opt.forecast ORDER BY id;
+----
+1	EU	100
+2	US	200
+3	APAC	300
+
+# qualified schema access works too
+query I
+SELECT count(*) FROM opt.main.forecast;
+----
+3
+
+# scenario table participates in joins with base tables
+query II
+SELECT b.id, s.qty FROM forecast b JOIN opt.forecast s USING (id) ORDER BY b.id LIMIT 1;
+----
+1	100
+
+# --- catalog introspection ---------------------------------------------------
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'opt' AND table_name = 'forecast';
+----
+1
+
+# unknown table in the scenario errors like a normal catalog
+statement error
+SELECT * FROM opt.does_not_exist;
+----
+<REGEX>:.*does_not_exist.*
+
+# --- DETACH: handle gone, scenario persists ----------------------------------
+
+statement ok
+DETACH opt;
+
+statement error
+SELECT count(*) FROM opt.forecast;
+----
+<REGEX>:.*opt.*
+
+statement ok
+ATTACH 'optimistic' AS opt2 (TYPE scenario);
+
+query I
+SELECT count(*) FROM opt2.forecast;
+----
+3
+
+statement ok
+DETACH opt2;
+
+# --- lifecycle verbs run in the caller's transaction --------------------------
+# (no side connections: ROLLBACK must undo scenario_create)
+
+statement ok
+BEGIN;
+
+statement ok
+CALL scenario_create('txn_scenario');
+
+statement ok
+ROLLBACK;
+
+statement error
+ATTACH 'txn_scenario' AS txs (TYPE scenario);
+----
+<REGEX>:.*txn_scenario.*not found.*
+
+statement ok
+BEGIN;
+
+statement ok
+CALL scenario_create('txn_scenario2');
+
+statement ok
+COMMIT;
+
+statement ok
+CALL scenario_drop('txn_scenario2');
+
+# --- drop lifecycle -----------------------------------------------------------
+
+statement ok
+CALL scenario_drop('optimistic');
+
+statement error
+ATTACH 'optimistic' AS opt3 (TYPE scenario);
+----
+<REGEX>:.*optimistic.*not found.*
+
+# dropping a nonexistent scenario errors
+statement error
+CALL scenario_drop('optimistic');
+----
+<REGEX>:.*optimistic.*not found.*
+
+# recreate after drop works
+statement ok
+CALL scenario_create('optimistic');
+
+statement ok
+CALL scenario_drop('optimistic');

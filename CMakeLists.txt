@@ -19,6 +19,14 @@ set(EXTENSION_SOURCES
     src/delta_storage_engine.cpp
     src/comparison_engine.cpp
     src/ddl_blocker.cpp
+    src/catalog/scenario_registry.cpp
+    src/catalog/scenario_catalog.cpp
+    src/catalog/scenario_schema_entry.cpp
+    src/catalog/scenario_table_entry.cpp
+    src/catalog/scenario_scan.cpp
+    src/catalog/scenario_transaction.cpp
+    src/catalog/scenario_storage_extension.cpp
+    src/lifecycle/scenario_lifecycle.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

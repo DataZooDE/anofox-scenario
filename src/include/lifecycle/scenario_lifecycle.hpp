@@ -1,0 +1,23 @@
+//===----------------------------------------------------------------------===//
+//                         anofox-scenario
+//
+// lifecycle/scenario_lifecycle.hpp
+//
+// CALL-style lifecycle verbs running in the caller's transaction
+// (registry v2 path; the legacy scalar functions remain until Phase 2).
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb.hpp"
+
+namespace duckdb {
+
+class ExtensionLoader;
+
+class ScenarioLifecycle {
+public:
+	static void RegisterFunctions(ExtensionLoader &loader);
+};
+
+} // namespace duckdb

@@ -1,0 +1,104 @@
+# name: test/sql/attach_ddl.test
+# description: Phase 1 WP1: all DDL inside a scenario is rejected with one canonical error (REQ-COW-007)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 'EU', 100);
+
+statement ok
+CALL scenario_create('ddl_test');
+
+statement ok
+ATTACH 'ddl_test' AS s (TYPE scenario);
+
+# --- CREATE ------------------------------------------------------------------
+
+statement error
+CREATE TABLE s.scratch (i INTEGER);
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+CREATE TABLE s.main.scratch (i INTEGER);
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+CREATE TABLE s.scratch AS SELECT * FROM forecast;
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+CREATE VIEW s.v AS SELECT * FROM forecast;
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+CREATE INDEX idx ON s.forecast (region);
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+CREATE SEQUENCE s.seq;
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+CREATE TYPE s.mood AS ENUM ('happy', 'sad');
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+CREATE SCHEMA s.other;
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+# --- ALTER / DROP / COMMENT ---------------------------------------------------
+
+statement error
+ALTER TABLE s.forecast ADD COLUMN extra INTEGER;
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+ALTER TABLE s.forecast RENAME TO forecast2;
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+DROP TABLE s.forecast;
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+COMMENT ON TABLE s.forecast IS 'nope';
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+statement error
+DROP SCHEMA s.main;
+----
+<REGEX>:.*DDL operations are not permitted in scenarios.*
+
+# --- base table unaffected, scenario still readable ----------------------------
+
+query I
+SELECT count(*) FROM s.forecast;
+----
+1
+
+query I
+SELECT count(*) FROM forecast;
+----
+1
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('ddl_test');
