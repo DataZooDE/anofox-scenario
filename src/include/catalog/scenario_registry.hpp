@@ -35,6 +35,8 @@ struct ScenarioRegistryEntry {
 	bool has_merged_at = false;
 	string description;
 	bool has_description = false;
+	//! Phase 4: catalog whose tables are the scenario's base ("" = host default)
+	string base_catalog;
 };
 
 //! Static helpers around the registry table. The physical layout is

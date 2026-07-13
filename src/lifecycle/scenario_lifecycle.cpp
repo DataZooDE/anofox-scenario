@@ -50,6 +50,8 @@ struct LifecycleBindData : public TableFunctionData {
 	string mode = "delta";
 	//! Phase 2: branch source (empty = none)
 	string from_scenario;
+	//! Phase 4: attached catalog serving as the base (empty = host default)
+	string base_catalog;
 };
 
 struct LifecycleGlobalState : public GlobalTableFunctionState {
@@ -86,7 +88,13 @@ unique_ptr<FunctionData> LifecycleBind(TableFunctionBindInput &input, vector<Log
 			}
 		} else if (param.first == "from_scenario") {
 			result->from_scenario = param.second.GetValue<string>();
+		} else if (param.first == "base") {
+			result->base_catalog = param.second.GetValue<string>();
 		}
+	}
+	if (!result->base_catalog.empty() && (result->mode == "materialized" || !result->from_scenario.empty())) {
+		throw NotImplementedException(
+		    "base := '<catalog>' cannot be combined with materialized mode or branching yet (planned)");
 	}
 	if (!result->from_scenario.empty() && result->mode == "materialized") {
 		throw InvalidInputException(
@@ -137,6 +145,19 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		}
 	}
 
+	// Phase 4: cross-catalog base (e.g. a DuckLake attach)
+	optional_ptr<Catalog> base_catalog;
+	if (!bind_data.base_catalog.empty()) {
+		base_catalog = Catalog::GetCatalogEntry(context, bind_data.base_catalog);
+		if (!base_catalog) {
+			throw InvalidInputException("Base catalog '%s' is not attached", bind_data.base_catalog);
+		}
+		if (base_catalog->GetCatalogType() == "scenario") {
+			throw InvalidInputException("A scenario cannot use another scenario as its base - branch instead "
+			                            "(from_scenario := '...')");
+		}
+	}
+
 	ScenarioRegistryEntry entry;
 	entry.scenario_id = ScenarioRegistry::NextId(context, host_catalog);
 	entry.name = bind_data.name;
@@ -145,6 +166,7 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	entry.created_at = Timestamp::GetCurrentTimestamp();
 	entry.description = bind_data.description;
 	entry.has_description = bind_data.has_description;
+	entry.base_catalog = bind_data.base_catalog;
 	ScenarioRegistry::Insert(context, host_catalog, entry);
 
 	// Eagerly create one (empty) delta table per base table, in this same
@@ -153,7 +175,8 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	// delta DDL happens here, where the host *is* the modified database.
 	// Cost: O(#tables) empty tables -- metadata only, no row data copied.
 	// Materialized mode additionally CTAS-copies every base table.
-	auto &host_schema = host_catalog.GetSchema(context, DEFAULT_SCHEMA);
+	auto &base_source = base_catalog ? *base_catalog : host_catalog;
+	auto &host_schema = base_source.GetSchema(context, DEFAULT_SCHEMA);
 	vector<reference<TableCatalogEntry>> base_tables;
 	host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
 		if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal) {
@@ -316,6 +339,7 @@ TableFunctionSet MakeVerbSet(const string &name, table_function_t function, bool
 	if (is_create) {
 		one_arg.named_parameters["mode"] = LogicalType::VARCHAR;
 		one_arg.named_parameters["from_scenario"] = LogicalType::VARCHAR;
+		one_arg.named_parameters["base"] = LogicalType::VARCHAR;
 	}
 	set.AddFunction(one_arg);
 	if (is_create) {
@@ -323,6 +347,7 @@ TableFunctionSet MakeVerbSet(const string &name, table_function_t function, bool
 		                      LifecycleInit);
 		two_arg.named_parameters["mode"] = LogicalType::VARCHAR;
 		two_arg.named_parameters["from_scenario"] = LogicalType::VARCHAR;
+		two_arg.named_parameters["base"] = LogicalType::VARCHAR;
 		set.AddFunction(two_arg);
 	}
 	return set;

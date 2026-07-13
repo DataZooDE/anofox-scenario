@@ -7,6 +7,9 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/parallel/thread_context.hpp"
+#include "duckdb/execution/execution_context.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 
 namespace duckdb {
@@ -28,6 +31,11 @@ struct ScenarioScanBindData : public TableFunctionData {
 	optional_ptr<DuckTableEntry> delta_table;
 	//! Logical PK column ids of the base table (empty when none)
 	vector<idx_t> pk_columns;
+	//! Phase 4: non-duck bases (e.g. DuckLake) are scanned through their own
+	//! table function, bound with an AT (TIMESTAMP => created_at) pin
+	bool base_is_duck = true;
+	TableFunction foreign_function;
+	unique_ptr<FunctionData> foreign_bind;
 
 	bool SupportStatementCache() const override {
 		// Both entry references are owned by the scenario *transaction*
@@ -60,6 +68,9 @@ struct ScenarioScanGlobalState : public GlobalTableFunctionState {
 	DataChunk scan_chunk;
 	//! True when scan_chunk differs from the output layout
 	bool needs_projection = false;
+	//! Phase 4: foreign-base scan states
+	unique_ptr<GlobalTableFunctionState> foreign_global;
+	unique_ptr<LocalTableFunctionState> foreign_local;
 
 	// --- delta side ---
 	//! Visible delta rows (op I/U) already in output layout
@@ -77,7 +88,6 @@ struct ScenarioScanGlobalState : public GlobalTableFunctionState {
 
 unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ScenarioScanBindData>();
-	auto &data_table = bind_data.base_entry.GetStorage();
 	auto result = make_uniq<ScenarioScanGlobalState>();
 	bool has_delta = bind_data.delta_table != nullptr;
 
@@ -125,20 +135,38 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 	}
 
 	// --- base scan init ------------------------------------------------------
-	vector<StorageIndex> storage_ids;
 	vector<LogicalType> scan_types;
 	for (auto &col : scan_columns) {
-		storage_ids.push_back(bind_data.base_entry.GetStorageIndex(col));
 		if (col.IsRowIdColumn()) {
 			scan_types.push_back(LogicalType::ROW_TYPE);
 		} else {
 			scan_types.push_back(bind_data.entry.GetColumn(LogicalIndex(col.GetPrimaryIndex())).Type());
 		}
 	}
-	data_table.InitializeParallelScan(context, result->parallel_state, scan_columns);
-	result->scan_state.Initialize(std::move(storage_ids), context, input.filters.get());
-	if (data_table.NextParallelScan(context, result->parallel_state, result->scan_state) == 0) {
-		result->base_exhausted = true;
+	if (bind_data.base_is_duck) {
+		auto &data_table = bind_data.base_entry.GetStorage();
+		vector<StorageIndex> storage_ids;
+		for (auto &col : scan_columns) {
+			storage_ids.push_back(bind_data.base_entry.GetStorageIndex(col));
+		}
+		data_table.InitializeParallelScan(context, result->parallel_state, scan_columns);
+		result->scan_state.Initialize(std::move(storage_ids), context, input.filters.get());
+		if (data_table.NextParallelScan(context, result->parallel_state, result->scan_state) == 0) {
+			result->base_exhausted = true;
+		}
+	} else {
+		// Foreign base (Phase 4): drive the base's own table function
+		vector<idx_t> no_projection;
+		TableFunctionInitInput foreign_input(bind_data.foreign_bind.get(), scan_columns, no_projection, nullptr);
+		if (bind_data.foreign_function.init_global) {
+			result->foreign_global = bind_data.foreign_function.init_global(context, foreign_input);
+		}
+		if (bind_data.foreign_function.init_local) {
+			ThreadContext thread_context(context);
+			ExecutionContext execution_context(context, thread_context, nullptr);
+			result->foreign_local = bind_data.foreign_function.init_local(execution_context, foreign_input,
+			                                                              result->foreign_global.get());
+		}
 	}
 	if (result->needs_projection) {
 		result->scan_chunk.Initialize(Allocator::Get(context), scan_types);
@@ -268,22 +296,33 @@ void ScenarioScanExecute(ClientContext &context, TableFunctionInput &input, Data
 	if (gstate.base_exhausted) {
 		return;
 	}
-	auto &data_table = bind_data.base_entry.GetStorage();
-	auto &transaction = DuckTransaction::Get(context, bind_data.base_entry.catalog);
 	auto &scan_target = gstate.needs_projection ? gstate.scan_chunk : output;
 	while (true) {
-		// Always reset: an exhausted DataTable::Scan leaves the chunk
-		// untouched, and a stale non-empty chunk would loop forever when the
-		// previous iteration was fully suppressed
+		// Always reset: an exhausted scan leaves the chunk untouched, and a
+		// stale non-empty chunk would loop forever when the previous
+		// iteration was fully suppressed
 		scan_target.Reset();
-		data_table.Scan(transaction, scan_target, gstate.scan_state);
-		if (scan_target.size() == 0) {
-			if (data_table.NextParallelScan(context, gstate.parallel_state, gstate.scan_state) == 0) {
+		if (bind_data.base_is_duck) {
+			auto &data_table = bind_data.base_entry.GetStorage();
+			auto &transaction = DuckTransaction::Get(context, bind_data.base_entry.catalog);
+			data_table.Scan(transaction, scan_target, gstate.scan_state);
+			if (scan_target.size() == 0) {
+				if (data_table.NextParallelScan(context, gstate.parallel_state, gstate.scan_state) == 0) {
+					gstate.base_exhausted = true;
+					output.SetCardinality(0);
+					return;
+				}
+				continue;
+			}
+		} else {
+			TableFunctionInput foreign_input(bind_data.foreign_bind.get(), gstate.foreign_local.get(),
+			                                 gstate.foreign_global.get());
+			bind_data.foreign_function.function(context, foreign_input, scan_target);
+			if (scan_target.size() == 0) {
 				gstate.base_exhausted = true;
 				output.SetCardinality(0);
 				return;
 			}
-			continue;
 		}
 		idx_t count = scan_target.size();
 		if (!gstate.suppressed_keys.empty()) {
@@ -338,8 +377,24 @@ TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, Scenario
 	auto &host_catalog = scenario_catalog.GetHostCatalog(context);
 	auto delta_table =
 	    ScenarioDelta::TryGetDeltaTable(context, host_catalog, scenario_catalog.scenario_id, entry.name);
-	bind_data = make_uniq<ScenarioScanBindData>(entry, entry.base_entry, delta_table,
-	                                            ScenarioDelta::GetPKColumns(entry.base_entry));
+	auto result = make_uniq<ScenarioScanBindData>(entry, entry.base_entry, delta_table,
+	                                              ScenarioDelta::GetPKColumns(entry.base_entry));
+	result->base_is_duck = entry.base_entry.IsDuckTable();
+	if (!result->base_is_duck) {
+		// Phase 4: bind the foreign base's own scan; versioned bases
+		// (DuckLake) are pinned to the scenario's creation time
+		unique_ptr<BoundAtClause> at_clause;
+		auto &base_catalog = scenario_catalog.GetBaseCatalog(context);
+		if (base_catalog.GetCatalogType() == "ducklake") {
+			at_clause =
+			    make_uniq<BoundAtClause>("timestamp", Value::TIMESTAMP(scenario_catalog.created_at));
+		}
+		EntryLookupInfo foreign_lookup(CatalogType::TABLE_ENTRY, entry.base_entry.name, at_clause.get(),
+		                               QueryErrorContext());
+		result->foreign_function =
+		    entry.base_entry.GetScanFunction(context, result->foreign_bind, foreign_lookup);
+	}
+	bind_data = std::move(result);
 	return function;
 }
 

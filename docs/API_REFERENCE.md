@@ -39,9 +39,12 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 
 - **Copy-on-write:** modifications are stored per scenario in delta tables under the internal
   `__anofox_scenario` schema of the host database; base tables are never written.
-- **Overlay reads:** a scenario sees the *live* base plus its own changes. Base rows
-  inserted/updated after scenario creation show through unless the scenario modified the same
-  primary key. (Point-in-time isolation: `mode := 'materialized'` in v0.2, DuckLake bases in v0.3.)
+- **Isolation tiers** (all shipped):
+  | Tier | How | Isolation from base changes |
+  | --- | --- | --- |
+  | `overlay` (default) | delta over the live base | none - base churn shows through unless the scenario touched the same PK (documented semantics) |
+  | `materialized` | `mode := 'materialized'`: full copy per table | complete |
+  | `snapshot` | `base := '<ducklake attach>'`: reads pinned via `AT (TIMESTAMP => created_at)` | complete, O(1) creation - no data copied |
 - **Constraints:** base `NOT NULL`, `CHECK`, and PRIMARY KEY constraints are enforced for
   scenario writes against the *merged* state, with distinct errors for conflicts with base rows
   vs. scenario changes.
@@ -60,12 +63,13 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | Tables created in the base *after* `scenario_create` are read-only in the scenario | v0.2 |
 | Host writes and scenario writes in the *same explicit transaction* | documented restriction |
 | Views are not exposed inside scenarios | v0.2 |
+| DuckLake-based scenarios: UPDATE/DELETE gated (DuckLake tables have no PRIMARY KEY); merge-back refused (single-writer rule); ducklake tests need a release build | backlog: `key_columns :=` |
 
 ## Function Reference
 
 | Function | Kind | Description |
 | --- | --- | --- |
-| `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes. O(#tables) metadata for delta mode. |
+| `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes; `base` uses another attached catalog's tables as the base (DuckLake bases are pinned to creation time - true snapshot isolation). O(#tables) metadata for delta mode. |
 | `CALL scenario_drop(name)` | verb | Remove the scenario and its delta/materialized tables. Refuses while attached or while branches exist. |
 | `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | verb | Reject/allow writes through any attached handle (reads keep working). A frozen materialized scenario is a snapshot. |
 | `SELECT * FROM scenario_list()` | table | `scenario_id, name, mode, frozen, parent, created_at, description`. |

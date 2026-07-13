@@ -17,9 +17,11 @@ void ThrowScenarioDDLError() {
 }
 
 ScenarioCatalog::ScenarioCatalog(AttachedDatabase &db, string scenario_name_p, string host_catalog_name_p,
-                                 int64_t scenario_id_p, int64_t mat_base_scenario_id_p)
+                                 int64_t scenario_id_p, int64_t mat_base_scenario_id_p, string base_catalog_name_p,
+                                 timestamp_t created_at_p)
     : Catalog(db), scenario_name(std::move(scenario_name_p)), host_catalog_name(std::move(host_catalog_name_p)),
-      scenario_id(scenario_id_p), mat_base_scenario_id(mat_base_scenario_id_p) {
+      base_catalog_name(std::move(base_catalog_name_p)), created_at(created_at_p), scenario_id(scenario_id_p),
+      mat_base_scenario_id(mat_base_scenario_id_p) {
 }
 
 void ScenarioCatalog::Initialize(bool load_builtin) {
@@ -106,6 +108,19 @@ Catalog &ScenarioCatalog::GetHostCatalog(ClientContext &context) {
 		    scenario_name, host_catalog_name);
 	}
 	return *host;
+}
+
+Catalog &ScenarioCatalog::GetBaseCatalog(ClientContext &context) {
+	if (base_catalog_name.empty()) {
+		return GetHostCatalog(context);
+	}
+	auto base = Catalog::GetCatalogEntry(context, base_catalog_name);
+	if (!base) {
+		throw InvalidInputException(
+		    "Scenario '%s': base catalog '%s' is not attached - ATTACH it before using this scenario",
+		    scenario_name, base_catalog_name);
+	}
+	return *base;
 }
 
 ScenarioTransaction &ScenarioCatalog::GetScenarioTransaction(ClientContext &context) {

@@ -48,7 +48,13 @@ static unique_ptr<Catalog> ScenarioAttach(optional_ptr<StorageExtensionInfo> sto
 			throw InternalException("anofox_scenario: cycle detected in scenario parent chain");
 		}
 	}
-	return make_uniq<ScenarioCatalog>(db, entry->name, host_catalog_name, entry->scenario_id, mat_base_scenario_id);
+	if (!entry->base_catalog.empty() && !Catalog::GetCatalogEntry(context, entry->base_catalog)) {
+		throw InvalidInputException(
+		    "Scenario '%s' uses '%s' as its base catalog, which is not attached. ATTACH it first",
+		    scenario_name, entry->base_catalog);
+	}
+	return make_uniq<ScenarioCatalog>(db, entry->name, host_catalog_name, entry->scenario_id, mat_base_scenario_id,
+	                                  entry->base_catalog, entry->created_at);
 }
 
 static unique_ptr<TransactionManager> ScenarioCreateTransactionManager(optional_ptr<StorageExtensionInfo> storage_info,

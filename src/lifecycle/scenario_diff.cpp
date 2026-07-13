@@ -83,12 +83,23 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 		base_entry = mat.get();
 		target.base_name = host_prefix + Q(ScenarioRegistry::SCHEMA_NAME) + "." + Q(mat->name);
 	} else {
-		base_entry = host_catalog.GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, table_name,
-		                                                      OnEntryNotFound::RETURN_NULL);
+		// Phase 4: the base may live in another attached catalog
+		optional_ptr<Catalog> base_catalog = &host_catalog;
+		if (!entry->base_catalog.empty()) {
+			base_catalog = Catalog::GetCatalogEntry(context, entry->base_catalog);
+			if (!base_catalog) {
+				throw InvalidInputException(
+				    "Scenario '%s': base catalog '%s' is not attached - ATTACH it first", scenario_name,
+				    entry->base_catalog);
+			}
+		}
+		base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, table_name,
+		                                                       OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			throw InvalidInputException("Table '%s' not found in the base schema", table_name);
 		}
-		target.base_name = host_prefix + Q(string(DEFAULT_SCHEMA)) + "." + Q(table_name);
+		target.base_name =
+		    Q(base_catalog->GetName()) + "." + Q(string(DEFAULT_SCHEMA)) + "." + Q(table_name);
 	}
 
 	auto pk_columns = ScenarioDelta::GetPKColumns(*base_entry);

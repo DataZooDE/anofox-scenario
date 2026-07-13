@@ -39,7 +39,8 @@ constexpr idx_t REG_COL_BASE_SNAPSHOT_ID = 5;
 constexpr idx_t REG_COL_CREATED_AT = 6;
 constexpr idx_t REG_COL_MERGED_AT = 7;
 constexpr idx_t REG_COL_DESCRIPTION = 8;
-constexpr idx_t REG_COL_COUNT = 9;
+constexpr idx_t REG_COL_BASE_CATALOG = 9;
+constexpr idx_t REG_COL_COUNT = 10;
 
 ScenarioRegistryEntry EntryFromChunk(DataChunk &chunk, idx_t row) {
 	ScenarioRegistryEntry entry;
@@ -61,6 +62,10 @@ ScenarioRegistryEntry EntryFromChunk(DataChunk &chunk, idx_t row) {
 	entry.has_description = !desc.IsNull();
 	if (entry.has_description) {
 		entry.description = desc.GetValue<string>();
+	}
+	auto base_catalog = chunk.GetValue(REG_COL_BASE_CATALOG, row);
+	if (!base_catalog.IsNull()) {
+		entry.base_catalog = base_catalog.GetValue<string>();
 	}
 	return entry;
 }
@@ -160,6 +165,9 @@ void ScenarioRegistry::EnsureExists(ClientContext &context, Catalog &host_catalo
 	info->columns.AddColumn(ColumnDefinition("created_at", LogicalType::TIMESTAMP));
 	info->columns.AddColumn(ColumnDefinition("merged_at", LogicalType::TIMESTAMP));
 	info->columns.AddColumn(ColumnDefinition("description", LogicalType::VARCHAR));
+	// Phase 4: NULL = the host default database; otherwise the attached
+	// catalog whose tables serve as the scenario's base (e.g. a DuckLake)
+	info->columns.AddColumn(ColumnDefinition("base_catalog", LogicalType::VARCHAR));
 	info->constraints.push_back(make_uniq<UniqueConstraint>(LogicalIndex(REG_COL_SCENARIO_ID), true));
 	info->constraints.push_back(make_uniq<UniqueConstraint>(LogicalIndex(REG_COL_NAME), false));
 	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(REG_COL_NAME)));
@@ -241,6 +249,8 @@ void ScenarioRegistry::Insert(ClientContext &context, Catalog &host_catalog, con
 	               entry.has_merged_at ? Value::TIMESTAMP(entry.merged_at) : Value(LogicalType::TIMESTAMP));
 	chunk.SetValue(REG_COL_DESCRIPTION, 0,
 	               entry.has_description ? Value(entry.description) : Value(LogicalType::VARCHAR));
+	chunk.SetValue(REG_COL_BASE_CATALOG, 0,
+	               entry.base_catalog.empty() ? Value(LogicalType::VARCHAR) : Value(entry.base_catalog));
 	chunk.SetCardinality(1);
 
 	auto binder = Binder::CreateBinder(context);

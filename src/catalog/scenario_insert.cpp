@@ -185,7 +185,6 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	auto &client = context.client;
 	auto &scenario_catalog = entry.GetScenarioCatalog();
 	auto &host_catalog = scenario_catalog.GetHostCatalog(client);
-	auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
 
 	// Lazy setup on the first chunk. The delta table was created eagerly by
 	// scenario_create; DML never creates catalog entries (single-writer rule).
@@ -202,9 +201,12 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		gstate.delta_table = &delta;
 		auto binder = Binder::CreateBinder(client);
 		gstate.delta_constraints = binder->BindConstraints(delta);
-		gstate.base_constraints = binder->BindConstraints(base_duck);
-		gstate.base_constraint_state =
-		    base_duck.GetStorage().InitializeConstraintState(base_duck, gstate.base_constraints);
+		if (entry.base_entry.IsDuckTable()) {
+			auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
+			gstate.base_constraints = binder->BindConstraints(base_duck);
+			gstate.base_constraint_state =
+			    base_duck.GetStorage().InitializeConstraintState(base_duck, gstate.base_constraints);
+		}
 		if (!gstate.pk_columns.empty()) {
 			gstate.delta_keys.Load(client, delta, gstate.pk_columns);
 		}
@@ -262,11 +264,13 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 			row_keys[i] = std::move(key);
 		}
 
-		// Probe the base through its own constraint machinery
-		if (base_verify_count > 0) {
+		// Probe the base through its own constraint machinery (duck bases
+		// only; foreign bases like DuckLake have no PK indexes to violate)
+		if (base_verify_count > 0 && gstate.base_constraint_state) {
 			gstate.verify_chunk.Reset();
 			gstate.verify_chunk.Reference(chunk);
 			gstate.verify_chunk.Slice(base_verify_sel, base_verify_count);
+			auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
 			try {
 				base_duck.GetStorage().VerifyAppendConstraints(*gstate.base_constraint_state, client,
 				                                               gstate.verify_chunk, nullptr, nullptr);

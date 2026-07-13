@@ -85,8 +85,9 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		});
 		return;
 	}
-	auto &host_schema = host_catalog.GetSchema(context, DEFAULT_SCHEMA);
-	host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &base_entry) {
+	auto &base_catalog = scenario_catalog.GetBaseCatalog(context);
+	auto &base_schema = base_catalog.GetSchema(context, DEFAULT_SCHEMA);
+	base_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &base_entry) {
 		if (!ShouldExpose(base_entry)) {
 			return;
 		}
@@ -123,9 +124,10 @@ optional_ptr<CatalogEntry> ScenarioSchemaEntry::LookupEntry(CatalogTransaction t
 		return &GetOrCreateTableEntryAs(context, *mat_entry, lookup_info.GetEntryName());
 	}
 
-	auto &host_schema = host_catalog.GetSchema(context, DEFAULT_SCHEMA);
+	auto &base_catalog = scenario_catalog.GetBaseCatalog(context);
+	auto &base_schema = base_catalog.GetSchema(context, DEFAULT_SCHEMA);
 	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, lookup_info.GetEntryName());
-	auto base_entry = host_schema.LookupEntry(host_catalog.GetCatalogTransaction(context), table_lookup);
+	auto base_entry = base_schema.LookupEntry(base_catalog.GetCatalogTransaction(context), table_lookup);
 	if (!base_entry || !ShouldExpose(*base_entry)) {
 		return nullptr;
 	}

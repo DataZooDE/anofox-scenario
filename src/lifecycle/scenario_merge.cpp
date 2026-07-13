@@ -76,10 +76,18 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 	string sql;
 	auto host_prefix = QM(host.GetName()) + ".";
 	auto internal_prefix = host_prefix + QM(ScenarioRegistry::SCHEMA_NAME) + ".";
+	optional_ptr<Catalog> preview_base = &host;
+	if (!entry->base_catalog.empty()) {
+		preview_base = Catalog::GetCatalogEntry(context, entry->base_catalog);
+		if (!preview_base) {
+			throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", scenario_name,
+			                            entry->base_catalog);
+		}
+	}
 	for (auto &delta_pair : ListDeltaTables(context, host, entry->scenario_id)) {
 		auto &logical_name = delta_pair.second;
-		auto base_entry =
-		    host.GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, logical_name, OnEntryNotFound::RETURN_NULL);
+		auto base_entry = preview_base->GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, logical_name,
+		                                                            OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			continue; // base table vanished; scenario_merge reports the error
 		}
@@ -98,7 +106,7 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 				pk_match += "b." + QM(name) + " = d." + QM(name);
 			}
 		}
-		auto base_name = host_prefix + QM(string(DEFAULT_SCHEMA)) + "." + QM(logical_name);
+		auto base_name = QM(preview_base->GetName()) + "." + QM(string(DEFAULT_SCHEMA)) + "." + QM(logical_name);
 		string exists_clause = pk_columns.empty()
 		                           ? string("false")
 		                           : "EXISTS (SELECT 1 FROM " + base_name + " b WHERE " + pk_match + ")";
@@ -195,6 +203,12 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		throw NotImplementedException(
 		    "Merging a materialized scenario back is not supported (v1): materialized scenarios are full "
 		    "copies, not changelogs");
+	}
+	if (!entry->base_catalog.empty()) {
+		throw NotImplementedException(
+		    "Merging back a scenario whose base lives in another catalog ('%s') is not supported (v1): "
+		    "DuckDB transactions write a single database",
+		    entry->base_catalog);
 	}
 	if (entry->frozen) {
 		throw InvalidInputException("Scenario '%s' is frozen. Unfreeze it before merging", bind_data.name);

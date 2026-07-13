@@ -1,0 +1,105 @@
+# name: test/sql/scenario_ducklake_base.test
+# description: Phase 4: scenarios over a DuckLake base with creation-time snapshot isolation
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+require parquet
+
+# needs the ducklake extension installed for the running duckdb version;
+# run with DUCKLAKE_TESTS=1 (release build - see phase 4 spike notes)
+require-env DUCKLAKE_TESTS
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/lake_meta.ducklake' AS lake (DATA_PATH '__TEST_DIR__/lake_data');
+
+statement ok
+CREATE TABLE lake.forecast (id INTEGER, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO lake.forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
+
+statement ok
+CALL scenario_create('lakescen', 'over a ducklake', base := 'lake');
+
+statement ok
+ATTACH 'lakescen' AS s (TYPE scenario);
+
+# reads flow through the ducklake scan
+query ITI
+SELECT id, region, qty FROM s.forecast ORDER BY id;
+----
+1	EU	100
+2	US	200
+3	APAC	300
+
+# --- REAL snapshot isolation: base churn after creation is INVISIBLE -------------
+
+statement ok
+INSERT INTO lake.forecast VALUES (4, 'LATAM', 400);
+
+statement ok
+UPDATE lake.forecast SET qty = 999 WHERE id = 1;
+
+statement ok
+DELETE FROM lake.forecast WHERE id = 3;
+
+# the lake moved on...
+query I
+SELECT count(*) FROM lake.forecast;
+----
+3
+
+# ...but the scenario still sees creation time
+query ITI
+SELECT id, region, qty FROM s.forecast ORDER BY id;
+----
+1	EU	100
+2	US	200
+3	APAC	300
+
+# --- scenario inserts overlay the pinned base (deltas live in the host) ------------
+
+statement ok
+INSERT INTO s.forecast VALUES (10, 'MEA', 50);
+
+query I
+SELECT count(*) FROM s.forecast;
+----
+4
+
+query I
+SELECT count(*) FROM lake.forecast WHERE id = 10;
+----
+0
+
+# ducklake tables have no PK: UPDATE/DELETE fall under the existing no-PK rule
+statement error
+UPDATE s.forecast SET qty = 1 WHERE id = 1;
+----
+<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+
+statement error
+DELETE FROM s.forecast WHERE id = 1;
+----
+<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+
+# merge-back into a foreign catalog is refused (single-writer rule)
+statement error
+SELECT * FROM scenario_merge('lakescen');
+----
+<REGEX>:.*another catalog.*
+
+# --- cleanup ------------------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('lakescen');
+
+statement ok
+DETACH lake;

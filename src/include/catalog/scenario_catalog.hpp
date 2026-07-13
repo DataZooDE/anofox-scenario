@@ -144,12 +144,16 @@ private:
 class ScenarioCatalog : public Catalog {
 public:
 	ScenarioCatalog(AttachedDatabase &db, string scenario_name, string host_catalog_name, int64_t scenario_id,
-	                int64_t mat_base_scenario_id);
+	                int64_t mat_base_scenario_id, string base_catalog_name, timestamp_t created_at);
 
 	//! Name of the scenario in the registry
 	const string scenario_name;
 	//! Name of the host catalog holding registry + delta tables + base tables
 	const string host_catalog_name;
+	//! Phase 4: attached catalog serving as the base ("" = the host)
+	const string base_catalog_name;
+	//! Creation time: pins versioned bases (DuckLake) via AT (TIMESTAMP => ...)
+	const timestamp_t created_at;
 	//! Registry id of the scenario
 	const int64_t scenario_id;
 	//! BaseSource selector: -1 = live host tables (overlay); otherwise the
@@ -194,6 +198,8 @@ public:
 
 	//! The host catalog (throws if it has been detached)
 	Catalog &GetHostCatalog(ClientContext &context);
+	//! The catalog providing the base tables (host unless base := was used)
+	Catalog &GetBaseCatalog(ClientContext &context);
 	//! The scenario transaction for this catalog in the current context
 	ScenarioTransaction &GetScenarioTransaction(ClientContext &context);
 	//! Throws when the scenario is frozen (single chokepoint for all writes)

@@ -68,9 +68,11 @@ public:
 		delta_table = delta_ptr;
 		auto binder = Binder::CreateBinder(client);
 		delta_constraints = binder->BindConstraints(*delta_ptr);
-		auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
-		base_constraints = binder->BindConstraints(base_duck);
-		base_constraint_state = base_duck.GetStorage().InitializeConstraintState(base_duck, base_constraints);
+		if (entry.base_entry.IsDuckTable()) {
+			auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
+			base_constraints = binder->BindConstraints(base_duck);
+			base_constraint_state = base_duck.GetStorage().InitializeConstraintState(base_duck, base_constraints);
+		}
 		pk_columns = ScenarioDelta::GetPKColumns(entry.base_entry);
 		delta_keys.Load(client, *delta_ptr, pk_columns);
 		delta_chunk.Initialize(Allocator::Get(client), delta_ptr->GetStorage().GetTypes());
@@ -79,7 +81,7 @@ public:
 	//! Verify rows (full table layout) against the base's unique constraints
 	void VerifyAgainstBase(ClientContext &client, ScenarioTableEntry &entry, DataChunk &full_chunk,
 	                       SelectionVector &sel, idx_t count) {
-		if (count == 0) {
+		if (count == 0 || !base_constraint_state) {
 			return;
 		}
 		DataChunk verify_chunk;
