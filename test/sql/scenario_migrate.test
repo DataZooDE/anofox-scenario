@@ -1,0 +1,165 @@
+# name: test/sql/scenario_migrate.test
+# description: Phase 2: scenario_migrate() converts a legacy v0.1 layout into registry v2
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# --- build a legacy-layout fixture by hand (mirrors the v0.1 on-disk shape) ------
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 100), (2, 200), (3, 300);
+
+# build the legacy metadata tables exactly as v0.1 shipped them
+statement ok
+CREATE TABLE _scenario_registry (
+    scenario_id INTEGER PRIMARY KEY, scenario_name VARCHAR NOT NULL UNIQUE,
+    schema_name VARCHAR NOT NULL UNIQUE, base_schema VARCHAR NOT NULL,
+    base_captured_at TIMESTAMP NOT NULL, created_at TIMESTAMP DEFAULT current_timestamp,
+    status VARCHAR DEFAULT 'active', description VARCHAR, parent_scenario_id INTEGER);
+
+statement ok
+CREATE TABLE _scenario_snapshots (
+    snapshot_id INTEGER PRIMARY KEY, snapshot_name VARCHAR NOT NULL UNIQUE,
+    source_schema VARCHAR NOT NULL, created_at TIMESTAMP, description VARCHAR, size_bytes BIGINT);
+
+statement ok
+CREATE TABLE _scenario_base_rowids (scenario_id INTEGER, table_name VARCHAR, base_rowid BIGINT);
+
+statement ok
+INSERT INTO _scenario_registry VALUES
+    (1, 'legacy_active', '_scen_legacy_active', 'main', TIMESTAMP '2026-01-01', TIMESTAMP '2026-01-01', 'active', 'a live one', NULL),
+    (2, 'legacy_archived', '_scen_legacy_archived', 'main', TIMESTAMP '2026-01-02', TIMESTAMP '2026-01-02', 'archived', NULL, NULL);
+
+statement ok
+CREATE SCHEMA _scen_legacy_active;
+
+# legacy delta layout: (_op, _ts, _version, payload); PK includes _op so one
+# logical row can carry several op rows (here: I then U for id 10)
+statement ok
+CREATE TABLE _scen_legacy_active._delta_forecast (
+    _op VARCHAR NOT NULL, _ts TIMESTAMP, _version INTEGER DEFAULT 1, id INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO _scen_legacy_active._delta_forecast VALUES
+    ('I', TIMESTAMP '2026-01-01 10:00:00', 1, 10, 1000),
+    ('U', TIMESTAMP '2026-01-01 11:00:00', 1, 10, 1010),
+    ('U', TIMESTAMP '2026-01-01 10:30:00', 1, 2, 222),
+    ('D', TIMESTAMP '2026-01-01 10:45:00', 1, 3, NULL);
+
+statement ok
+CREATE SCHEMA _scen_legacy_archived;
+
+statement ok
+CREATE TABLE _scen_legacy_archived._delta_forecast (
+    _op VARCHAR NOT NULL, _ts TIMESTAMP, _version INTEGER DEFAULT 1, id INTEGER, qty INTEGER);
+
+# legacy snapshot: a full schema copy
+statement ok
+INSERT INTO _scenario_snapshots VALUES (1, 'board_deck', 'main', TIMESTAMP '2026-01-03', 'frozen for the meeting', 0);
+
+statement ok
+CREATE SCHEMA _snap_board_deck;
+
+statement ok
+CREATE TABLE _snap_board_deck.forecast AS SELECT * FROM forecast;
+
+# --- migrate ----------------------------------------------------------------------
+
+query II
+SELECT migrated_scenarios, migrated_snapshots FROM scenario_migrate();
+----
+2	1
+
+# legacy artifacts are gone
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name IN ('_scenario_registry', '_scenario_snapshots', '_scenario_base_rowids');
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_schemas() WHERE schema_name LIKE '_scen_%' OR schema_name LIKE '_snap_%';
+----
+0
+
+# --- migrated scenarios behave like native v2 scenarios ----------------------------
+
+query TTT
+SELECT name, mode, frozen::VARCHAR FROM scenario_list() ORDER BY name;
+----
+board_deck	materialized	true
+legacy_active	delta	false
+legacy_archived	delta	true
+
+statement ok
+ATTACH 'legacy_active' AS la (TYPE scenario);
+
+# folded net effect: id 10 stays a scenario-insert with the LATEST values;
+# id 2 modified; id 3 tombstoned
+query II
+SELECT id, qty FROM la.forecast ORDER BY id;
+----
+1	100
+2	222
+10	1010
+
+query ITT
+SELECT id, change_type, new_value FROM scenario_diff('legacy_active', 'forecast') ORDER BY id;
+----
+2	modified	222
+3	removed	NULL
+10	added	NULL
+
+# archived -> frozen: writes rejected, reads fine
+statement ok
+ATTACH 'legacy_archived' AS lar (TYPE scenario);
+
+statement error
+INSERT INTO lar.forecast VALUES (99, 9);
+----
+<REGEX>:.*frozen.*
+
+# snapshot -> materialized+frozen: immune to base churn
+statement ok
+ATTACH 'board_deck' AS bd (TYPE scenario);
+
+statement ok
+UPDATE forecast SET qty = 12345 WHERE id = 1;
+
+query I
+SELECT qty FROM bd.forecast WHERE id = 1;
+----
+100
+
+statement error
+DELETE FROM bd.forecast WHERE id = 1;
+----
+<REGEX>:.*frozen.*
+
+# migration is one-way and refuses partial reruns gracefully (nothing left)
+query II
+SELECT * FROM scenario_migrate();
+----
+0	0
+
+# --- cleanup -------------------------------------------------------------------------
+
+statement ok
+DETACH la;
+
+statement ok
+DETACH lar;
+
+statement ok
+DETACH bd;
+
+statement ok
+CALL scenario_drop('legacy_active');
+
+statement ok
+CALL scenario_drop('legacy_archived');
+
+statement ok
+CALL scenario_drop('board_deck');

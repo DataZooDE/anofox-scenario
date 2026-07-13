@@ -260,7 +260,7 @@ void ScenarioUnfreezeVerb(ClientContext &context, const LifecycleBindData &bind_
 }
 
 //===----------------------------------------------------------------------===//
-// scenario_list_v2: the registry v2 view
+// scenario_list: the registry v2 view
 //===----------------------------------------------------------------------===//
 
 struct ScenarioListState : public GlobalTableFunctionState {
@@ -336,7 +336,7 @@ void ScenarioLifecycle::RegisterFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(MakeVerbSet("scenario_freeze", LifecycleExecute<ScenarioFreezeVerb>, false));
 	loader.RegisterFunction(MakeVerbSet("scenario_unfreeze", LifecycleExecute<ScenarioUnfreezeVerb>, false));
 	// Registry v2 listing (replaces legacy scenario_list in v0.2)
-	loader.RegisterFunction(TableFunction("scenario_list_v2", {}, ScenarioListExecute, ScenarioListBind,
+	loader.RegisterFunction(TableFunction("scenario_list", {}, ScenarioListExecute, ScenarioListBind,
 	                                      ScenarioListInit));
 }
 

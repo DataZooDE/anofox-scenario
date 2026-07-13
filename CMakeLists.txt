@@ -12,13 +12,6 @@ include_directories(src/include)
 
 set(EXTENSION_SOURCES
     src/anofox_scenario_extension.cpp
-    src/metadata_store.cpp
-    src/scenario_manager.cpp
-    src/snapshot_manager.cpp
-    src/protocol_manager.cpp
-    src/delta_storage_engine.cpp
-    src/comparison_engine.cpp
-    src/ddl_blocker.cpp
     src/catalog/scenario_registry.cpp
     src/catalog/scenario_catalog.cpp
     src/catalog/scenario_schema_entry.cpp
@@ -31,6 +24,7 @@ set(EXTENSION_SOURCES
     src/catalog/scenario_storage_extension.cpp
     src/lifecycle/scenario_lifecycle.cpp
     src/lifecycle/scenario_diff.cpp
+    src/lifecycle/scenario_migrate.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

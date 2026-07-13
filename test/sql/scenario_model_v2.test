@@ -106,10 +106,10 @@ CALL scenario_drop('what_if');
 ----
 <REGEX>:.*attached.*
 
-# --- scenario_list_v2: registry v2 view --------------------------------------------
+# --- scenario_list: registry v2 view --------------------------------------------
 
 query TTT
-SELECT name, mode, frozen::VARCHAR FROM scenario_list_v2() ORDER BY name;
+SELECT name, mode, frozen::VARCHAR FROM scenario_list() ORDER BY name;
 ----
 baseline	materialized	false
 what_if	delta	false
@@ -120,7 +120,7 @@ statement ok
 CALL scenario_freeze('baseline');
 
 query T
-SELECT frozen::VARCHAR FROM scenario_list_v2() WHERE name = 'baseline';
+SELECT frozen::VARCHAR FROM scenario_list() WHERE name = 'baseline';
 ----
 true
 

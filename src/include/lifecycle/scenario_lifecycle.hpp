@@ -20,4 +20,10 @@ public:
 	static void RegisterFunctions(ExtensionLoader &loader);
 };
 
+//! CALL scenario_migrate(): legacy v0.1 layout -> registry v2 (one-way)
+class ScenarioMigrate {
+public:
+	static void RegisterFunctions(ExtensionLoader &loader);
+};
+
 } // namespace duckdb
