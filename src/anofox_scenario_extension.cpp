@@ -25,6 +25,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	ScenarioDiff::RegisterFunctions(loader);
 	// CALL scenario_migrate(): legacy v0.1 layout -> registry v2
 	ScenarioMigrate::RegisterFunctions(loader);
+	// scenario_merge_preview + CALL scenario_merge (merge-back)
+	ScenarioMergeBack::RegisterFunctions(loader);
 }
 
 void AnofoxScenarioExtension::Load(ExtensionLoader &loader) {

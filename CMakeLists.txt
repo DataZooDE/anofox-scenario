@@ -26,6 +26,7 @@ set(EXTENSION_SOURCES
     src/lifecycle/scenario_lifecycle.cpp
     src/lifecycle/scenario_diff.cpp
     src/lifecycle/scenario_migrate.cpp
+    src/lifecycle/scenario_merge.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

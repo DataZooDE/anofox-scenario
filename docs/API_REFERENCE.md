@@ -72,6 +72,8 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | `SELECT * FROM scenario_diff(scenario, table)` | table | Compare to origin: `<pk cols>` (native types), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value`. Streams through the engine. |
 | `SELECT * FROM scenario_diff(a, b, table)` | table | Generic diff between two merged relations (`'main'` or any scenario). `old` = side a, `new` = side b. |
 | `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog. |
+| `SELECT * FROM scenario_merge_preview(scenario)` | table | Planned merge-back actions: `table_name, key, action, conflict`. Streaming; no side effects. Overlay-tier conflicts: an `insert` whose key now exists in base, an `update` whose key vanished. |
+| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base in the caller's transaction (atomic across tables). `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. On success the scenario ends `frozen` with `merged_at` set and an empty delta. Delta scenarios only; refuses while branches exist. |
 | `SELECT * FROM scenario_migrate()` | verb | One-way migration of a legacy v0.1 database (`_scenario_registry`, `_scen_*`, `_snap_*`) into the v2 layout. Archived -> frozen; snapshots -> materialized+frozen; multi-op delta rows folded to net effects; `_scenario_base_rowids` dropped; `_scenario_protocols` preserved. |
 | `ATTACH 'name' AS alias (TYPE scenario)` / `DETACH alias` | SQL | The entire read/write UX. |
 

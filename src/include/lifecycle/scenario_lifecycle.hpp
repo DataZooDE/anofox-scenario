@@ -26,4 +26,10 @@ public:
 	static void RegisterFunctions(ExtensionLoader &loader);
 };
 
+//! Phase 6: scenario_merge_preview + CALL scenario_merge
+class ScenarioMergeBack {
+public:
+	static void RegisterFunctions(ExtensionLoader &loader);
+};
+
 } // namespace duckdb

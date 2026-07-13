@@ -288,6 +288,30 @@ void ScenarioRegistry::SetFrozen(ClientContext &context, Catalog &host_catalog, 
 	data_table.Update(*update_state, context, row_ids, column_ids, update_chunk);
 }
 
+void ScenarioRegistry::MarkMerged(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {
+	auto &table = GetRegistryTableOrThrow(context, host_catalog);
+	auto row_id = FindRowId(context, host_catalog, table, scenario_id);
+	if (row_id < 0) {
+		throw InternalException("anofox_scenario: registry row for scenario id %lld not found", scenario_id);
+	}
+	MarkHostModified(context, host_catalog, DatabaseModificationType::UPDATE_DATA);
+
+	auto &data_table = table.GetStorage();
+	auto binder = Binder::CreateBinder(context);
+	auto bound_constraints = binder->BindConstraints(table);
+	auto update_state = data_table.InitializeUpdate(table, context, bound_constraints);
+
+	Vector row_ids(LogicalType::ROW_TYPE);
+	row_ids.SetValue(0, Value::BIGINT(row_id));
+	DataChunk update_chunk;
+	update_chunk.Initialize(Allocator::Get(context), {LogicalType::BOOLEAN, LogicalType::TIMESTAMP});
+	update_chunk.SetValue(0, 0, Value::BOOLEAN(true));
+	update_chunk.SetValue(1, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+	update_chunk.SetCardinality(1);
+	vector<PhysicalIndex> column_ids {PhysicalIndex(REG_COL_FROZEN), PhysicalIndex(REG_COL_MERGED_AT)};
+	data_table.Update(*update_state, context, row_ids, column_ids, update_chunk);
+}
+
 bool ScenarioRegistry::HasChildren(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {
 	auto table = GetRegistryTable(context, host_catalog);
 	if (!table) {

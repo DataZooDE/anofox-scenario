@@ -69,6 +69,8 @@ public:
 	static void Delete(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
 	//! Flip the frozen flag for the given scenario id.
 	static void SetFrozen(ClientContext &context, Catalog &host_catalog, int64_t scenario_id, bool frozen);
+	//! Phase 6: mark a scenario merged (frozen = true, merged_at = now).
+	static void MarkMerged(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
 	//! True if any scenario records the given id as its parent.
 	static bool HasChildren(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
 
