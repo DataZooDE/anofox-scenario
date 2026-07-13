@@ -13,6 +13,10 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/config.hpp"
 
+#ifdef HAS_POSTHOG_TELEMETRY
+#include "telemetry.hpp"
+#endif
+
 
 namespace duckdb {
 
@@ -73,6 +77,35 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register DDL blocker to prevent schema modifications in scenarios
 	DDLBlocker::Register(loader.GetDatabaseInstance());
+
+	// Initialize PostHog telemetry (respects DATAZOO_DISABLE_TELEMETRY env var)
+#ifdef HAS_POSTHOG_TELEMETRY
+	auto &telemetry = PostHogTelemetry::Instance();
+
+	// Auto-disable telemetry in CI environments
+	if (std::getenv("CI") || std::getenv("GITHUB_ACTIONS") || std::getenv("GITLAB_CI") ||
+	    std::getenv("CIRCLECI") || std::getenv("TRAVIS") || std::getenv("JENKINS_URL") ||
+	    std::getenv("BUILDKITE") || std::getenv("TEAMCITY_VERSION") ||
+	    std::getenv("TF_BUILD") || std::getenv("CODEBUILD_BUILD_ID")) {
+		telemetry.SetEnabled(false);
+	}
+
+	telemetry.SetAPIKey("phc_t3wwRLtpyEmLHYaZCSszG0MqVr74J6wnCrj9D41zk2t");
+	telemetry.SetDuckDBVersion(DuckDB::LibraryVersion());
+	telemetry.SetProduct("anofox_scenario", "2026.06.17", "oss");
+	telemetry.AssociateGroup("deployment", PostHogTelemetry::GetDistinctId());
+	telemetry.CaptureExtensionLoad("anofox_scenario", AnofoxScenarioExtension().Version());
+
+	// Register telemetry opt-out setting
+	config.AddExtensionOption(
+	    "anofox_scenario_telemetry_enabled",
+	    "Enable or disable anonymous usage telemetry for anofox_scenario",
+	    LogicalType::BOOLEAN,
+	    Value::BOOLEAN(true),
+	    [](ClientContext &context, SetScope scope, Value &parameter) {
+		    PostHogTelemetry::Instance().SetEnabled(BooleanValue::Get(parameter));
+	    });
+#endif
 }
 
 void AnofoxScenarioExtension::Load(ExtensionLoader &loader) {
