@@ -113,7 +113,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 	// The scan list holds regular/rowid columns; __scenario_origin is a
 	// constant (0) on the base side; __scenario_key_<k> maps to the PK column.
 	vector<ColumnIndex> scan_columns;
-	auto find_or_add_scan_column = [&](const ColumnIndex &col) {
+	auto find_or_add_scan_column = [&](const ColumnIndex &col) -> idx_t {
 		for (idx_t i = 0; i < scan_columns.size(); i++) {
 			if (scan_columns[i].GetPrimaryIndex() == col.GetPrimaryIndex()) {
 				return i;
@@ -276,7 +276,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 		vector<LogicalType> delta_types;
 		delta_column_ids.emplace_back(ScenarioDelta::OP_COL);
 		delta_types.push_back(LogicalType::VARCHAR);
-		auto find_or_add_delta = [&](idx_t payload_col) {
+		auto find_or_add_delta = [&](idx_t payload_col) -> idx_t {
 			for (idx_t i = 1; i < delta_column_ids.size(); i++) {
 				if (delta_column_ids[i].GetPrimaryIndex() == ScenarioDelta::PAYLOAD_START + payload_col) {
 					return i;
