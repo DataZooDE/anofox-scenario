@@ -17,6 +17,7 @@
 #include "catalog/scenario_dml.hpp"
 #include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -111,14 +112,45 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 		string exists_clause = pk_columns.empty()
 		                           ? string("false")
 		                           : "EXISTS (SELECT 1 FROM " + base_name + " b WHERE " + pk_match + ")";
+
+		// Materialized scenarios: base drift vs the creation snapshot is a
+		// 3-way conflict on touched keys (mirrors scenario_merge's check)
+		string drift_clause = "false";
+		if (entry->mode == "materialized" && !pk_columns.empty()) {
+			auto mat_name =
+			    internal_prefix + QM(ScenarioDelta::MatTableName(entry->scenario_id, logical_name));
+			string mat_match, drift_columns;
+			unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
+			for (auto pk_col : pk_columns) {
+				auto &name = base_entry->GetColumn(LogicalIndex(pk_col)).Name();
+				if (!mat_match.empty()) {
+					mat_match += " AND ";
+				}
+				mat_match += "m." + QM(name) + " = d." + QM(name);
+			}
+			for (idx_t col = 0; col < base_entry->GetColumns().LogicalColumnCount(); col++) {
+				if (pk_set.find(col) != pk_set.end()) {
+					continue;
+				}
+				auto &name = base_entry->GetColumn(LogicalIndex(col)).Name();
+				if (!drift_columns.empty()) {
+					drift_columns += " OR ";
+				}
+				drift_columns += "b." + QM(name) + " IS DISTINCT FROM m." + QM(name);
+			}
+			if (!drift_columns.empty()) {
+				drift_clause = "EXISTS (SELECT 1 FROM " + base_name + " b, " + mat_name + " m WHERE " + pk_match +
+				               " AND " + mat_match + " AND (" + drift_columns + "))";
+			}
+		}
 		if (!sql.empty()) {
 			sql += " UNION ALL ";
 		}
 		sql += "SELECT CAST('" + logical_name + "' AS VARCHAR) AS table_name, " + key_expr +
 		       " AS key, CASE d._op WHEN 'I' THEN 'insert' WHEN 'U' THEN 'update' ELSE 'delete' END AS action, "
 		       "CASE WHEN d._op = 'I' THEN " +
-		       exists_clause + " WHEN d._op = 'U' THEN NOT " + exists_clause +
-		       " ELSE false END AS conflict FROM " + internal_prefix + QM(delta_pair.first) + " d";
+		       exists_clause + " WHEN d._op = 'U' THEN (NOT " + exists_clause + " OR " + drift_clause +
+		       ") ELSE " + drift_clause + " END AS conflict FROM " + internal_prefix + QM(delta_pair.first) + " d";
 	}
 	if (sql.empty()) {
 		sql = "SELECT CAST(NULL AS VARCHAR) AS table_name, CAST(NULL AS VARCHAR) AS key, CAST(NULL AS VARCHAR) AS "
@@ -200,11 +232,11 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	if (entry->has_merged_at) {
 		throw InvalidInputException("Scenario '%s' was already merged back into the base", bind_data.name);
 	}
-	if (entry->mode == "materialized") {
-		throw NotImplementedException(
-		    "Merging a materialized scenario back is not supported (v1): materialized scenarios are full "
-		    "copies, not changelogs");
-	}
+	// Materialized scenarios merge like delta scenarios (writes live in the
+	// delta; the mat tables are the immutable creation snapshot) - and the
+	// snapshot upgrades conflict detection to a true 3-way: base drift on a
+	// touched row is a conflict even when the overlay model cannot see it.
+	bool is_materialized = entry->mode == "materialized";
 	if (!entry->base_catalog.empty()) {
 		throw NotImplementedException(
 		    "Merging back a scenario whose base lives in another catalog ('%s') is not supported (v1): "
@@ -304,24 +336,75 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			for (auto &row : rows) {
 				wanted.insert(key_of(row));
 			}
+			auto column_count = base_entry->GetColumns().LogicalColumnCount();
 			vector<StorageIndex> base_cols;
 			vector<LogicalType> base_scan_types;
 			base_cols.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
 			base_scan_types.push_back(LogicalType::ROW_TYPE);
 			vector<idx_t> key_positions;
-			for (auto pk_col : pk_columns) {
-				key_positions.push_back(base_cols.size());
-				base_cols.emplace_back(pk_col);
-				base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(pk_col)).Type());
+			if (is_materialized) {
+				// 3-way drift detection needs full payloads: scan every column
+				for (idx_t col = 0; col < column_count; col++) {
+					base_cols.emplace_back(col);
+					base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(col)).Type());
+				}
+				for (auto pk_col : pk_columns) {
+					key_positions.push_back(1 + pk_col);
+				}
+			} else {
+				for (auto pk_col : pk_columns) {
+					key_positions.push_back(base_cols.size());
+					base_cols.emplace_back(pk_col);
+					base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(pk_col)).Type());
+				}
 			}
+			unordered_map<string, vector<Value>> base_payloads;
 			ScenarioDelta::ScanTableRows(context, base_duck, std::move(base_cols), base_scan_types,
 			                             [&](DataChunk &chunk, idx_t row) {
 				                             auto key = ScenarioDelta::MakeKey(chunk, row, key_positions);
 				                             if (wanted.find(key) != wanted.end()) {
 					                             base_row_ids[key] = chunk.GetValue(0, row).GetValue<row_t>();
+					                             if (is_materialized) {
+						                             vector<Value> payload;
+						                             for (idx_t col = 0; col < column_count; col++) {
+							                             payload.push_back(chunk.GetValue(1 + col, row));
+						                             }
+						                             base_payloads[key] = std::move(payload);
+					                             }
 				                             }
 				                             return true;
 			                             });
+
+			// the creation snapshot's values for the touched keys
+			unordered_map<string, vector<Value>> mat_payloads;
+			if (is_materialized) {
+				auto mat_entry =
+				    ScenarioDelta::TryGetMatTable(context, host, entry->scenario_id, logical_name);
+				if (mat_entry) {
+					vector<StorageIndex> mat_cols;
+					vector<LogicalType> mat_types;
+					vector<idx_t> mat_key_positions;
+					for (idx_t col = 0; col < column_count; col++) {
+						mat_cols.emplace_back(col);
+						mat_types.push_back(base_entry->GetColumn(LogicalIndex(col)).Type());
+					}
+					for (auto pk_col : pk_columns) {
+						mat_key_positions.push_back(pk_col);
+					}
+					ScenarioDelta::ScanTableRows(context, *mat_entry, std::move(mat_cols), mat_types,
+					                             [&](DataChunk &chunk, idx_t row) {
+						                             auto key = ScenarioDelta::MakeKey(chunk, row, mat_key_positions);
+						                             if (wanted.find(key) != wanted.end()) {
+							                             vector<Value> payload;
+							                             for (idx_t col = 0; col < column_count; col++) {
+								                             payload.push_back(chunk.GetValue(col, row));
+							                             }
+							                             mat_payloads[key] = std::move(payload);
+						                             }
+						                             return true;
+					                             });
+				}
+			}
 
 			// classify, resolve conflicts, and apply
 			vector<row_t> base_rows_to_delete;      // rows replaced or deleted
@@ -333,7 +416,22 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				auto key = key_of(row);
 				auto base_hit = base_row_ids.find(key);
 				bool in_base = base_hit != base_row_ids.end();
-				bool conflict = (row.op == 'I' && in_base) || (row.op == 'U' && !in_base);
+				// 3-way (materialized only): the base row drifted away from the
+				// creation snapshot while the scenario touched the same key
+				bool drift = false;
+				if (is_materialized && in_base) {
+					auto mat_it = mat_payloads.find(key);
+					auto base_it = base_payloads.find(key);
+					if (mat_it != mat_payloads.end() && base_it != base_payloads.end()) {
+						for (idx_t col = 0; col < mat_it->second.size(); col++) {
+							if (ValueOperations::DistinctFrom(mat_it->second[col], base_it->second[col])) {
+								drift = true;
+								break;
+							}
+						}
+					}
+				}
+				bool conflict = (row.op == 'I' && in_base) || (row.op == 'U' && !in_base) || drift;
 				if (conflict) {
 					table_conflicts++;
 					if (bind_data.policy == MergeConflictPolicy::ABORT) {
