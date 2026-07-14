@@ -32,6 +32,11 @@ string Q(const string &identifier) {
 	return KeywordHelper::WriteOptionallyQuoted(identifier);
 }
 
+//! SQL single-quoted string literal with proper escaping
+string QL(const string &value) {
+	return "'" + StringUtil::Replace(value, "'", "''") + "'";
+}
+
 Catalog &GetHostCatalogForDiff(ClientContext &context) {
 	return Catalog::GetCatalog(context, DatabaseManager::GetDefaultDatabase(context));
 }
@@ -203,7 +208,7 @@ unique_ptr<TableRef> ScenarioDiffGenericBindReplace(ClientContext &context, Tabl
 	       ", 'removed', CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR) FROM " + rel_a +
 	       " a LEFT JOIN " + rel_b + " b ON (" + pk_join + ") WHERE " + b_pk_null;
 	for (auto &col : shape.payload_columns) {
-		sql += " UNION ALL SELECT " + pk_list_a + ", 'modified', CAST('" + col + "' AS VARCHAR), CAST(a." + Q(col) +
+		sql += " UNION ALL SELECT " + pk_list_a + ", 'modified', CAST(" + QL(col) + " AS VARCHAR), CAST(a." + Q(col) +
 		       " AS VARCHAR), CAST(b." + Q(col) + " AS VARCHAR) FROM " + rel_a + " a JOIN " + rel_b + " b ON (" +
 		       pk_join + ") WHERE (a." + Q(col) + " IS DISTINCT FROM b." + Q(col) + ")";
 	}
@@ -238,8 +243,8 @@ unique_ptr<TableRef> ScenarioDiffBindReplace(ClientContext &context, TableFuncti
 	       ", 'removed', CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR) FROM " +
 	       target.delta_name + " d WHERE d._op = 'D'";
 	for (auto &col : target.payload_columns) {
-		sql += " UNION ALL SELECT " + pk_list_d + ", 'modified', CAST('" + col +
-		       "' AS VARCHAR), CAST(b." + Q(col) + " AS VARCHAR), CAST(d." + Q(col) + " AS VARCHAR) FROM " +
+		sql += " UNION ALL SELECT " + pk_list_d + ", 'modified', CAST(" + QL(col) +
+		       " AS VARCHAR), CAST(b." + Q(col) + " AS VARCHAR), CAST(d." + Q(col) + " AS VARCHAR) FROM " +
 		       target.delta_name + " d JOIN " + target.base_name + " b ON (" + join_cond + ") WHERE d._op = 'U' AND (d." +
 		       Q(col) + " IS DISTINCT FROM b." + Q(col) + ")";
 	}
@@ -277,8 +282,8 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 			sql += " UNION ALL ";
 		}
 		auto logical = delta_table.substr(prefix.size());
-		sql += "SELECT CAST('" + logical +
-		       "' AS VARCHAR) AS table_name, count(*) FILTER (_op = 'I') AS rows_added, count(*) FILTER (_op = "
+		sql += "SELECT CAST(" + QL(logical) +
+		       " AS VARCHAR) AS table_name, count(*) FILTER (_op = 'I') AS rows_added, count(*) FILTER (_op = "
 		       "'U') AS rows_modified, count(*) FILTER (_op = 'D') AS rows_removed FROM " +
 		       host_prefix + Q(delta_table);
 	}

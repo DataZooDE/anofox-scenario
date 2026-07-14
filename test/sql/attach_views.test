@@ -92,6 +92,21 @@ APAC	700
 EU	100
 US	200
 
+# catalog introspection with views present must not crash (views used to leak
+# into the TABLE_ENTRY scan and get cast to tables)
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 's';
+----
+1
+
+query I
+SELECT count(*) >= 2 FROM duckdb_views() WHERE database_name = 's';
+----
+true
+
+statement ok
+SHOW ALL TABLES;
+
 # --- cleanup -------------------------------------------------------------------------
 
 statement ok

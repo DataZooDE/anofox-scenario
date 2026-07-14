@@ -45,6 +45,11 @@ string QM(const string &identifier) {
 	return KeywordHelper::WriteOptionallyQuoted(identifier);
 }
 
+//! SQL single-quoted string literal with proper escaping
+string QML(const string &value) {
+	return "'" + StringUtil::Replace(value, "'", "''") + "'";
+}
+
 Catalog &MergeHostCatalog(ClientContext &context) {
 	return Catalog::GetCatalog(context, DatabaseManager::GetDefaultDatabase(context));
 }
@@ -158,7 +163,7 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 		if (!sql.empty()) {
 			sql += " UNION ALL ";
 		}
-		sql += "SELECT CAST('" + logical_name + "' AS VARCHAR) AS table_name, " + key_expr +
+		sql += "SELECT CAST(" + QML(logical_name) + " AS VARCHAR) AS table_name, " + key_expr +
 		       " AS key, CASE d._op WHEN 'I' THEN 'insert' WHEN 'U' THEN 'update' ELSE 'delete' END AS action, "
 		       "CASE WHEN d._op = 'I' THEN " +
 		       exists_clause + " WHEN d._op = 'U' THEN (NOT " + exists_clause + " OR " + drift_clause +
