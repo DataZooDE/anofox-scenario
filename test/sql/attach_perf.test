@@ -1,0 +1,136 @@
+# name: test/sql/attach_perf.test
+# description: Phase 1 WP5: merge-scan smoke over a larger base (1M rows) with a ~1% delta
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE big (id INTEGER PRIMARY KEY, v DOUBLE);
+
+statement ok
+INSERT INTO big SELECT range, range * 0.5 FROM range(1000000);
+
+statement ok
+CALL scenario_create('perf');
+
+statement ok
+ATTACH 'perf' AS p (TYPE scenario);
+
+# unmodified: merged reads equal base reads
+query II
+SELECT count(*), sum(v)::BIGINT FROM p.big;
+----
+1000000	249999750000
+
+# ~1% modifications through all three DML paths
+statement ok
+UPDATE p.big SET v = v + 1 WHERE id % 200 = 0;
+
+statement ok
+DELETE FROM p.big WHERE id % 200 = 1;
+
+statement ok
+INSERT INTO p.big SELECT range + 2000000, 1.0 FROM range(5000);
+
+# merged row count: 1M - 5000 deleted + 5000 inserted
+query I
+SELECT count(*) FROM p.big;
+----
+1000000
+
+# updates visible, tombstones gone, inserts present
+query I
+SELECT count(*) FROM p.big WHERE id % 200 = 0 AND id < 1000000 AND v = id * 0.5 + 1;
+----
+5000
+
+query I
+SELECT count(*) FROM p.big WHERE id % 200 = 1 AND id < 1000000;
+----
+0
+
+query I
+SELECT count(*) FROM p.big WHERE id >= 2000000;
+----
+5000
+
+# base untouched
+query II
+SELECT count(*), sum(v)::BIGINT FROM big;
+----
+1000000	249999750000
+
+# --- filter pushdown (WP2.1): filters execute inside the scenario scan -----------
+
+# the filter must appear inside the scan node (pushdown), not a separate
+# FILTER operator above it
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT v FROM p.big WHERE id = 123456;
+----
+physical_plan	<REGEX>:.*Filters.*id=123456.*
+
+# pushed filters stay correct across both merge sides:
+# id=200 was updated in the scenario (delta side)...
+query II
+SELECT id, v FROM p.big WHERE id = 200;
+----
+200	101.0
+
+# ...id=201 was deleted (suppressed, must NOT reappear under pushdown)...
+query I
+SELECT count(*) FROM p.big WHERE id = 201;
+----
+0
+
+# ...id=2000123 exists only in the delta...
+query II
+SELECT id, v FROM p.big WHERE id = 2000123;
+----
+2000123	1.0
+
+# ...and id=123456 only in the base
+query II
+SELECT id, v FROM p.big WHERE id = 123456;
+----
+123456	61728.0
+
+# range filter spanning all origins
+query I
+SELECT count(*) FROM p.big WHERE id BETWEEN 100 AND 299;
+----
+199
+
+# --- filters combined with virtual columns (codex final-review finding #1) -------
+
+# "which rows did my scenario change?" - origin filter must NOT reach the
+# base scan (origin is a constant there, not a storage column)
+query I
+SELECT count(*) FROM (SELECT __scenario_origin AS o FROM p.big) WHERE o = 1;
+----
+10000
+
+query I
+SELECT count(*) FROM (SELECT __scenario_origin AS o FROM p.big) WHERE o = 0;
+----
+990000
+
+# a regular filter whose column sits AFTER the virtual column in the
+# projection: pushdown key must be remapped to the scan position
+query II
+SELECT __scenario_origin, v FROM p.big WHERE id = 123456;
+----
+0	61728.0
+
+query II
+SELECT __scenario_origin, v FROM p.big WHERE id = 2000123;
+----
+1	1.0
+
+statement ok
+DETACH p;
+
+statement ok
+CALL scenario_drop('perf');

@@ -1,0 +1,143 @@
+# name: test/sql/scenario_diff_v2.test
+# description: Phase 3: streaming diff engine - scenario_diff / scenario_diff_summary (registry v2)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
+
+statement ok
+CALL scenario_create('d1');
+
+statement ok
+ATTACH 'd1' AS s (TYPE scenario);
+
+statement ok
+UPDATE s.forecast SET qty = 220 WHERE id = 2;
+
+statement ok
+INSERT INTO s.forecast VALUES (10, 'LATAM', 500);
+
+statement ok
+DELETE FROM s.forecast WHERE id = 3;
+
+# --- compare-to-origin (2-arg): reads the delta changelog directly ---------------
+
+query ITTTT
+SELECT id, change_type, column_name, old_value, new_value
+FROM scenario_diff('d1', 'forecast') ORDER BY change_type, id, column_name;
+----
+10	added	NULL	NULL	NULL
+2	modified	qty	200	220
+3	removed	NULL	NULL	NULL
+
+# PK keeps its native type: arithmetic works directly
+query I
+SELECT id + 0 FROM scenario_diff('d1', 'forecast') WHERE change_type = 'added';
+----
+10
+
+# diffs stream through the engine: filters/aggregates compose
+query I
+SELECT count(*) FROM scenario_diff('d1', 'forecast') WHERE change_type = 'modified';
+----
+1
+
+# --- unchanged table diffs empty ----------------------------------------------------
+
+statement ok
+CREATE TABLE untouched (k INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+INSERT INTO untouched VALUES (1, 'x');
+
+statement ok
+CALL scenario_create('d2');
+
+query I
+SELECT count(*) FROM scenario_diff('d2', 'forecast');
+----
+0
+
+# --- summary: per-table I/U/D counts (REQ-COMP-002, REQ-SCEN-004) --------------------
+
+query TIII
+SELECT table_name, rows_added, rows_modified, rows_removed
+FROM scenario_diff_summary('d1') WHERE rows_added + rows_modified + rows_removed > 0;
+----
+forecast	1	1	1
+
+# empty scenario: all-zero (or absent) counts
+query I
+SELECT count(*) FROM scenario_diff_summary('d2') WHERE rows_added + rows_modified + rows_removed > 0;
+----
+0
+
+# --- generic 3-arg diff: scenario <-> main / scenario <-> scenario --------------------
+
+# diff(main, d1) equals the compare-to-origin form
+query ITTTT
+SELECT id, change_type, column_name, old_value, new_value
+FROM scenario_diff('main', 'd1', 'forecast') ORDER BY change_type, id, column_name;
+----
+10	added	NULL	NULL	NULL
+2	modified	qty	200	220
+3	removed	NULL	NULL	NULL
+
+# reversed direction: added <-> removed, old/new swapped
+query ITTTT
+SELECT id, change_type, column_name, old_value, new_value
+FROM scenario_diff('d1', 'main', 'forecast') ORDER BY change_type, id, column_name;
+----
+3	added	NULL	NULL	NULL
+2	modified	qty	220	200
+10	removed	NULL	NULL	NULL
+
+# scenario <-> scenario: branch d1 and change one more row
+statement ok
+CALL scenario_create('d1b', from_scenario := 'd1');
+
+statement ok
+ATTACH 'd1b' AS sb (TYPE scenario);
+
+statement ok
+UPDATE sb.forecast SET qty = 999 WHERE id = 1;
+
+query ITTTT
+SELECT id, change_type, column_name, old_value, new_value
+FROM scenario_diff('d1', 'd1b', 'forecast') ORDER BY change_type, id, column_name;
+----
+1	modified	qty	100	999
+
+statement ok
+DETACH sb;
+
+statement ok
+CALL scenario_drop('d1b');
+
+# --- errors ----------------------------------------------------------------------------
+
+statement error
+SELECT * FROM scenario_diff('nope', 'forecast');
+----
+<REGEX>:.*nope.*not found.*
+
+statement error
+SELECT * FROM scenario_diff('d1', 'no_such_table');
+----
+<REGEX>:.*no_such_table.*
+
+# --- cleanup ------------------------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('d1');
+
+statement ok
+CALL scenario_drop('d2');

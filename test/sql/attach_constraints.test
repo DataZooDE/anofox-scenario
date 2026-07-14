@@ -1,0 +1,118 @@
+# name: test/sql/attach_constraints.test
+# description: Phase 1: base NOT NULL/CHECK/PK constraints hold for scenario writes; no-PK v1 limitations
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    price DECIMAL(8,2) CHECK (price >= 0)
+);
+
+statement ok
+INSERT INTO products VALUES (1, 'widget', 9.99), (2, 'gadget', 19.99);
+
+statement ok
+CREATE TABLE no_pk_log (event VARCHAR, logged_at TIMESTAMP);
+
+statement ok
+INSERT INTO no_pk_log VALUES ('created', TIMESTAMP '2026-01-01 00:00:00');
+
+statement ok
+CALL scenario_create('c');
+
+statement ok
+ATTACH 'c' AS s (TYPE scenario);
+
+# --- NOT NULL -----------------------------------------------------------------
+
+statement error
+INSERT INTO s.products VALUES (3, NULL, 5.00);
+----
+<REGEX>:.*NOT NULL constraint failed.*name.*
+
+statement error
+UPDATE s.products SET name = NULL WHERE id = 1;
+----
+<REGEX>:.*NOT NULL constraint failed.*name.*
+
+# --- CHECK ----------------------------------------------------------------------
+
+statement error
+INSERT INTO s.products VALUES (3, 'bad', -1.00);
+----
+<REGEX>:.*CHECK constraint failed.*
+
+statement error
+UPDATE s.products SET price = -5.00 WHERE id = 1;
+----
+<REGEX>:.*CHECK constraint failed.*
+
+# --- PK collisions: distinct messages for base vs scenario ----------------------
+
+statement error
+INSERT INTO s.products VALUES (1, 'dup', 1.00);
+----
+<REGEX>:.*primary key.*base.*
+
+statement ok
+INSERT INTO s.products VALUES (3, 'new', 3.00);
+
+statement error
+INSERT INTO s.products VALUES (3, 'dup2', 1.00);
+----
+<REGEX>:.*primary key.*scenario.*
+
+# NULL PK rejected
+statement error
+INSERT INTO s.products VALUES (NULL, 'nokey', 1.00);
+----
+<REGEX>:.*NOT NULL.*
+
+# valid writes still pass all constraints
+statement ok
+UPDATE s.products SET price = 12.50 WHERE id = 1;
+
+query I
+SELECT price FROM s.products WHERE id = 1;
+----
+12.50
+
+# --- no-PK tables: readable + insertable; UPDATE/DELETE are a v1 limitation ------
+
+query I
+SELECT count(*) FROM s.no_pk_log;
+----
+1
+
+statement ok
+INSERT INTO s.no_pk_log VALUES ('scenario event', TIMESTAMP '2026-02-01 00:00:00');
+
+query I
+SELECT count(*) FROM s.no_pk_log;
+----
+2
+
+# base unchanged
+query I
+SELECT count(*) FROM no_pk_log;
+----
+1
+
+statement error
+UPDATE s.no_pk_log SET event = 'x';
+----
+<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+
+statement error
+DELETE FROM s.no_pk_log WHERE event = 'created';
+----
+<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('c');

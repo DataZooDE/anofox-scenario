@@ -1,0 +1,190 @@
+# name: test/sql/scenario_merge_back.test
+# description: Phase 6: merge-back - scenario_merge_preview + CALL scenario_merge
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
+
+statement ok
+CALL scenario_create('mb', 'merge me back');
+
+statement ok
+ATTACH 'mb' AS s (TYPE scenario);
+
+statement ok
+INSERT INTO s.forecast VALUES (10, 'LATAM', 500);
+
+statement ok
+UPDATE s.forecast SET qty = 222 WHERE id = 2;
+
+statement ok
+DELETE FROM s.forecast WHERE id = 3;
+
+# --- preview: streaming, no side effects -----------------------------------------
+
+query TTTT
+SELECT table_name, key, action, conflict::VARCHAR FROM scenario_merge_preview('mb') ORDER BY action, key;
+----
+forecast	3	delete	false
+forecast	10	insert	false
+forecast	2	update	false
+
+# preview did not change anything
+query I
+SELECT count(*) FROM forecast;
+----
+3
+
+# --- merge applies the delta to the base ---------------------------------------------
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('mb');
+----
+1	3	0
+
+query ITI
+SELECT id, region, qty FROM forecast ORDER BY id;
+----
+1	EU	100
+2	US	222
+10	LATAM	500
+
+# the merged scenario is frozen with an empty delta: reads pass through
+query I
+SELECT count(*) FROM s.forecast;
+----
+3
+
+statement error
+INSERT INTO s.forecast VALUES (77, 'X', 1);
+----
+<REGEX>:.*frozen.*
+
+# empty preview after merge
+query I
+SELECT count(*) FROM scenario_merge_preview('mb');
+----
+0
+
+# re-merging errors clearly
+statement error
+SELECT * FROM scenario_merge('mb');
+----
+<REGEX>:.*already.*merged.*
+
+# --- conflicts (overlay tier: base drifted under the scenario) -------------------------
+
+statement ok
+CALL scenario_create('cf');
+
+statement ok
+ATTACH 'cf' AS c (TYPE scenario);
+
+statement ok
+UPDATE c.forecast SET qty = 111 WHERE id = 1;
+
+statement ok
+INSERT INTO c.forecast VALUES (20, 'MEA', 60);
+
+# drift: the base row the scenario updated vanishes; the key it inserted appears
+statement ok
+DELETE FROM forecast WHERE id = 1;
+
+statement ok
+INSERT INTO forecast VALUES (20, 'CLASH', 1);
+
+query TTTT
+SELECT table_name, key, action, conflict::VARCHAR FROM scenario_merge_preview('cf') ORDER BY key;
+----
+forecast	1	update	true
+forecast	20	insert	true
+
+# default: abort on conflicts, nothing applied
+statement error
+SELECT * FROM scenario_merge('cf');
+----
+<REGEX>:.*conflict.*
+
+query I
+SELECT count(*) FROM forecast WHERE id = 1;
+----
+0
+
+# ours: scenario wins - vanished row is revived, clashing key overwritten
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('cf', on_conflict := 'ours');
+----
+1	2	2
+
+query II
+SELECT id, qty FROM forecast WHERE id IN (1, 20) ORDER BY id;
+----
+1	111
+20	60
+
+# --- theirs: base wins - conflicting delta rows are skipped ------------------------------
+
+statement ok
+CALL scenario_create('th');
+
+statement ok
+ATTACH 'th' AS t (TYPE scenario);
+
+statement ok
+UPDATE t.forecast SET qty = 9999 WHERE id = 2;
+
+statement ok
+DELETE FROM forecast WHERE id = 2;
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('th', on_conflict := 'theirs');
+----
+0	0	1
+
+query I
+SELECT count(*) FROM forecast WHERE id = 2;
+----
+0
+
+# --- guards --------------------------------------------------------------------------------
+
+statement ok
+CALL scenario_create('matx', mode := 'materialized');
+
+statement error
+SELECT * FROM scenario_merge('matx');
+----
+<REGEX>:.*materialized.*
+
+statement error
+SELECT * FROM scenario_merge('nope');
+----
+<REGEX>:.*not found.*
+
+# --- cleanup ---------------------------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+DETACH c;
+
+statement ok
+DETACH t;
+
+statement ok
+CALL scenario_drop('mb');
+
+statement ok
+CALL scenario_drop('cf');
+
+statement ok
+CALL scenario_drop('th');
+
+statement ok
+CALL scenario_drop('matx');

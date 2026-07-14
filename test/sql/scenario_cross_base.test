@@ -1,0 +1,105 @@
+# name: test/sql/scenario_cross_base.test
+# description: Phase 4: scenarios over a cross-catalog base (base := attached database)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# the warehouse lives in its own attached database
+statement ok
+ATTACH '__TEST_DIR__/warehouse.db' AS wh;
+
+statement ok
+CREATE TABLE wh.forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO wh.forecast VALUES (1, 100), (2, 200), (3, 300);
+
+# scenario state (registry + deltas) lives in the session default database;
+# the base tables come from 'wh'
+statement ok
+CALL scenario_create('lakeish', 'cross-catalog base', base := 'wh');
+
+statement ok
+ATTACH 'lakeish' AS s (TYPE scenario);
+
+query II
+SELECT id, qty FROM s.forecast ORDER BY id;
+----
+1	100
+2	200
+3	300
+
+# transparent DML: deltas land in the host, the warehouse is never written
+statement ok
+INSERT INTO s.forecast VALUES (10, 1000);
+
+statement ok
+UPDATE s.forecast SET qty = 222 WHERE id = 2;
+
+statement ok
+DELETE FROM s.forecast WHERE id = 3;
+
+query II
+SELECT id, qty FROM s.forecast ORDER BY id;
+----
+1	100
+2	222
+10	1000
+
+query II
+SELECT id, qty FROM wh.forecast ORDER BY id;
+----
+1	100
+2	200
+3	300
+
+# PK constraints hold against the cross-catalog base
+statement error
+INSERT INTO s.forecast VALUES (1, 0);
+----
+<REGEX>:.*primary key.*base.*
+
+# diff reads the delta changelog as usual
+query I
+SELECT count(*) FROM scenario_diff('lakeish', 'forecast');
+----
+3
+
+# errors: unknown base catalog at create
+statement error
+CALL scenario_create('nope', base := 'no_such_catalog');
+----
+<REGEX>:.*not attached.*
+
+# detached base -> clear error at scenario ATTACH
+statement ok
+DETACH s;
+
+statement ok
+DETACH wh;
+
+statement error
+ATTACH 'lakeish' AS s2 (TYPE scenario);
+----
+<REGEX>:.*base catalog.*not attached.*
+
+# reattach the base and everything works again
+statement ok
+ATTACH '__TEST_DIR__/warehouse.db' AS wh;
+
+statement ok
+ATTACH 'lakeish' AS s3 (TYPE scenario);
+
+query I
+SELECT count(*) FROM s3.forecast;
+----
+3
+
+statement ok
+DETACH s3;
+
+statement ok
+DETACH wh;
+
+statement ok
+CALL scenario_drop('lakeish');
