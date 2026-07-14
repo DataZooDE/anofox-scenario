@@ -60,9 +60,10 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | `ON CONFLICT` / `INSERT OR REPLACE`, `RETURNING`, `MERGE INTO`, PK-column updates | v0.4 |
 | `UPDATE`/`DELETE` on tables without a PRIMARY KEY (insert/read work) | v0.4+ |
 | Secondary `UNIQUE` constraints: enforced against base rows, but not between scenario-written rows (PK is fully enforced) | v0.4 |
-| Tables created in the base *after* `scenario_create` are read-only in the scenario | v0.2 |
 | Host writes and scenario writes in the *same explicit transaction* | documented restriction |
-| Views are not exposed inside scenarios | v0.2 |
+| Views are not exposed inside scenarios (their SQL binds against the base catalog and cannot be retargeted) | backlog |
+| Only the base's `main` schema is mirrored; other schemas are not visible in scenarios | backlog |
+| Base tables created after `scenario_create` are read-only until `CALL scenario_refresh(name)` | shipped |
 | DuckLake-based scenarios: UPDATE/DELETE gated (DuckLake tables have no PRIMARY KEY); merge-back refused (single-writer rule); ducklake tests need a release build | backlog: `key_columns :=` |
 
 ## Function Reference
