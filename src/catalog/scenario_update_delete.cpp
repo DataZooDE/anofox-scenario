@@ -118,12 +118,53 @@ public:
 		}
 	}
 
+	//! Fetch the full payload of delta rows by rowid (before deleting them),
+	//! so the delete-index registration covers every unique index - not just
+	//! the PK (secondary UNIQUE columns must be freed for replacement rows)
+	vector<vector<Value>> FetchDeltaRows(ClientContext &client, ScenarioTableEntry &entry,
+	                                     const vector<row_t> &row_ids) {
+		vector<vector<Value>> result;
+		if (row_ids.empty()) {
+			return result;
+		}
+		auto column_count = entry.GetColumns().LogicalColumnCount();
+		auto &storage = delta_table->GetStorage();
+		auto &transaction = DuckTransaction::Get(client, delta_table->catalog);
+		vector<StorageIndex> fetch_columns;
+		vector<LogicalType> fetch_types;
+		for (idx_t col = 0; col < column_count; col++) {
+			fetch_columns.emplace_back(ScenarioDelta::PAYLOAD_START + col);
+			fetch_types.push_back(entry.GetColumn(LogicalIndex(col)).Type());
+		}
+		idx_t offset = 0;
+		while (offset < row_ids.size()) {
+			idx_t batch = MinValue<idx_t>(row_ids.size() - offset, STANDARD_VECTOR_SIZE);
+			DataChunk fetched;
+			fetched.Initialize(Allocator::Get(client), fetch_types);
+			Vector fetch_rowids(LogicalType::ROW_TYPE, batch);
+			for (idx_t i = 0; i < batch; i++) {
+				fetch_rowids.SetValue(i, Value::BIGINT(row_ids[offset + i]));
+			}
+			ColumnFetchState fetch_state;
+			storage.Fetch(transaction, fetched, fetch_columns, fetch_rowids, batch, fetch_state);
+			for (idx_t i = 0; i < batch; i++) {
+				vector<Value> row_values;
+				for (idx_t col = 0; col < column_count; col++) {
+					row_values.push_back(fetched.GetValue(col, i));
+				}
+				result.push_back(std::move(row_values));
+			}
+			offset += batch;
+		}
+		return result;
+	}
+
 	//! Append rows to the delta in one batch; rows given as (op, values).
-	//! deleted_row_ids/deleted_keys register same-statement deletions (op
-	//! transitions) so the delta PK index accepts the replacement rows.
+	//! deleted_row_ids/deleted_rows register same-statement deletions (op
+	//! transitions) so the delta unique indexes accept the replacement rows.
 	void FlushAppends(ClientContext &client, ScenarioTableEntry &entry, const vector<char> &ops,
 	                  const vector<vector<Value>> &rows, const vector<row_t> &deleted_row_ids = {},
-	                  const vector<vector<Value>> &deleted_keys = {}) {
+	                  const vector<vector<Value>> &deleted_rows = {}) {
 		if (rows.empty()) {
 			return;
 		}
@@ -132,12 +173,12 @@ public:
 		DataChunk deleted_chunk;
 		if (!deleted_row_ids.empty()) {
 			deleted_chunk.Initialize(Allocator::Get(client), delta_table->GetStorage().GetTypes());
-			for (idx_t i = 0; i < deleted_keys.size(); i++) {
-				for (idx_t k = 0; k < pk_columns.size(); k++) {
-					deleted_chunk.SetValue(ScenarioDelta::PAYLOAD_START + pk_columns[k], i, deleted_keys[i][k]);
+			for (idx_t i = 0; i < deleted_rows.size(); i++) {
+				for (idx_t col = 0; col < deleted_rows[i].size(); col++) {
+					deleted_chunk.SetValue(ScenarioDelta::PAYLOAD_START + col, i, deleted_rows[i][col]);
 				}
 			}
-			deleted_chunk.SetCardinality(deleted_keys.size());
+			deleted_chunk.SetCardinality(deleted_rows.size());
 			deleted_chunk_ptr = &deleted_chunk;
 		}
 		idx_t offset = 0;
@@ -305,10 +346,7 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 	auto column_count = entry.GetColumns().LogicalColumnCount();
 	vector<char> append_ops;
 	vector<vector<Value>> append_rows;
-	vector<row_t> rewrite_row_ids;
-	vector<vector<Value>> rewrite_rows;
 	vector<row_t> rows_to_remove;
-	vector<vector<Value>> removed_keys;
 	SelectionVector base_verify_sel(chunk.size());
 	idx_t base_verify_count = 0;
 	auto null_payload_row = [&](DataChunk &keys_chunk, const vector<idx_t> &positions, idx_t row) {
@@ -345,13 +383,16 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 				info.row_id = -1;
 				gstate.delta_keys.keys[old_key] = info;
 			} else {
-				// delta row ('I' or 'U'): rewrite its payload in place
+				// delta row ('I' or 'U'): replace it (remove + re-append with
+				// the same op - in-place updates cannot touch indexed columns)
 				auto existing = gstate.delta_keys.keys.find(old_key);
 				if (existing == gstate.delta_keys.keys.end()) {
 					throw InternalException("anofox_scenario: delta row for updated key not found in key map");
 				}
-				rewrite_row_ids.push_back(existing->second.row_id);
-				rewrite_rows.push_back(std::move(row_values));
+				rows_to_remove.push_back(existing->second.row_id);
+				append_ops.push_back(existing->second.op);
+				append_rows.push_back(std::move(row_values));
+				existing->second.row_id = -1;
 			}
 			gstate.affected_count++;
 			continue;
@@ -373,11 +414,6 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 				throw InternalException("anofox_scenario: delta row for moved key not found in key map");
 			}
 			rows_to_remove.push_back(existing->second.row_id);
-			vector<Value> key_values;
-			for (idx_t k = 0; k < gstate.pk_columns.size(); k++) {
-				key_values.push_back(chunk.GetValue(old_key_positions[k], i));
-			}
-			removed_keys.push_back(std::move(key_values));
 			if (existing->second.op == 'U') {
 				append_ops.push_back('D');
 				append_rows.push_back(null_payload_row(chunk, old_key_positions, i));
@@ -393,11 +429,6 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 			if (target->second.op == 'D') {
 				// moving onto a tombstoned base key: net effect is an update
 				rows_to_remove.push_back(target->second.row_id);
-				vector<Value> key_values;
-				for (idx_t k = 0; k < gstate.pk_columns.size(); k++) {
-					key_values.push_back(full_chunk.GetValue(new_key_positions[k], i));
-				}
-				removed_keys.push_back(std::move(key_values));
 				append_ops.push_back('U');
 				append_rows.push_back(std::move(row_values));
 				target->second.op = 'U';
@@ -421,57 +452,14 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 		gstate.affected_count++;
 	}
 	gstate.VerifyAgainstBase(client, entry, full_chunk, base_verify_sel, base_verify_count);
+	auto removed_rows = gstate.FetchDeltaRows(client, entry, rows_to_remove);
 	gstate.FlushDeletes(client, rows_to_remove);
-	gstate.FlushAppends(client, entry, append_ops, append_rows, rows_to_remove, removed_keys);
+	gstate.FlushAppends(client, entry, append_ops, append_rows, rows_to_remove, removed_rows);
 	if (return_chunk) {
 		if (!gstate.return_collection) {
 			gstate.return_collection = make_uniq<ColumnDataCollection>(Allocator::Get(client), entry.GetTypes());
 		}
 		gstate.return_collection->Append(full_chunk);
-	}
-
-	// In-place payload rewrite for delta rows (op unchanged)
-	if (!rewrite_row_ids.empty()) {
-		auto &storage = gstate.delta_table->GetStorage();
-		auto update_state = storage.InitializeUpdate(*gstate.delta_table, client, gstate.delta_constraints);
-		auto delta_types = storage.GetTypes();
-		auto now = Timestamp::GetCurrentTimestamp();
-		// PK payload columns are covered by the delta's PK index and cannot
-		// change here (PK updates are gated at bind): exclude them so the
-		// in-place update never touches an indexed column.
-		unordered_set<idx_t> pk_set(gstate.pk_columns.begin(), gstate.pk_columns.end());
-		vector<PhysicalIndex> update_columns;
-		vector<idx_t> value_columns; // table-layout column served by each update column (after _ts)
-		update_columns.emplace_back(ScenarioDelta::TS_COL);
-		for (idx_t col = 0; col < entry.GetColumns().LogicalColumnCount(); col++) {
-			if (pk_set.find(col) != pk_set.end()) {
-				continue;
-			}
-			update_columns.emplace_back(ScenarioDelta::PAYLOAD_START + col);
-			value_columns.push_back(col);
-		}
-		DataChunk update_chunk;
-		vector<LogicalType> update_types;
-		for (auto &col : update_columns) {
-			update_types.push_back(delta_types[col.index]);
-		}
-		update_chunk.Initialize(Allocator::Get(client), update_types);
-		idx_t offset = 0;
-		while (offset < rewrite_row_ids.size()) {
-			idx_t batch = MinValue<idx_t>(rewrite_row_ids.size() - offset, STANDARD_VECTOR_SIZE);
-			update_chunk.Reset();
-			Vector row_ids(LogicalType::ROW_TYPE);
-			for (idx_t i = 0; i < batch; i++) {
-				row_ids.SetValue(i, Value::BIGINT(rewrite_row_ids[offset + i]));
-				update_chunk.SetValue(0, i, Value::TIMESTAMP(now));
-				for (idx_t out_col = 0; out_col < value_columns.size(); out_col++) {
-					update_chunk.SetValue(1 + out_col, i, rewrite_rows[offset + i][value_columns[out_col]]);
-				}
-			}
-			update_chunk.SetCardinality(batch);
-			storage.Update(*update_state, client, row_ids, update_columns, update_chunk);
-			offset += batch;
-		}
 	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
@@ -599,7 +587,6 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 	vector<char> append_ops;
 	vector<vector<Value>> append_rows;
 	vector<row_t> rows_to_remove;
-	vector<vector<Value>> removed_keys;
 	for (idx_t i = 0; i < chunk.size(); i++) {
 		auto origin = chunk.GetValue(row_id_start, i).GetValue<int8_t>();
 		auto key = ScenarioDelta::MakeKey(chunk, i, key_positions);
@@ -628,11 +615,6 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 			// remove the delta row; 'U' rows get a fresh tombstone ('I' rows
 			// simply vanish - the scenario never saw them)
 			rows_to_remove.push_back(existing->second.row_id);
-			vector<Value> key_values;
-			for (idx_t k = 0; k < gstate.pk_columns.size(); k++) {
-				key_values.push_back(chunk.GetValue(key_positions[k], i));
-			}
-			removed_keys.push_back(std::move(key_values));
 			if (existing->second.op == 'U') {
 				vector<Value> row_values;
 				for (idx_t col = 0; col < column_count; col++) {
@@ -651,8 +633,9 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 		}
 		gstate.affected_count++;
 	}
+	auto removed_rows = gstate.FetchDeltaRows(client, entry, rows_to_remove);
 	gstate.FlushDeletes(client, rows_to_remove);
-	gstate.FlushAppends(client, entry, append_ops, append_rows, rows_to_remove, removed_keys);
+	gstate.FlushAppends(client, entry, append_ops, append_rows, rows_to_remove, removed_rows);
 
 	if (return_chunk) {
 		if (!gstate.return_collection) {

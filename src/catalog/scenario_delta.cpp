@@ -155,6 +155,26 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 		vector<string> pk_names = *declared_keys;
 		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
 	}
+
+	// Secondary UNIQUE constraints are mirrored so scenario-written rows are
+	// unique among themselves too (the base side is probed separately at DML
+	// time). Tombstones carry NULL payloads, which never conflict.
+	for (auto &constraint : base_entry.GetConstraints()) {
+		if (constraint->type != ConstraintType::UNIQUE) {
+			continue;
+		}
+		auto &unique = constraint->Cast<UniqueConstraint>();
+		if (unique.IsPrimaryKey()) {
+			continue;
+		}
+		vector<string> unique_names;
+		if (unique.HasIndex()) {
+			unique_names.push_back(base_entry.GetColumn(unique.GetIndex()).Name());
+		} else {
+			unique_names = unique.GetColumnNames();
+		}
+		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(unique_names), false));
+	}
 	host_catalog.CreateTable(context, std::move(info));
 
 	auto created = TryGetDeltaTable(context, host_catalog, scenario_id, base_entry.name);

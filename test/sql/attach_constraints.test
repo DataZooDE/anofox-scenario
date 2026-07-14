@@ -111,6 +111,80 @@ DELETE FROM s.no_pk_log WHERE event = 'created';
 ----
 <REGEX>:.*PRIMARY KEY.*v1 limitation.*
 
+# --- secondary UNIQUE among scenario-written rows -----------------------------------
+
+statement ok
+CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR UNIQUE, name VARCHAR);
+
+statement ok
+INSERT INTO users VALUES (1, 'ada@corp.com', 'Ada');
+
+statement ok
+CALL scenario_create('uq');
+
+statement ok
+ATTACH 'uq' AS q (TYPE scenario);
+
+statement ok
+INSERT INTO q.users VALUES (2, 'grace@corp.com', 'Grace');
+
+# same email as another scenario-inserted row, separate statement
+statement error
+INSERT INTO q.users VALUES (3, 'grace@corp.com', 'Imposter');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# same email twice within one statement
+statement error
+INSERT INTO q.users VALUES (4, 'alan@corp.com', 'Alan'), (5, 'alan@corp.com', 'Clone');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# email already taken by a base row
+statement error
+INSERT INTO q.users VALUES (6, 'ada@corp.com', 'Shadow');
+----
+<REGEX>:.*(unique|Duplicate|constraint|key).*
+
+# updating a scenario row's email onto another scenario row's email
+statement ok
+INSERT INTO q.users VALUES (7, 'edsger@corp.com', 'Edsger');
+
+statement error
+UPDATE q.users SET email = 'grace@corp.com' WHERE id = 7;
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# updating a scenario row without changing its email is fine (self-match),
+# and exercises the delta rewrite path under the unique index
+statement ok
+UPDATE q.users SET name = 'Grace Hopper' WHERE id = 2;
+
+statement ok
+UPDATE q.users SET email = 'g.hopper@corp.com' WHERE id = 2;
+
+query T
+SELECT email FROM q.users WHERE id = 2;
+----
+g.hopper@corp.com
+
+# NULL emails never conflict
+statement ok
+INSERT INTO q.users VALUES (8, NULL, 'Nobody'), (9, NULL, 'Noone');
+
+query I
+SELECT count(*) FROM q.users;
+----
+5
+
+statement ok
+DETACH q;
+
+statement ok
+CALL scenario_drop('uq');
+
+# --- cleanup -------------------------------------------------------------------------
+
 statement ok
 DETACH s;
 
