@@ -199,12 +199,19 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		}
 	}
 
-	// Phase 4: cross-catalog base (e.g. a DuckLake attach)
+	// Phase 4: cross-catalog base (e.g. a DuckLake attach). Branches inherit
+	// the parent's base catalog - and its snapshot pin (created_at), so the
+	// child's view equals the parent's at branch time (a fresh pin would
+	// leak base churn that happened between the two creations).
+	string effective_base = bind_data.base_catalog;
+	if (parent && !parent->base_catalog.empty()) {
+		effective_base = parent->base_catalog;
+	}
 	optional_ptr<Catalog> base_catalog;
-	if (!bind_data.base_catalog.empty()) {
-		base_catalog = Catalog::GetCatalogEntry(context, bind_data.base_catalog);
+	if (!effective_base.empty()) {
+		base_catalog = Catalog::GetCatalogEntry(context, effective_base);
 		if (!base_catalog) {
-			throw InvalidInputException("Base catalog '%s' is not attached", bind_data.base_catalog);
+			throw InvalidInputException("Base catalog '%s' is not attached", effective_base);
 		}
 		if (base_catalog->GetCatalogType() == "scenario") {
 			throw InvalidInputException("A scenario cannot use another scenario as its base - branch instead "
@@ -217,10 +224,11 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	entry.name = bind_data.name;
 	entry.mode = bind_data.mode;
 	entry.parent_id = parent ? parent->scenario_id : -1;
-	entry.created_at = Timestamp::GetCurrentTimestamp();
+	entry.created_at = (parent && !parent->base_catalog.empty()) ? parent->created_at
+	                                                             : Timestamp::GetCurrentTimestamp();
 	entry.description = bind_data.description;
 	entry.has_description = bind_data.has_description;
-	entry.base_catalog = bind_data.base_catalog;
+	entry.base_catalog = effective_base;
 	ScenarioRegistry::Insert(context, host_catalog, entry);
 
 	// Eagerly create one (empty) delta table per base table, in this same
@@ -359,6 +367,11 @@ void ScenarioUnfreezeVerb(ClientContext &context, const LifecycleBindData &bind_
 	if (!entry) {
 		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
 	}
+	if (entry->has_merged_at) {
+		throw InvalidInputException("Scenario '%s' was already merged back into the base - its changelog is "
+		                            "closed. Create a new scenario instead",
+		                            bind_data.name);
+	}
 	ScenarioRegistry::SetFrozen(context, host_catalog, entry->scenario_id, false);
 }
 
@@ -408,6 +421,10 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 	auto entry = ScenarioRegistry::Lookup(context, host_catalog, bind_data.name);
 	if (!entry) {
 		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
+	}
+	if (entry->frozen) {
+		throw InvalidInputException("Cannot refresh scenario '%s': it is frozen. Unfreeze it first",
+		                            bind_data.name);
 	}
 	if (entry->mode == "materialized") {
 		throw InvalidInputException(

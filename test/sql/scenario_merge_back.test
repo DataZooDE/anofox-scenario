@@ -168,6 +168,12 @@ SELECT * FROM scenario_merge('nope');
 ----
 <REGEX>:.*not found.*
 
+# merged scenarios are terminally frozen: unfreeze refuses
+statement error
+CALL scenario_unfreeze('mb');
+----
+<REGEX>:.*merged.*
+
 # --- cleanup ---------------------------------------------------------------------------------
 
 statement ok

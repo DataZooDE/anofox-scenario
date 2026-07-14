@@ -94,6 +94,21 @@ SELECT * FROM scenario_refresh('nope');
 ----
 <REGEX>:.*not found.*
 
+# frozen scenarios refuse refresh (their state is immutable)
+statement ok
+CALL scenario_create('icy');
+
+statement ok
+CALL scenario_freeze('icy');
+
+statement error
+SELECT * FROM scenario_refresh('icy');
+----
+<REGEX>:.*frozen.*
+
+statement ok
+CALL scenario_drop('icy');
+
 # materialized scenarios refuse refresh (would break point-in-time isolation)
 statement ok
 CALL scenario_create('frozen_copy', mode := 'materialized');

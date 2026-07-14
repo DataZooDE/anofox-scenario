@@ -191,6 +191,57 @@ DETACH lb;
 statement ok
 CALL scenario_drop('lakebag');
 
+# --- branches inherit the lake base and its snapshot pin (agy finding #1) -----------
+
+statement ok
+CREATE TABLE lake.plans (id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO lake.plans VALUES (1, 100);
+
+statement ok
+CALL scenario_create('lp', base := 'lake', key_columns := MAP {'plans': ['id']});
+
+statement ok
+ATTACH 'lp' AS lp (TYPE scenario);
+
+statement ok
+UPDATE lp.plans SET amount = 150 WHERE id = 1;
+
+# lake churn after the parent's snapshot
+statement ok
+INSERT INTO lake.plans VALUES (2, 200);
+
+statement ok
+CALL scenario_create('lpc', from_scenario := 'lp');
+
+statement ok
+ATTACH 'lpc' AS lpc (TYPE scenario);
+
+# the child reads the LAKE (not the host), sees the parent's change, and is
+# pinned to the parent's snapshot - the churn row stays invisible
+query II rowsort
+SELECT id, amount FROM lpc.plans;
+----
+1	150
+
+query T
+SELECT base_catalog FROM __anofox_scenario.registry WHERE name = 'lpc';
+----
+lake
+
+statement ok
+DETACH lpc;
+
+statement ok
+DETACH lp;
+
+statement ok
+CALL scenario_drop('lpc');
+
+statement ok
+CALL scenario_drop('lp');
+
 # --- cleanup ------------------------------------------------------------------------
 
 statement ok
