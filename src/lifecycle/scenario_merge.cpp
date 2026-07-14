@@ -17,7 +17,10 @@
 #include "catalog/scenario_dml.hpp"
 #include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -113,12 +116,19 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 		                           ? string("false")
 		                           : "EXISTS (SELECT 1 FROM " + base_name + " b WHERE " + pk_match + ")";
 
-		// Materialized scenarios: base drift vs the creation snapshot is a
-		// 3-way conflict on touched keys (mirrors scenario_merge's check)
+		// Scenarios with a creation snapshot (materialized: the mat copy;
+		// cross-catalog/DuckLake: the AT-pinned base) get 3-way conflicts:
+		// base drift on a touched key mirrors scenario_merge's check
 		string drift_clause = "false";
-		if (entry->mode == "materialized" && !pk_columns.empty()) {
-			auto mat_name =
-			    internal_prefix + QM(ScenarioDelta::MatTableName(entry->scenario_id, logical_name));
+		string snapshot_ref; // includes the "m" alias (AT clauses follow the alias)
+		if (entry->mode == "materialized") {
+			snapshot_ref =
+			    internal_prefix + QM(ScenarioDelta::MatTableName(entry->scenario_id, logical_name)) + " m";
+		} else if (!entry->base_catalog.empty()) {
+			snapshot_ref =
+			    base_name + " AS m AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry->created_at) + "')";
+		}
+		if (!snapshot_ref.empty() && !pk_columns.empty()) {
 			string mat_match, drift_columns;
 			unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
 			for (auto pk_col : pk_columns) {
@@ -139,7 +149,7 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 				drift_columns += "b." + QM(name) + " IS DISTINCT FROM m." + QM(name);
 			}
 			if (!drift_columns.empty()) {
-				drift_clause = "EXISTS (SELECT 1 FROM " + base_name + " b, " + mat_name + " m WHERE " + pk_match +
+				drift_clause = "EXISTS (SELECT 1 FROM " + base_name + " b, " + snapshot_ref + " WHERE " + pk_match +
 				               " AND " + mat_match + " AND (" + drift_columns + "))";
 			}
 		}
@@ -215,6 +225,156 @@ struct MergeRow {
 	vector<Value> payload; // base-table layout
 };
 
+//! Merge-back into a cross-catalog (e.g. DuckLake) base. DuckDB transactions
+//! write a single attached database (no 2PC), so the lake apply runs
+//! atomically in its OWN transaction on a second connection (lake = sole
+//! writer, host deltas only read), after which the caller's transaction does
+//! the host bookkeeping. Requires autocommit; if the process dies between
+//! the two, the delta is still present and a re-merge surfaces the overlap
+//! as conflicts (documented).
+void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioRegistryEntry &entry,
+                          MergeConflictPolicy policy, idx_t &tables_changed, idx_t &rows_applied,
+                          idx_t &conflicts_resolved) {
+	if (!context.transaction.IsAutoCommit()) {
+		throw NotImplementedException(
+		    "Merging scenario '%s' into base catalog '%s' requires autocommit: the two catalogs cannot commit in "
+		    "one transaction (single-writer rule)",
+		    entry.name, entry.base_catalog);
+	}
+	auto base_catalog = Catalog::GetCatalogEntry(context, entry.base_catalog);
+	if (!base_catalog) {
+		throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", entry.name,
+		                            entry.base_catalog);
+	}
+
+	Connection con(*context.db);
+	con.BeginTransaction();
+	auto run = [&](const string &sql) {
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			con.Rollback();
+			result->ThrowError();
+		}
+		return result;
+	};
+	auto count_of = [&](const string &sql) {
+		auto result = run(sql);
+		auto chunk = result->Fetch();
+		return NumericCast<idx_t>(chunk->GetValue(0, 0).GetValue<int64_t>());
+	};
+
+	auto host_prefix = QM(host.GetName()) + ".";
+	auto internal_prefix = host_prefix + QM(ScenarioRegistry::SCHEMA_NAME) + ".";
+	for (auto &delta_pair : ListDeltaTables(context, host, entry.scenario_id)) {
+		auto &logical_name = delta_pair.second;
+		auto base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, logical_name,
+		                                                            OnEntryNotFound::RETURN_NULL);
+		if (!base_entry) {
+			con.Rollback();
+			throw InvalidInputException("Cannot merge scenario '%s': base table '%s' no longer exists in '%s'",
+			                            entry.name, logical_name, entry.base_catalog);
+		}
+		auto delta_ref = internal_prefix + QM(delta_pair.first);
+		auto base_ref = QM(base_catalog->GetName()) + "." + QM(string(DEFAULT_SCHEMA)) + "." + QM(logical_name);
+		auto snapshot_ref =
+		    base_ref + " AS m AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry.created_at) + "')";
+		auto pk_columns = ScenarioDelta::GetKeyColumns(context, host, entry.scenario_id, logical_name, *base_entry);
+
+		// payload column list, delta side
+		string payload_cols;
+		for (auto &col : base_entry->GetColumns().Logical()) {
+			if (!payload_cols.empty()) {
+				payload_cols += ", ";
+			}
+			payload_cols += "d." + QM(col.Name());
+		}
+
+		if (pk_columns.empty()) {
+			// keyless lake tables are insert-only: plain appends
+			auto inserted = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'I'");
+			if (inserted > 0) {
+				run("INSERT INTO " + base_ref + " SELECT " + payload_cols + " FROM " + delta_ref +
+				    " d WHERE d._op = 'I'");
+				rows_applied += inserted;
+				tables_changed++;
+			}
+			continue;
+		}
+
+		unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
+		string pk_match_b, pk_match_b2, pk_match_m, pk_match_c, pk_list, key_expr, drift_columns;
+		for (auto pk_col : pk_columns) {
+			auto &name = base_entry->GetColumn(LogicalIndex(pk_col)).Name();
+			if (!pk_match_b.empty()) {
+				pk_match_b += " AND ";
+				pk_match_b2 += " AND ";
+				pk_match_m += " AND ";
+				pk_match_c += " AND ";
+				pk_list += ", ";
+				key_expr += " || '|' || ";
+			}
+			pk_match_b += "b." + QM(name) + " = d." + QM(name);
+			pk_match_b2 += "b2." + QM(name) + " = d." + QM(name);
+			pk_match_m += "m." + QM(name) + " = d." + QM(name);
+			pk_match_c += "c." + QM(name) + " = d." + QM(name);
+			pk_list += "d." + QM(name);
+			key_expr += "CAST(d." + QM(name) + " AS VARCHAR)";
+		}
+		for (idx_t col = 0; col < base_entry->GetColumns().LogicalColumnCount(); col++) {
+			if (pk_set.find(col) != pk_set.end()) {
+				continue;
+			}
+			auto &name = base_entry->GetColumn(LogicalIndex(col)).Name();
+			if (!drift_columns.empty()) {
+				drift_columns += " OR ";
+			}
+			drift_columns += "b2." + QM(name) + " IS DISTINCT FROM m." + QM(name);
+		}
+		string exists_b = "EXISTS (SELECT 1 FROM " + base_ref + " b WHERE " + pk_match_b + ")";
+		string drift = drift_columns.empty()
+		                   ? string("false")
+		                   : "EXISTS (SELECT 1 FROM " + base_ref + " b2, " + snapshot_ref + " WHERE " +
+		                         pk_match_b2 + " AND " + pk_match_m + " AND (" + drift_columns + "))";
+		string conflict_pred = "(d._op = 'I' AND " + exists_b + ") OR (d._op = 'U' AND NOT " + exists_b +
+		                       ") OR (d._op IN ('U', 'D') AND (" + drift + "))";
+
+		// conflict keys + pre-mutation counts (the lake must not have been
+		// touched yet when these are evaluated)
+		run("CREATE OR REPLACE TEMP TABLE __anofox_merge_conflicts AS SELECT " + pk_list + " FROM " + delta_ref +
+		    " d WHERE " + conflict_pred);
+		string in_conflicts = "EXISTS (SELECT 1 FROM __anofox_merge_conflicts c WHERE " + pk_match_c + ")";
+		auto n_conflicts = count_of("SELECT count(*) FROM __anofox_merge_conflicts");
+		if (n_conflicts > 0 && policy == MergeConflictPolicy::ABORT) {
+			auto sample = run("SELECT " + key_expr + " FROM " + delta_ref + " d WHERE " + conflict_pred + " LIMIT 1");
+			auto sample_key = sample->Fetch()->GetValue(0, 0).ToString();
+			con.Rollback();
+			throw ConstraintException(
+			    "Cannot merge scenario '%s': the base changed underneath it (e.g. key %s of table '%s'). Rerun "
+			    "with on_conflict := 'ours' (scenario wins) or 'theirs' (base wins)",
+			    entry.name, sample_key, logical_name);
+		}
+		conflicts_resolved += n_conflicts;
+
+		string theirs_filter = policy == MergeConflictPolicy::THEIRS ? " AND NOT " + in_conflicts : "";
+		auto d_hits = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'D' AND " + exists_b +
+		                       theirs_filter);
+
+		// deletes: U/D keys vacate; with 'ours', I over an existing row replaces
+		string delete_ops = policy == MergeConflictPolicy::OURS ? "('U', 'D', 'I')" : "('U', 'D')";
+		auto deleted = count_of("WITH doomed AS (SELECT " + pk_list + " FROM " + delta_ref +
+		                        " d WHERE d._op IN " + delete_ops + theirs_filter + ") DELETE FROM " + base_ref +
+		                        " b WHERE EXISTS (SELECT 1 FROM doomed d WHERE " + pk_match_b + ")");
+		auto inserted = count_of("INSERT INTO " + base_ref + " SELECT " + payload_cols + " FROM " + delta_ref +
+		                         " d WHERE d._op IN ('I', 'U')" + theirs_filter);
+		run("DROP TABLE __anofox_merge_conflicts");
+		rows_applied += inserted + d_hits;
+		if (inserted + deleted > 0) {
+			tables_changed++;
+		}
+	}
+	con.Commit();
+}
+
 void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<MergeState>();
 	if (state.done) {
@@ -237,12 +397,6 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	// snapshot upgrades conflict detection to a true 3-way: base drift on a
 	// touched row is a conflict even when the overlay model cannot see it.
 	bool is_materialized = entry->mode == "materialized";
-	if (!entry->base_catalog.empty()) {
-		throw NotImplementedException(
-		    "Merging back a scenario whose base lives in another catalog ('%s') is not supported (v1): "
-		    "DuckDB transactions write a single database",
-		    entry->base_catalog);
-	}
 	if (entry->frozen) {
 		throw InvalidInputException("Scenario '%s' is frozen. Unfreeze it before merging", bind_data.name);
 	}
@@ -256,6 +410,54 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	idx_t tables_changed = 0;
 	idx_t rows_applied = 0;
 	idx_t conflicts_resolved = 0;
+
+	if (!entry->base_catalog.empty()) {
+		// cross-catalog base: apply on a second connection (lake commits
+		// atomically on its own), then do host bookkeeping below
+		MergeIntoForeignBase(context, host, *entry, bind_data.policy, tables_changed, rows_applied,
+		                     conflicts_resolved);
+		// empty the deltas in the caller's transaction
+		for (auto &delta_pair : ListDeltaTables(context, host, entry->scenario_id)) {
+			auto delta_entry =
+			    ScenarioDelta::TryGetDeltaTable(context, host, entry->scenario_id, delta_pair.second);
+			if (!delta_entry) {
+				continue;
+			}
+			vector<row_t> delta_row_ids;
+			vector<StorageIndex> rowid_col;
+			rowid_col.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+			vector<LogicalType> rowid_type = {LogicalType::ROW_TYPE};
+			ScenarioDelta::ScanTableRows(context, *delta_entry, std::move(rowid_col), rowid_type,
+			                             [&](DataChunk &chunk, idx_t row) {
+				                             delta_row_ids.push_back(chunk.GetValue(0, row).GetValue<row_t>());
+				                             return true;
+			                             });
+			if (delta_row_ids.empty()) {
+				continue;
+			}
+			auto binder = Binder::CreateBinder(context);
+			auto delta_constraints = binder->BindConstraints(*delta_entry);
+			auto &delta_storage = delta_entry->GetStorage();
+			auto delete_state = delta_storage.InitializeDelete(*delta_entry, context, delta_constraints);
+			idx_t offset = 0;
+			while (offset < delta_row_ids.size()) {
+				idx_t batch = MinValue<idx_t>(delta_row_ids.size() - offset, STANDARD_VECTOR_SIZE);
+				Vector row_ids(LogicalType::ROW_TYPE);
+				for (idx_t i = 0; i < batch; i++) {
+					row_ids.SetValue(i, Value::BIGINT(delta_row_ids[offset + i]));
+				}
+				delta_storage.Delete(*delete_state, context, row_ids, batch);
+				offset += batch;
+			}
+		}
+		ScenarioRegistry::MarkMerged(context, host, entry->scenario_id);
+		ScenarioRegistry::SetFrozen(context, host, entry->scenario_id, true);
+		output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
+		output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
+		output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
+		output.SetCardinality(1);
+		return;
+	}
 
 	for (auto &delta_pair : ListDeltaTables(context, host, entry->scenario_id)) {
 		auto &logical_name = delta_pair.second;
