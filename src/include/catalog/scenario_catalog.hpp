@@ -21,6 +21,7 @@ namespace duckdb {
 
 class ScenarioCatalog;
 class ScenarioSchemaEntry;
+class ViewCatalogEntry;
 
 //! The one canonical error for any DDL attempted inside a scenario.
 [[noreturn]] void ThrowScenarioDDLError();
@@ -137,6 +138,8 @@ private:
 	//! physical base table's (materialized copies)
 	CatalogEntry &GetOrCreateTableEntryAs(ClientContext &context, TableCatalogEntry &base_table,
 	                                      const string &logical_name);
+	//! Mirror a base view so its SQL rebinds against the scenario's tables
+	CatalogEntry &GetOrCreateViewEntry(ClientContext &context, ViewCatalogEntry &base_view);
 	ScenarioCatalog &GetScenarioCatalog();
 };
 
