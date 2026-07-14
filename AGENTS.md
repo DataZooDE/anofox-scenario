@@ -477,9 +477,12 @@ __anofox_scenario.registry(
     merged_at TIMESTAMP,                 -- Phase 6: merge-back
     description VARCHAR)
 
--- One delta table per (scenario, base table); the changelog contract
+-- One delta table per (scenario, base table); the changelog contract.
+-- <table> is the logical name: plain for main, '<schema>.<table>' otherwise.
 __anofox_scenario.s<id>_delta_<table>(_op VARCHAR, _ts TIMESTAMP, <base columns>,
-                                      PRIMARY KEY (<base pk>))
+                                      PRIMARY KEY (<base pk or declared key_columns>))
+-- Keyless tables (no PK, no declared key): bag changelog instead - no PK,
+-- trailing _count BIGINT multiplicity, readers aggregate I/D nets per value
 
 -- Materialized base copies (mode = 'materialized')
 __anofox_scenario.s<id>_mat_<table>     -- full schema + data copy of the base table
