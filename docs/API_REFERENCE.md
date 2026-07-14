@@ -58,19 +58,19 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | Limitation | Planned |
 | --- | --- |
 | `ON CONFLICT` / `INSERT OR REPLACE`, `RETURNING`, `MERGE INTO`, PK-column updates | v0.4 |
-| `UPDATE`/`DELETE` on tables without a PRIMARY KEY (insert/read work) | v0.4+ |
+| `UPDATE`/`DELETE` on tables without a PRIMARY KEY (insert/read work) - unless `key_columns :=` declares identity at create/refresh | shipped (`key_columns :=`) |
 | Secondary `UNIQUE` constraints: enforced against base rows, but not between scenario-written rows (PK is fully enforced) | v0.4 |
 | Host writes and scenario writes in the *same explicit transaction* | documented restriction |
 | Views are not exposed inside scenarios (their SQL binds against the base catalog and cannot be retargeted) | backlog |
 | Only the base's `main` schema is mirrored; other schemas are not visible in scenarios | backlog |
-| Base tables created after `scenario_create` are read-only until `CALL scenario_refresh(name)` | shipped |
-| DuckLake-based scenarios: UPDATE/DELETE gated (DuckLake tables have no PRIMARY KEY); merge-back refused (single-writer rule); ducklake tests need a release build | backlog: `key_columns :=` |
+| Base tables created after `scenario_create` are read-only until `scenario_refresh(name, [key_columns := ...])` | shipped |
+| DuckLake-based scenarios: full DML once `key_columns :=` declares row identity (DuckLake tables have no PRIMARY KEY); without it UPDATE/DELETE are gated. Merge-back to a DuckLake base is refused (single-writer rule); ducklake tests need a release build | shipped (`key_columns :=`); merge-back backlog |
 
 ## Function Reference
 
 | Function | Kind | Description |
 | --- | --- | --- |
-| `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes; `base` uses another attached catalog's tables as the base (DuckLake bases are pinned to creation time - true snapshot isolation). O(#tables) metadata for delta mode. |
+| `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog], [key_columns := MAP {'table': ['col', ...]}])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes; `base` uses another attached catalog's tables as the base (DuckLake bases are pinned to creation time - true snapshot isolation); `key_columns` declares row identity for tables without a PRIMARY KEY, unlocking UPDATE/DELETE/MERGE on them. O(#tables) metadata for delta mode. |
 | `CALL scenario_drop(name)` | verb | Remove the scenario and its delta/materialized tables. Refuses while attached or while branches exist. |
 | `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | verb | Reject/allow writes through any attached handle (reads keep working). A frozen materialized scenario is a snapshot. |
 | `SELECT * FROM scenario_list()` | table | `scenario_id, name, mode, frozen, parent, created_at, description`. |
@@ -79,6 +79,7 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog. |
 | `SELECT * FROM scenario_merge_preview(scenario)` | table | Planned merge-back actions: `table_name, key, action, conflict`. Streaming; no side effects. Overlay-tier conflicts: an `insert` whose key now exists in base, an `update` whose key vanished. |
 | `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base in the caller's transaction (atomic across tables). `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. On success the scenario ends `frozen` with `merged_at` set and an empty delta. Delta scenarios only; refuses while branches exist. |
+| `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | verb | Create delta tables for base tables added after `scenario_create`, making them writable. `key_columns` declares identity for new keyless tables (rejected once a table is already tracked). Returns `refreshed_tables`. Idempotent; refuses materialized scenarios. |
 | `SELECT * FROM scenario_migrate()` | verb | One-way migration of a legacy v0.1 database (`_scenario_registry`, `_scen_*`, `_snap_*`) into the v2 layout. Archived -> frozen; snapshots -> materialized+frozen; multi-op delta rows folded to net effects; `_scenario_base_rowids` dropped; `_scenario_protocols` preserved. |
 | `ATTACH 'name' AS alias (TYPE scenario)` / `DETACH alias` | SQL | The entire read/write UX. |
 

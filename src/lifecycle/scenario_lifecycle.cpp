@@ -60,6 +60,36 @@ struct LifecycleGlobalState : public GlobalTableFunctionState {
 	bool done = false;
 };
 
+//! Parse a key_columns := MAP {'table': ['col', ...], ...} parameter value
+void ParseKeyColumnsParam(const Value &value, map<string, vector<string>> &out) {
+	for (auto &map_entry : ListValue::GetChildren(value)) {
+		auto &kv = StructValue::GetChildren(map_entry);
+		auto table_name = kv[0].GetValue<string>();
+		vector<string> columns;
+		for (auto &col : ListValue::GetChildren(kv[1])) {
+			columns.push_back(col.GetValue<string>());
+		}
+		if (columns.empty()) {
+			throw InvalidInputException("key_columns for table '%s' must not be empty", table_name);
+		}
+		out[table_name] = std::move(columns);
+	}
+}
+
+//! Shared typo-safety checks for a declared key against its base table
+void ValidateDeclaredKey(const TableCatalogEntry &base_table, const vector<string> &columns) {
+	if (base_table.HasPrimaryKey()) {
+		throw InvalidInputException("key_columns declared for table '%s', but it already has a PRIMARY KEY",
+		                            base_table.name);
+	}
+	for (auto &column_name : columns) {
+		if (!base_table.ColumnExists(column_name)) {
+			throw InvalidInputException("key_columns for table '%s': column '%s' does not exist", base_table.name,
+			                            column_name);
+		}
+	}
+}
+
 unique_ptr<GlobalTableFunctionState> LifecycleInit(ClientContext &context, TableFunctionInitInput &input) {
 	return make_uniq<LifecycleGlobalState>();
 }
@@ -93,19 +123,7 @@ unique_ptr<FunctionData> LifecycleBind(TableFunctionBindInput &input, vector<Log
 		} else if (param.first == "base") {
 			result->base_catalog = param.second.GetValue<string>();
 		} else if (param.first == "key_columns") {
-			// MAP {'table': ['col', ...], ...}
-			for (auto &map_entry : ListValue::GetChildren(param.second)) {
-				auto &kv = StructValue::GetChildren(map_entry);
-				auto table_name = kv[0].GetValue<string>();
-				vector<string> columns;
-				for (auto &col : ListValue::GetChildren(kv[1])) {
-					columns.push_back(col.GetValue<string>());
-				}
-				if (columns.empty()) {
-					throw InvalidInputException("key_columns for table '%s' must not be empty", table_name);
-				}
-				result->key_columns[table_name] = std::move(columns);
-			}
+			ParseKeyColumnsParam(param.second, result->key_columns);
 		}
 	}
 	if (!result->base_catalog.empty() && (result->mode == "materialized" || !result->from_scenario.empty())) {
@@ -211,16 +229,7 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 				continue;
 			}
 			table_found = true;
-			if (base_table.get().HasPrimaryKey()) {
-				throw InvalidInputException(
-				    "key_columns declared for table '%s', but it already has a PRIMARY KEY", declared.first);
-			}
-			for (auto &column_name : declared.second) {
-				if (!base_table.get().ColumnExists(column_name)) {
-					throw InvalidInputException("key_columns for table '%s': column '%s' does not exist",
-					                            declared.first, column_name);
-				}
-			}
+			ValidateDeclaredKey(base_table.get(), declared.second);
 		}
 		if (!table_found) {
 			throw InvalidInputException("key_columns declared for unknown table '%s'", declared.first);
@@ -338,6 +347,16 @@ unique_ptr<FunctionData> ScenarioRefreshBind(ClientContext &context, TableFuncti
 		throw InvalidInputException("Scenario name cannot be NULL");
 	}
 	result->name = input.inputs[0].GetValue<string>();
+	// key_columns := declares identity for keyless tables that appeared after
+	// scenario_create (which rejects declarations for then-unknown tables)
+	for (auto &param : input.named_parameters) {
+		if (param.second.IsNull()) {
+			continue;
+		}
+		if (param.first == "key_columns") {
+			ParseKeyColumnsParam(param.second, result->key_columns);
+		}
+	}
 	return_types = {LogicalType::BIGINT};
 	names = {"refreshed_tables"};
 	return std::move(result);
@@ -387,10 +406,32 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 		}
 		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
 	});
+	// validate declared keys up front: they must name a base table that is not
+	// yet tracked (identity cannot be changed once a delta table exists)
+	for (auto &declared : bind_data.key_columns) {
+		bool table_found = false;
+		for (auto &base_table : base_tables) {
+			if (base_table.get().name != declared.first) {
+				continue;
+			}
+			table_found = true;
+			ValidateDeclaredKey(base_table.get(), declared.second);
+			if (ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, base_table.get().name)) {
+				throw InvalidInputException("key_columns declared for table '%s', but scenario '%s' already tracks "
+				                            "it - row identity cannot be changed after the fact",
+				                            declared.first, bind_data.name);
+			}
+		}
+		if (!table_found) {
+			throw InvalidInputException("key_columns declared for unknown table '%s'", declared.first);
+		}
+	}
 	idx_t refreshed = 0;
 	for (auto &base_table : base_tables) {
 		if (!ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, base_table.get().name)) {
-			ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry->scenario_id, base_table.get());
+			auto declared = bind_data.key_columns.find(base_table.get().name);
+			ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry->scenario_id, base_table.get(),
+			                                declared == bind_data.key_columns.end() ? nullptr : &declared->second);
 			refreshed++;
 		}
 	}
@@ -484,8 +525,10 @@ void ScenarioLifecycle::RegisterFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(TableFunction("scenario_list", {}, ScenarioListExecute, ScenarioListBind,
 	                                      ScenarioListInit));
 	// Pick up base tables created after the scenario
-	loader.RegisterFunction(TableFunction("scenario_refresh", {LogicalType::VARCHAR}, ScenarioRefreshExecute,
-	                                      ScenarioRefreshBind, ScenarioRefreshInit));
+	TableFunction refresh("scenario_refresh", {LogicalType::VARCHAR}, ScenarioRefreshExecute, ScenarioRefreshBind,
+	                      ScenarioRefreshInit);
+	refresh.named_parameters["key_columns"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
+	loader.RegisterFunction(refresh);
 }
 
 } // namespace duckdb

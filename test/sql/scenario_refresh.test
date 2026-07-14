@@ -62,6 +62,32 @@ SELECT refreshed_tables FROM scenario_refresh('evolving');
 ----
 0
 
+# --- refresh can declare keys for new keyless tables (codex finding #2) ---------
+
+statement ok
+CREATE TABLE metrics (metric_name VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO metrics VALUES ('cpu', 0.5);
+
+query I
+SELECT refreshed_tables FROM scenario_refresh('evolving', key_columns := MAP {'metrics': ['metric_name']});
+----
+1
+
+statement ok
+UPDATE s.metrics SET val = 0.9 WHERE metric_name = 'cpu';
+
+query T
+SELECT val::VARCHAR FROM s.metrics;
+----
+0.9
+
+query T
+SELECT val::VARCHAR FROM metrics;
+----
+0.5
+
 # unknown scenario errors
 statement error
 SELECT * FROM scenario_refresh('nope');

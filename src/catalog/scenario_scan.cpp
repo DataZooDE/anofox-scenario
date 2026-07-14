@@ -9,6 +9,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -66,7 +67,11 @@ struct ScenarioScanGlobalState : public GlobalTableFunctionState {
 	bool needs_projection = false;
 	vector<StorageIndex> storage_ids;
 	vector<LogicalType> scan_types;
-	optional_ptr<TableFilterSet> filters;
+	//! Pushed filters remapped from output positions to base scan positions;
+	//! filters on __scenario_origin never reach the base scan (see InitGlobal)
+	TableFilterSet base_filters;
+	//! True when an origin filter excludes base rows entirely (origin = 1)
+	bool base_side_disabled = false;
 
 	// --- duck base ---
 	ParallelTableScanState parallel_state;
@@ -103,7 +108,6 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 	auto &bind_data = input.bind_data->Cast<ScenarioScanBindData>();
 	auto result = make_uniq<ScenarioScanGlobalState>();
 	bool has_delta = bind_data.delta_table != nullptr;
-	result->filters = input.filters;
 
 	// --- classify requested columns and build the base-side scan list -------
 	// The scan list holds regular/rowid columns; __scenario_origin is a
@@ -137,6 +141,41 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			result->key_positions.push_back(find_or_add_scan_column(ColumnIndex(pk_col)));
 		}
 	}
+	// --- remap pushed filters onto the base scan list ------------------------
+	// input.filters are keyed by *output* position (input.column_indexes).
+	// The base scan list diverges from the output layout whenever virtual
+	// columns are projected: __scenario_origin has no scan column at all and
+	// __scenario_key_<k> dedupes onto its PK column. Forwarding the set
+	// unremapped would filter the wrong storage column - so rebuild it keyed
+	// by scan position, and fold origin filters against the base-side
+	// constant (0) instead of pushing them into storage.
+	if (input.filters) {
+		for (auto &filter_entry : input.filters->filters) {
+			auto out_pos = filter_entry.first;
+			if (out_pos >= result->out_map.size()) {
+				throw InternalException("anofox_scenario: pushed filter references an unprojected column");
+			}
+			auto scan_pos = result->out_map[out_pos].scan_pos;
+			if (scan_pos == DConstants::INVALID_INDEX) {
+				// __scenario_origin: constant 0 for every base row. The filter
+				// either rejects all base rows (skip the base side) or none.
+				auto origin_ref = make_uniq<BoundConstantExpression>(Value::TINYINT(0));
+				auto folded = filter_entry.second->ToExpression(*origin_ref);
+				Value fold_result;
+				if (!ExpressionExecutor::TryEvaluateScalar(context, *folded, fold_result)) {
+					throw InternalException("anofox_scenario: could not fold filter on __scenario_origin");
+				}
+				if (fold_result.IsNull() || !BooleanValue::Get(fold_result.DefaultCastAs(LogicalType::BOOLEAN))) {
+					result->base_side_disabled = true;
+				}
+				continue;
+			}
+			// PushFilter conjuncts when two outputs (a key virtual column and
+			// its PK column) dedupe onto the same scan position
+			result->base_filters.PushFilter(ColumnIndex(scan_pos), filter_entry.second->Copy());
+		}
+	}
+
 	// projection required unless outputs are exactly the scanned columns
 	result->needs_projection = scan_columns.size() != result->out_map.size();
 	if (!result->needs_projection) {
@@ -336,8 +375,13 @@ unique_ptr<LocalTableFunctionState> ScenarioScanInitLocal(ExecutionContext &cont
 	auto result = make_uniq<ScenarioScanLocalState>();
 	if (bind_data.base_is_duck) {
 		auto storage_ids = gstate.storage_ids;
-		result->scan_state.Initialize(std::move(storage_ids), context.client, gstate.filters);
+		optional_ptr<TableFilterSet> base_filters;
+		if (!gstate.base_filters.filters.empty()) {
+			base_filters = &gstate.base_filters;
+		}
+		result->scan_state.Initialize(std::move(storage_ids), context.client, base_filters);
 	}
+	result->base_done = gstate.base_side_disabled;
 	if (gstate.needs_projection) {
 		result->scan_chunk.Initialize(Allocator::Get(context.client), gstate.scan_types);
 	}
