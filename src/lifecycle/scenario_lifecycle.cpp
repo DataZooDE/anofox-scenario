@@ -164,6 +164,25 @@ void LifecycleExecute(ClientContext &context, TableFunctionInput &data, DataChun
 // Verbs
 //===----------------------------------------------------------------------===//
 
+//! Collect every user table of every mirrored schema of a base catalog
+void CollectBaseTables(ClientContext &context, Catalog &base_source, vector<reference<TableCatalogEntry>> &out) {
+	base_source.ScanSchemas(context, [&](SchemaCatalogEntry &schema) {
+		// built-in schemas (main) are marked internal, so filter by name only
+		if (schema.name == ScenarioRegistry::SCHEMA_NAME) {
+			return;
+		}
+		schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
+			if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal) {
+				return;
+			}
+			if (StringUtil::StartsWith(table_entry.name, "_scenario_")) {
+				return; // legacy v0.1 metadata
+			}
+			out.push_back(table_entry.Cast<TableCatalogEntry>());
+		});
+	});
+}
+
 void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_data) {
 	auto &host_catalog = GetHostCatalog(context);
 	ScenarioRegistry::EnsureExists(context, host_catalog);
@@ -210,22 +229,13 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	// Cost: O(#tables) empty tables -- metadata only, no row data copied.
 	// Materialized mode additionally CTAS-copies every base table.
 	auto &base_source = base_catalog ? *base_catalog : host_catalog;
-	auto &host_schema = base_source.GetSchema(context, DEFAULT_SCHEMA);
 	vector<reference<TableCatalogEntry>> base_tables;
-	host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
-		if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal) {
-			return;
-		}
-		if (StringUtil::StartsWith(table_entry.name, "_scenario_")) {
-			return; // legacy v0.1 metadata
-		}
-		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
-	});
+	CollectBaseTables(context, base_source, base_tables);
 	// validate declared keys up front (typo safety)
 	for (auto &declared : bind_data.key_columns) {
 		bool table_found = false;
 		for (auto &base_table : base_tables) {
-			if (base_table.get().name != declared.first) {
+			if (ScenarioDelta::LogicalName(base_table.get()) != declared.first) {
 				continue;
 			}
 			table_found = true;
@@ -236,7 +246,7 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		}
 	}
 	for (auto &base_table : base_tables) {
-		auto declared = bind_data.key_columns.find(base_table.get().name);
+		auto declared = bind_data.key_columns.find(ScenarioDelta::LogicalName(base_table.get()));
 		auto &delta = ScenarioDelta::EnsureDeltaTable(
 		    context, host_catalog, entry.scenario_id, base_table.get(),
 		    declared == bind_data.key_columns.end() ? nullptr : &declared->second);
@@ -246,8 +256,8 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		if (parent) {
 			// Branch: inherit the parent's modifications by copying its
 			// delta rows (cheap - deltas are small by invariant)
-			auto parent_delta =
-			    ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id, base_table.get().name);
+			auto parent_delta = ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id,
+			                                                    ScenarioDelta::LogicalName(base_table.get()));
 			if (parent_delta) {
 				ScenarioDelta::CopyTableData(context, *parent_delta, delta);
 			}
@@ -397,26 +407,20 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 	MetaTransaction::Get(context).ModifyDatabase(host_catalog.GetAttached(),
 	                                             DatabaseModificationType::CREATE_CATALOG_ENTRY);
 
-	auto &base_schema = base_source->GetSchema(context, DEFAULT_SCHEMA);
 	vector<reference<TableCatalogEntry>> base_tables;
-	base_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
-		if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal ||
-		    StringUtil::StartsWith(table_entry.name, "_scenario_")) {
-			return;
-		}
-		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
-	});
+	CollectBaseTables(context, *base_source, base_tables);
 	// validate declared keys up front: they must name a base table that is not
 	// yet tracked (identity cannot be changed once a delta table exists)
 	for (auto &declared : bind_data.key_columns) {
 		bool table_found = false;
 		for (auto &base_table : base_tables) {
-			if (base_table.get().name != declared.first) {
+			if (ScenarioDelta::LogicalName(base_table.get()) != declared.first) {
 				continue;
 			}
 			table_found = true;
 			ValidateDeclaredKey(base_table.get(), declared.second);
-			if (ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, base_table.get().name)) {
+			if (ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id,
+			                                    ScenarioDelta::LogicalName(base_table.get()))) {
 				throw InvalidInputException("key_columns declared for table '%s', but scenario '%s' already tracks "
 				                            "it - row identity cannot be changed after the fact",
 				                            declared.first, bind_data.name);
@@ -428,8 +432,9 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 	}
 	idx_t refreshed = 0;
 	for (auto &base_table : base_tables) {
-		if (!ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, base_table.get().name)) {
-			auto declared = bind_data.key_columns.find(base_table.get().name);
+		if (!ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id,
+		                                     ScenarioDelta::LogicalName(base_table.get()))) {
+			auto declared = bind_data.key_columns.find(ScenarioDelta::LogicalName(base_table.get()));
 			ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry->scenario_id, base_table.get(),
 			                                declared == bind_data.key_columns.end() ? nullptr : &declared->second);
 			refreshed++;

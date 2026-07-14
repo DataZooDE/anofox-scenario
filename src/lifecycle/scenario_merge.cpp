@@ -90,7 +90,9 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 	}
 	for (auto &delta_pair : ListDeltaTables(context, host, entry->scenario_id)) {
 		auto &logical_name = delta_pair.second;
-		auto base_entry = preview_base->GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, logical_name,
+		string schema_name, table_name;
+		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
+		auto base_entry = preview_base->GetEntry<TableCatalogEntry>(context, schema_name, table_name,
 		                                                            OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			continue; // base table vanished; scenario_merge reports the error
@@ -111,7 +113,7 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 				pk_match += "b." + QM(name) + " = d." + QM(name);
 			}
 		}
-		auto base_name = QM(preview_base->GetName()) + "." + QM(string(DEFAULT_SCHEMA)) + "." + QM(logical_name);
+		auto base_name = QM(preview_base->GetName()) + "." + QM(schema_name) + "." + QM(table_name);
 		string exists_clause = pk_columns.empty()
 		                           ? string("false")
 		                           : "EXISTS (SELECT 1 FROM " + base_name + " b WHERE " + pk_match + ")";
@@ -267,7 +269,9 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 	auto internal_prefix = host_prefix + QM(ScenarioRegistry::SCHEMA_NAME) + ".";
 	for (auto &delta_pair : ListDeltaTables(context, host, entry.scenario_id)) {
 		auto &logical_name = delta_pair.second;
-		auto base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, logical_name,
+		string schema_name, table_name;
+		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
+		auto base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, schema_name, table_name,
 		                                                            OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			con.Rollback();
@@ -275,7 +279,7 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 			                            entry.name, logical_name, entry.base_catalog);
 		}
 		auto delta_ref = internal_prefix + QM(delta_pair.first);
-		auto base_ref = QM(base_catalog->GetName()) + "." + QM(string(DEFAULT_SCHEMA)) + "." + QM(logical_name);
+		auto base_ref = QM(base_catalog->GetName()) + "." + QM(schema_name) + "." + QM(table_name);
 		auto snapshot_ref =
 		    base_ref + " AS m AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry.created_at) + "')";
 		auto pk_columns = ScenarioDelta::GetKeyColumns(context, host, entry.scenario_id, logical_name, *base_entry);
@@ -496,8 +500,10 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			continue;
 		}
 
+		string schema_name, table_name;
+		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
 		auto base_entry =
-		    host.GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, logical_name, OnEntryNotFound::RETURN_NULL);
+		    host.GetEntry<TableCatalogEntry>(context, schema_name, table_name, OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			throw InvalidInputException(
 			    "Cannot merge scenario '%s': base table '%s' no longer exists", bind_data.name, logical_name);

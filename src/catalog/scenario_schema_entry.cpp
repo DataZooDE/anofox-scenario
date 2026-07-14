@@ -36,7 +36,8 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateViewEntry(ClientContext &context, 
 	auto &scenario_catalog = GetScenarioCatalog();
 	auto &transaction = scenario_catalog.GetScenarioTransaction(context);
 
-	auto cached = transaction.table_entries.find(base_view.name);
+	auto qualified = QualifiedName(base_view.name);
+	auto cached = transaction.table_entries.find(qualified);
 	if (cached != transaction.table_entries.end()) {
 		return *cached->second;
 	}
@@ -52,8 +53,16 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateViewEntry(ClientContext &context, 
 
 	auto entry = make_uniq<ViewCatalogEntry>(scenario_catalog, *this, view_info);
 	auto &result = *entry;
-	transaction.table_entries[base_view.name] = std::move(entry);
+	transaction.table_entries[qualified] = std::move(entry);
 	return result;
+}
+
+string ScenarioSchemaEntry::QualifiedName(const string &table_name) const {
+	// the delta/mat naming contract: plain for main, '<schema>.<table>' else
+	if (name == DEFAULT_SCHEMA) {
+		return table_name;
+	}
+	return name + "." + table_name;
 }
 
 CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table) {
@@ -61,11 +70,12 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntry(ClientContext &context,
 }
 
 CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &context, TableCatalogEntry &base_table,
-                                                           const string &logical_name) {
+                                                           const string &table_name) {
 	auto &scenario_catalog = GetScenarioCatalog();
 	auto &transaction = scenario_catalog.GetScenarioTransaction(context);
+	auto qualified = QualifiedName(table_name);
 
-	auto cached = transaction.table_entries.find(logical_name);
+	auto cached = transaction.table_entries.find(qualified);
 	if (cached != transaction.table_entries.end()) {
 		return *cached->second;
 	}
@@ -76,13 +86,13 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	auto &table_info = create_info->Cast<CreateTableInfo>();
 	table_info.catalog = scenario_catalog.GetName();
 	table_info.schema = name;
-	table_info.table = logical_name;
+	table_info.table = table_name;
 
 	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table);
 	entry->key_columns = ScenarioDelta::GetKeyColumns(context, scenario_catalog.GetHostCatalog(context),
-	                                                  scenario_catalog.scenario_id, logical_name, base_table);
+	                                                  scenario_catalog.scenario_id, qualified, base_table);
 	auto &result = *entry;
-	transaction.table_entries[logical_name] = std::move(entry);
+	transaction.table_entries[qualified] = std::move(entry);
 	return result;
 }
 
@@ -93,7 +103,11 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		// Views are mirrored live from the base in both modes (their SQL
 		// rebinds against the scenario's tables at query time)
 		auto &view_catalog = scenario_catalog.GetBaseCatalog(context);
-		auto &view_schema = view_catalog.GetSchema(context, DEFAULT_SCHEMA);
+		auto view_schema_ptr = view_catalog.GetSchema(context, name, OnEntryNotFound::RETURN_NULL);
+		if (!view_schema_ptr) {
+			return;
+		}
+		auto &view_schema = *view_schema_ptr;
 		view_schema.Scan(context, CatalogType::VIEW_ENTRY, [&](CatalogEntry &base_entry) {
 			if (base_entry.type != CatalogType::VIEW_ENTRY || !ShouldExpose(base_entry)) {
 				return;
@@ -115,18 +129,27 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			return;
 		}
 		string prefix = "s" + to_string(scenario_catalog.mat_base_scenario_id) + "_mat_";
+		if (name != DEFAULT_SCHEMA) {
+			prefix += name + ".";
+		}
 		internal_schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &mat_entry) {
 			if (mat_entry.type != CatalogType::TABLE_ENTRY || !StringUtil::StartsWith(mat_entry.name, prefix)) {
 				return;
 			}
-			auto logical_name = mat_entry.name.substr(prefix.size());
-			callback(GetOrCreateTableEntryAs(context, mat_entry.Cast<TableCatalogEntry>(), logical_name));
+			auto table_name = mat_entry.name.substr(prefix.size());
+			if (name == DEFAULT_SCHEMA && table_name.find('.') != string::npos) {
+				return; // belongs to a mirrored non-main schema
+			}
+			callback(GetOrCreateTableEntryAs(context, mat_entry.Cast<TableCatalogEntry>(), table_name));
 		});
 		return;
 	}
 	auto &base_catalog = scenario_catalog.GetBaseCatalog(context);
-	auto &base_schema = base_catalog.GetSchema(context, DEFAULT_SCHEMA);
-	base_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &base_entry) {
+	auto base_schema = base_catalog.GetSchema(context, name, OnEntryNotFound::RETURN_NULL);
+	if (!base_schema) {
+		return;
+	}
+	base_schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &base_entry) {
 		if (!ShouldExpose(base_entry)) {
 			return;
 		}
@@ -156,7 +179,7 @@ optional_ptr<CatalogEntry> ScenarioSchemaEntry::LookupEntry(CatalogTransaction t
 	if (scenario_catalog.mat_base_scenario_id >= 0) {
 		// Materialized base: resolve against the frozen copy
 		auto mat_entry = ScenarioDelta::TryGetMatTable(context, host_catalog, scenario_catalog.mat_base_scenario_id,
-		                                               lookup_info.GetEntryName());
+		                                               QualifiedName(lookup_info.GetEntryName()));
 		if (mat_entry) {
 			return &GetOrCreateTableEntryAs(context, *mat_entry, lookup_info.GetEntryName());
 		}
@@ -165,9 +188,12 @@ optional_ptr<CatalogEntry> ScenarioSchemaEntry::LookupEntry(CatalogTransaction t
 	}
 
 	auto &base_catalog = scenario_catalog.GetBaseCatalog(context);
-	auto &base_schema = base_catalog.GetSchema(context, DEFAULT_SCHEMA);
+	auto base_schema = base_catalog.GetSchema(context, name, OnEntryNotFound::RETURN_NULL);
+	if (!base_schema) {
+		return nullptr;
+	}
 	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, lookup_info.GetEntryName());
-	auto base_entry = base_schema.LookupEntry(base_catalog.GetCatalogTransaction(context), table_lookup);
+	auto base_entry = base_schema->LookupEntry(base_catalog.GetCatalogTransaction(context), table_lookup);
 	if (!base_entry || !ShouldExpose(*base_entry)) {
 		return nullptr;
 	}

@@ -515,7 +515,7 @@ TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, Scenario
 	auto &scenario_catalog = entry.GetScenarioCatalog();
 	auto &host_catalog = scenario_catalog.GetHostCatalog(context);
 	auto delta_table =
-	    ScenarioDelta::TryGetDeltaTable(context, host_catalog, scenario_catalog.scenario_id, entry.name);
+	    ScenarioDelta::TryGetDeltaTable(context, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
 	auto result = make_uniq<ScenarioScanBindData>(entry, entry.base_entry, delta_table, entry.key_columns);
 	result->base_is_duck = entry.base_entry.IsDuckTable();
 	// WP2.1: duck bases honor pushed filters on both merge sides; foreign

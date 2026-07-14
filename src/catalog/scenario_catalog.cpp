@@ -1,5 +1,6 @@
 #include "catalog/scenario_catalog.hpp"
 
+#include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -45,6 +46,29 @@ void ScenarioCatalog::DropSchema(ClientContext &context, DropInfo &info) {
 	ThrowScenarioDDLError();
 }
 
+ScenarioSchemaEntry &ScenarioCatalog::GetOrCreateMirroredSchema(const string &schema_name) {
+	lock_guard<mutex> guard(schema_lock);
+	auto existing = mirrored_schemas.find(schema_name);
+	if (existing != mirrored_schemas.end()) {
+		return *existing->second;
+	}
+	CreateSchemaInfo info;
+	info.schema = schema_name;
+	info.internal = true;
+	auto entry = make_uniq<ScenarioSchemaEntry>(*this, info);
+	auto &result = *entry;
+	mirrored_schemas[schema_name] = std::move(entry);
+	return result;
+}
+
+//! True when a base schema participates in scenario mirroring
+static bool ShouldMirrorSchema(const SchemaCatalogEntry &schema) {
+	if (schema.name == DEFAULT_SCHEMA || schema.internal) {
+		return false;
+	}
+	return schema.name != ScenarioRegistry::SCHEMA_NAME;
+}
+
 optional_ptr<SchemaCatalogEntry> ScenarioCatalog::LookupSchema(CatalogTransaction transaction,
                                                                const EntryLookupInfo &schema_lookup,
                                                                OnEntryNotFound if_not_found) {
@@ -52,15 +76,30 @@ optional_ptr<SchemaCatalogEntry> ScenarioCatalog::LookupSchema(CatalogTransactio
 	if (schema_name == DEFAULT_SCHEMA || schema_name == INVALID_SCHEMA) {
 		return main_schema.get();
 	}
+	// Non-main schemas mirror the base's schemas (live: any schema the base
+	// has right now; the internal metadata schema is never exposed)
+	if (transaction.context && schema_name != ScenarioRegistry::SCHEMA_NAME) {
+		auto &base_catalog = GetBaseCatalog(*transaction.context);
+		auto base_schema = base_catalog.GetSchema(*transaction.context, schema_name, OnEntryNotFound::RETURN_NULL);
+		if (base_schema && ShouldMirrorSchema(*base_schema)) {
+			return &GetOrCreateMirroredSchema(schema_name);
+		}
+	}
 	if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
-		throw CatalogException("Scenario catalog \"%s\" only has a \"%s\" schema - schema \"%s\" does not exist",
-		                       GetName(), DEFAULT_SCHEMA, schema_name);
+		throw CatalogException("Schema \"%s\" does not exist in scenario catalog \"%s\" (schemas mirror the base)",
+		                       schema_name, GetName());
 	}
 	return nullptr;
 }
 
 void ScenarioCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
 	callback(*main_schema);
+	auto &base_catalog = GetBaseCatalog(context);
+	base_catalog.ScanSchemas(context, [&](SchemaCatalogEntry &base_schema) {
+		if (ShouldMirrorSchema(base_schema)) {
+			callback(GetOrCreateMirroredSchema(base_schema.name));
+		}
+	});
 }
 
 PhysicalOperator &ScenarioCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,

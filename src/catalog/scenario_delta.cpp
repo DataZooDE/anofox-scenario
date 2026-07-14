@@ -28,6 +28,25 @@ string ScenarioDelta::MatTableName(int64_t scenario_id, const string &table_name
 	return "s" + to_string(scenario_id) + "_mat_" + table_name;
 }
 
+string ScenarioDelta::LogicalName(const TableCatalogEntry &table) {
+	auto &schema_name = table.ParentSchema().name;
+	if (schema_name == DEFAULT_SCHEMA) {
+		return table.name;
+	}
+	return schema_name + "." + table.name;
+}
+
+void ScenarioDelta::SplitLogicalName(const string &logical_name, string &schema_name, string &table_name) {
+	auto dot = logical_name.find('.');
+	if (dot == string::npos) {
+		schema_name = DEFAULT_SCHEMA;
+		table_name = logical_name;
+	} else {
+		schema_name = logical_name.substr(0, dot);
+		table_name = logical_name.substr(dot + 1);
+	}
+}
+
 //! Internal: look up a table in the internal schema by exact name
 static optional_ptr<DuckTableEntry> TryGetInternalTable(ClientContext &context, Catalog &host_catalog,
                                                         const string &table_name) {
@@ -53,18 +72,19 @@ optional_ptr<DuckTableEntry> ScenarioDelta::TryGetMatTable(ClientContext &contex
 }
 
 DuckTableEntry &ScenarioDelta::CreateMatTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-                                              TableCatalogEntry &base_entry) {
+                                              TableCatalogEntry &base_entry, const string *logical_name_override) {
+	auto logical_name = logical_name_override ? *logical_name_override : LogicalName(base_entry);
 	// Full schema copy (columns + constraints, so the PK survives)
 	auto create_info = base_entry.GetInfo();
 	auto &info = create_info->Cast<CreateTableInfo>();
 	info.catalog = host_catalog.GetName();
 	info.schema = ScenarioRegistry::SCHEMA_NAME;
-	info.table = MatTableName(scenario_id, base_entry.name);
+	info.table = MatTableName(scenario_id, logical_name);
 	info.on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 	info.temporary = false;
 	host_catalog.CreateTable(context, unique_ptr_cast<CreateInfo, CreateTableInfo>(std::move(create_info)));
 
-	auto created = TryGetMatTable(context, host_catalog, scenario_id, base_entry.name);
+	auto created = TryGetMatTable(context, host_catalog, scenario_id, logical_name);
 	if (!created) {
 		throw InternalException("anofox_scenario: failed to create materialized table for '%s'", base_entry.name);
 	}
@@ -120,8 +140,10 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 }
 
 DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-                                                TableCatalogEntry &base_entry, const vector<string> *declared_keys) {
-	auto existing = TryGetDeltaTable(context, host_catalog, scenario_id, base_entry.name);
+                                                TableCatalogEntry &base_entry, const vector<string> *declared_keys,
+                                                const string *logical_name_override) {
+	auto logical_name = logical_name_override ? *logical_name_override : LogicalName(base_entry);
+	auto existing = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (existing) {
 		return *existing;
 	}
@@ -131,7 +153,7 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 	auto info = make_uniq<CreateTableInfo>();
 	info->catalog = host_catalog.GetName();
 	info->schema = ScenarioRegistry::SCHEMA_NAME;
-	info->table = DeltaTableName(scenario_id, base_entry.name);
+	info->table = DeltaTableName(scenario_id, logical_name);
 	info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 	info->columns.AddColumn(ColumnDefinition("_op", LogicalType::VARCHAR));
 	info->columns.AddColumn(ColumnDefinition("_ts", LogicalType::TIMESTAMP));
@@ -177,7 +199,7 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 	}
 	host_catalog.CreateTable(context, std::move(info));
 
-	auto created = TryGetDeltaTable(context, host_catalog, scenario_id, base_entry.name);
+	auto created = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (!created) {
 		throw InternalException("anofox_scenario: failed to create delta table for '%s'", base_entry.name);
 	}

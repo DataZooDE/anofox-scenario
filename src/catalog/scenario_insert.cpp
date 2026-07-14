@@ -190,7 +190,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	// scenario_create; DML never creates catalog entries (single-writer rule).
 	if (!gstate.delta_table) {
 		auto delta_ptr =
-		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, entry.name);
+		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
 		if (!delta_ptr) {
 			throw InvalidInputException(
 			    "Table '%s' was created in the base after scenario '%s': it is readable but not writable in "

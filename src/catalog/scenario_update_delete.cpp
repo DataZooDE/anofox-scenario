@@ -60,7 +60,7 @@ public:
 		auto &scenario_catalog = entry.GetScenarioCatalog();
 		auto &host_catalog = scenario_catalog.GetHostCatalog(client);
 		auto delta_ptr =
-		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, entry.name);
+		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
 		if (!delta_ptr) {
 			throw InvalidInputException(
 			    "Table '%s' was created in the base after scenario '%s': it is readable but not writable in "
