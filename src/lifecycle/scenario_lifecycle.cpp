@@ -283,6 +283,81 @@ void ScenarioUnfreezeVerb(ClientContext &context, const LifecycleBindData &bind_
 }
 
 //===----------------------------------------------------------------------===//
+// scenario_refresh: create delta tables for base tables added after creation
+//===----------------------------------------------------------------------===//
+
+struct RefreshState : public GlobalTableFunctionState {
+	bool done = false;
+};
+
+unique_ptr<FunctionData> ScenarioRefreshBind(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
+	auto result = make_uniq<LifecycleBindData>();
+	if (input.inputs[0].IsNull()) {
+		throw InvalidInputException("Scenario name cannot be NULL");
+	}
+	result->name = input.inputs[0].GetValue<string>();
+	return_types = {LogicalType::BIGINT};
+	names = {"refreshed_tables"};
+	return std::move(result);
+}
+
+unique_ptr<GlobalTableFunctionState> ScenarioRefreshInit(ClientContext &context, TableFunctionInitInput &input) {
+	return make_uniq<RefreshState>();
+}
+
+void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &state = data.global_state->Cast<RefreshState>();
+	if (state.done) {
+		output.SetCardinality(0);
+		return;
+	}
+	state.done = true;
+	auto &bind_data = data.bind_data->Cast<LifecycleBindData>();
+	auto &host_catalog = GetHostCatalog(context);
+	auto entry = ScenarioRegistry::Lookup(context, host_catalog, bind_data.name);
+	if (!entry) {
+		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
+	}
+	if (entry->mode == "materialized") {
+		throw InvalidInputException(
+		    "Cannot refresh scenario '%s': materialized scenarios are point-in-time copies and do not pick up "
+		    "new base tables",
+		    bind_data.name);
+	}
+	// Phase 4: honor a cross-catalog base
+	optional_ptr<Catalog> base_source = &host_catalog;
+	if (!entry->base_catalog.empty()) {
+		base_source = Catalog::GetCatalogEntry(context, entry->base_catalog);
+		if (!base_source) {
+			throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", bind_data.name,
+			                            entry->base_catalog);
+		}
+	}
+	MetaTransaction::Get(context).ModifyDatabase(host_catalog.GetAttached(),
+	                                             DatabaseModificationType::CREATE_CATALOG_ENTRY);
+
+	auto &base_schema = base_source->GetSchema(context, DEFAULT_SCHEMA);
+	vector<reference<TableCatalogEntry>> base_tables;
+	base_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
+		if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal ||
+		    StringUtil::StartsWith(table_entry.name, "_scenario_")) {
+			return;
+		}
+		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
+	});
+	idx_t refreshed = 0;
+	for (auto &base_table : base_tables) {
+		if (!ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, base_table.get().name)) {
+			ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry->scenario_id, base_table.get());
+			refreshed++;
+		}
+	}
+	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(refreshed)));
+	output.SetCardinality(1);
+}
+
+//===----------------------------------------------------------------------===//
 // scenario_list: the registry v2 view
 //===----------------------------------------------------------------------===//
 
@@ -363,6 +438,9 @@ void ScenarioLifecycle::RegisterFunctions(ExtensionLoader &loader) {
 	// Registry v2 listing (replaces legacy scenario_list in v0.2)
 	loader.RegisterFunction(TableFunction("scenario_list", {}, ScenarioListExecute, ScenarioListBind,
 	                                      ScenarioListInit));
+	// Pick up base tables created after the scenario
+	loader.RegisterFunction(TableFunction("scenario_refresh", {LogicalType::VARCHAR}, ScenarioRefreshExecute,
+	                                      ScenarioRefreshBind, ScenarioRefreshInit));
 }
 
 } // namespace duckdb

@@ -203,7 +203,16 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		gstate.delta_constraints = binder->BindConstraints(delta);
 		if (entry.base_entry.IsDuckTable()) {
 			auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
-			gstate.base_constraints = binder->BindConstraints(base_duck);
+			auto all_base_constraints = binder->BindConstraints(base_duck);
+			// Base probe = unique/PK collisions ONLY. NOT NULL/CHECK are
+			// evaluated by the sink itself, and FK constraints must NOT be
+			// checked against the base alone: a referenced parent row may
+			// exist only in the scenario (FKs are enforced at merge-back).
+			for (auto &constraint : all_base_constraints) {
+				if (constraint->type == ConstraintType::UNIQUE) {
+					gstate.base_constraints.push_back(std::move(constraint));
+				}
+			}
 			gstate.base_constraint_state =
 			    base_duck.GetStorage().InitializeConstraintState(base_duck, gstate.base_constraints);
 		}

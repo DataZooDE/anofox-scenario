@@ -60,6 +60,49 @@ SELECT count(*), sum(v)::BIGINT FROM big;
 ----
 1000000	249999750000
 
+# --- filter pushdown (WP2.1): filters execute inside the scenario scan -----------
+
+# the filter must appear inside the scan node (pushdown), not a separate
+# FILTER operator above it
+statement ok
+PRAGMA explain_output='physical_only';
+
+query II
+EXPLAIN SELECT v FROM p.big WHERE id = 123456;
+----
+physical_plan	<REGEX>:.*Filters.*id=123456.*
+
+# pushed filters stay correct across both merge sides:
+# id=200 was updated in the scenario (delta side)...
+query II
+SELECT id, v FROM p.big WHERE id = 200;
+----
+200	101.0
+
+# ...id=201 was deleted (suppressed, must NOT reappear under pushdown)...
+query I
+SELECT count(*) FROM p.big WHERE id = 201;
+----
+0
+
+# ...id=2000123 exists only in the delta...
+query II
+SELECT id, v FROM p.big WHERE id = 2000123;
+----
+2000123	1.0
+
+# ...and id=123456 only in the base
+query II
+SELECT id, v FROM p.big WHERE id = 123456;
+----
+123456	61728.0
+
+# range filter spanning all origins
+query I
+SELECT count(*) FROM p.big WHERE id BETWEEN 100 AND 299;
+----
+199
+
 statement ok
 DETACH p;
 
