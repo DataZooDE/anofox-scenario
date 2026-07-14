@@ -152,6 +152,45 @@ SELECT * FROM scenario_merge('lakescen');
 ----
 <REGEX>:.*already merged.*
 
+# --- keyless lake tables: bag deletes cannot merge back (codex finding #1) ----------
+
+statement ok
+CREATE TABLE lake.rawlog (line VARCHAR);
+
+statement ok
+INSERT INTO lake.rawlog VALUES ('a'), ('b');
+
+statement ok
+CALL scenario_create('lakebag', base := 'lake');
+
+statement ok
+ATTACH 'lakebag' AS lb (TYPE scenario);
+
+statement ok
+DELETE FROM lb.rawlog WHERE line = 'a';
+
+query I
+SELECT count(*) FROM lb.rawlog;
+----
+1
+
+statement error
+SELECT * FROM scenario_merge('lakebag');
+----
+<REGEX>:.*keyless.*key_columns.*
+
+# the lake was not touched by the refused merge
+query I
+SELECT count(*) FROM lake.rawlog;
+----
+2
+
+statement ok
+DETACH lb;
+
+statement ok
+CALL scenario_drop('lakebag');
+
 # --- cleanup ------------------------------------------------------------------------
 
 statement ok

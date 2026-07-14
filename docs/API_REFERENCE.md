@@ -64,6 +64,8 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | `scenario_diff` on keyless tables | requires a PK or `key_columns :=` |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
 | Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |
+| Unique values *vacated* by scenario deletes/updates are conservatively still treated as taken when a scenario write reuses them | rejected with a clean error |
+| Table or schema names containing `.` | rejected at `scenario_create` (naming-contract separator) |
 
 ## Function Reference
 

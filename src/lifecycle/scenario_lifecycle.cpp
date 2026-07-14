@@ -4,6 +4,7 @@
 #include "catalog/scenario_delta.hpp"
 #include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -246,21 +247,40 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		}
 	}
 	for (auto &base_table : base_tables) {
-		auto declared = bind_data.key_columns.find(ScenarioDelta::LogicalName(base_table.get()));
+		auto logical_name = ScenarioDelta::LogicalName(base_table.get());
+		auto declared = bind_data.key_columns.find(logical_name);
+		optional_ptr<DuckTableEntry> parent_delta;
+		if (parent) {
+			parent_delta =
+			    ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id, logical_name);
+		}
+		// Branches inherit the parent's delta SHAPE (declared key or keyless
+		// _count layout) - the parent rows are copied verbatim, so a
+		// different child shape would corrupt the changelog
+		vector<string> inherited_keys;
+		if (parent_delta && ScenarioDelta::GetPKColumns(base_table.get()).empty()) {
+			for (auto delta_col : ScenarioDelta::GetPKColumns(*parent_delta)) {
+				inherited_keys.push_back(
+				    base_table.get().GetColumn(LogicalIndex(delta_col - ScenarioDelta::PAYLOAD_START)).Name());
+			}
+			if (declared != bind_data.key_columns.end() && declared->second != inherited_keys) {
+				throw InvalidInputException(
+				    "key_columns for table '%s' differ from the parent scenario's declared key - branches "
+				    "inherit the parent's row identity",
+				    logical_name);
+			}
+		}
 		auto &delta = ScenarioDelta::EnsureDeltaTable(
 		    context, host_catalog, entry.scenario_id, base_table.get(),
-		    declared == bind_data.key_columns.end() ? nullptr : &declared->second);
+		    !inherited_keys.empty() ? &inherited_keys
+		                            : (declared == bind_data.key_columns.end() ? nullptr : &declared->second));
 		if (bind_data.mode == "materialized") {
 			ScenarioDelta::CreateMatTable(context, host_catalog, entry.scenario_id, base_table.get());
 		}
-		if (parent) {
-			// Branch: inherit the parent's modifications by copying its
-			// delta rows (cheap - deltas are small by invariant)
-			auto parent_delta = ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id,
-			                                                    ScenarioDelta::LogicalName(base_table.get()));
-			if (parent_delta) {
-				ScenarioDelta::CopyTableData(context, *parent_delta, delta);
-			}
+		if (parent_delta) {
+			// inherit the parent's modifications by copying its delta rows
+			// (cheap - deltas are small by invariant)
+			ScenarioDelta::CopyTableData(context, *parent_delta, delta);
 		}
 	}
 }

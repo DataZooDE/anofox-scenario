@@ -108,6 +108,61 @@ CALL scenario_create('bad2', key_columns := MAP {'with_pk': ['v']});
 ----
 <REGEX>:.*already has a PRIMARY KEY.*
 
+# --- branches inherit the parent's declared row identity (codex finding #4) --------
+
+statement ok
+CREATE TABLE readings (sensor VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO readings VALUES ('a', 1), ('b', 2);
+
+statement ok
+CALL scenario_create('kp', key_columns := MAP {'readings': ['sensor']});
+
+statement ok
+ATTACH 'kp' AS kp (TYPE scenario);
+
+statement ok
+UPDATE kp.readings SET val = 10 WHERE sensor = 'a';
+
+statement ok
+CALL scenario_create('kc', from_scenario := 'kp');
+
+statement ok
+ATTACH 'kc' AS kc (TYPE scenario);
+
+# the child sees the parent's change AND inherits the declared identity
+query I
+SELECT val FROM kc.readings WHERE sensor = 'a';
+----
+10
+
+statement ok
+UPDATE kc.readings SET val = 20 WHERE sensor = 'a';
+
+query I
+SELECT val FROM kc.readings WHERE sensor = 'a';
+----
+20
+
+# a conflicting redeclaration on a branch is rejected
+statement error
+CALL scenario_create('kc2', from_scenario := 'kp', key_columns := MAP {'readings': ['val']});
+----
+<REGEX>:.*inherit.*
+
+statement ok
+DETACH kc;
+
+statement ok
+DETACH kp;
+
+statement ok
+CALL scenario_drop('kc');
+
+statement ok
+CALL scenario_drop('kp');
+
 # --- cleanup --------------------------------------------------------------------------
 
 statement ok

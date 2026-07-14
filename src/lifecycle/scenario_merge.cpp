@@ -295,7 +295,18 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 		}
 
 		if (pk_columns.empty()) {
-			// keyless lake tables are insert-only: plain appends
+			// keyless bag deltas cannot be applied to a foreign base by SQL
+			// alone (deleting N of M identical rows needs rowids): refuse
+			// loudly instead of silently dropping the deletes
+			auto deletes = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'D'");
+			if (deletes > 0) {
+				con.Rollback();
+				throw NotImplementedException(
+				    "Cannot merge scenario '%s': keyless table '%s' has scenario deletes/updates, which cannot "
+				    "be applied to base catalog '%s'. Declare key_columns at scenario_create for keyed "
+				    "merge-back",
+				    entry.name, logical_name, entry.base_catalog);
+			}
 			auto inserted = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'I'");
 			if (inserted > 0) {
 				run("INSERT INTO " + base_ref + " SELECT " + payload_cols + " FROM " + delta_ref +

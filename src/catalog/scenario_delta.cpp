@@ -40,6 +40,13 @@ string ScenarioDelta::MatTableName(int64_t scenario_id, const string &table_name
 
 string ScenarioDelta::LogicalName(const TableCatalogEntry &table) {
 	auto &schema_name = table.ParentSchema().name;
+	// '.' is the (schema, table) separator of the naming contract; names
+	// containing it would re-parse wrong in diff/preview/merge
+	if (table.name.find('.') != string::npos || schema_name.find('.') != string::npos) {
+		throw NotImplementedException(
+		    "Table or schema names containing '.' are not supported in scenarios (table '%s', schema '%s')",
+		    table.name, schema_name);
+	}
 	if (schema_name == DEFAULT_SCHEMA) {
 		return table.name;
 	}

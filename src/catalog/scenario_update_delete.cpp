@@ -16,7 +16,10 @@
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/planner/constraints/bound_unique_constraint.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
@@ -46,9 +49,15 @@ public:
 	vector<idx_t> pk_columns;
 	//! Keys already written by this statement (double-touch detection)
 	unordered_set<string> touched_keys;
-	//! Base-side unique/PK verification (PK-moving updates)
+	//! Base-side PK verification (PK-moving updates claim a new key)
 	vector<unique_ptr<BoundConstraint>> base_constraints;
 	unique_ptr<ConstraintState> base_constraint_state;
+	//! Base-side secondary UNIQUE verification: probed only for rows whose
+	//! unique values CHANGED (self-matches must not reject)
+	vector<unique_ptr<BoundConstraint>> base_secondary_constraints;
+	unique_ptr<ConstraintState> base_secondary_state;
+	//! Logical column sets of the base's secondary UNIQUE constraints
+	vector<vector<idx_t>> secondary_unique_sets;
 	//! RETURNING: collected result rows
 	unique_ptr<ColumnDataCollection> return_collection;
 	idx_t affected_count = 0;
@@ -75,16 +84,34 @@ public:
 		if (entry.base_entry.IsDuckTable()) {
 			auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
 			auto all_base_constraints = binder->BindConstraints(base_duck);
-			// Base probe = unique/PK collisions ONLY. NOT NULL/CHECK are
+			// Base probes = unique collisions ONLY. NOT NULL/CHECK are
 			// evaluated by the sink itself, and FK constraints must NOT be
 			// checked against the base alone: a referenced parent row may
 			// exist only in the scenario (FKs are enforced at merge-back).
+			// PK and secondary UNIQUEs are split: new keys always probe the
+			// PK; secondary values probe only when they CHANGED (probing an
+			// unchanged value would match the row itself).
 			for (auto &constraint : all_base_constraints) {
-				if (constraint->type == ConstraintType::UNIQUE) {
+				if (constraint->type != ConstraintType::UNIQUE) {
+					continue;
+				}
+				auto &bound_unique = constraint->Cast<BoundUniqueConstraint>();
+				if (bound_unique.is_primary_key) {
 					base_constraints.push_back(std::move(constraint));
+				} else {
+					vector<idx_t> unique_set;
+					for (auto &key : bound_unique.keys) {
+						unique_set.push_back(key.index);
+					}
+					secondary_unique_sets.push_back(std::move(unique_set));
+					base_secondary_constraints.push_back(std::move(constraint));
 				}
 			}
 			base_constraint_state = base_duck.GetStorage().InitializeConstraintState(base_duck, base_constraints);
+			if (!base_secondary_constraints.empty()) {
+				base_secondary_state =
+				    base_duck.GetStorage().InitializeConstraintState(base_duck, base_secondary_constraints);
+			}
 		}
 		pk_columns = entry.key_columns;
 		if (!pk_columns.empty()) {
@@ -94,7 +121,42 @@ public:
 		delta_chunk.Initialize(Allocator::Get(client), delta_ptr->GetStorage().GetTypes());
 	}
 
-	//! Verify rows (full table layout) against the base's unique constraints
+	//! Probe the base table's unique ART indexes with rows in full table
+	//! layout. primary_key=true probes only the PK index (new keys must be
+	//! free); false probes only the secondary UNIQUE indexes (used for rows
+	//! whose unique values changed - unchanged values would match themselves).
+	void ProbeBaseIndexes(ClientContext &client, ScenarioTableEntry &entry, DataChunk &verify_chunk,
+	                      bool primary_key) {
+		auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
+		auto &data_table = base_duck.GetStorage();
+		unordered_set<column_t> pk_set(pk_columns.begin(), pk_columns.end());
+		auto &index_list = data_table.GetDataTableInfo()->GetIndexes();
+		for (auto &index_entry : index_list.IndexEntries()) {
+			auto &index = *index_entry.index;
+			if (!index.IsUnique() || index.GetIndexType() != ART::TYPE_NAME || !index.IsBound()) {
+				continue;
+			}
+			auto &column_set = index.GetColumnIdSet();
+			bool is_pk_index = column_set.size() == pk_set.size();
+			if (is_pk_index) {
+				for (auto col : column_set) {
+					if (pk_set.find(col) == pk_set.end()) {
+						is_pk_index = false;
+						break;
+					}
+				}
+			}
+			if (is_pk_index != primary_key) {
+				continue;
+			}
+			auto &art = index.Cast<ART>();
+			lock_guard<mutex> guard(index_entry.lock);
+			IndexAppendInfo index_append_info;
+			art.VerifyAppend(verify_chunk, index_append_info, nullptr);
+		}
+	}
+
+	//! Verify rows (full table layout) against the base's PRIMARY KEY
 	void VerifyAgainstBase(ClientContext &client, ScenarioTableEntry &entry, DataChunk &full_chunk,
 	                       SelectionVector &sel, idx_t count) {
 		if (count == 0 || !base_constraint_state) {
@@ -104,10 +166,8 @@ public:
 		verify_chunk.Initialize(Allocator::Get(client), entry.GetTypes());
 		verify_chunk.Reference(full_chunk);
 		verify_chunk.Slice(sel, count);
-		auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
 		try {
-			base_duck.GetStorage().VerifyAppendConstraints(*base_constraint_state, client, verify_chunk, nullptr,
-			                                               nullptr);
+			ProbeBaseIndexes(client, entry, verify_chunk, true);
 		} catch (ConstraintException &) {
 			throw ConstraintException(
 			    "Duplicate key violates primary key constraint on scenario table \"%s\": the key exists in the "
@@ -121,6 +181,46 @@ public:
 			throw InvalidInputException(
 			    "Scenario %s modified the same row twice within one statement - this is not supported (v1)", verb);
 		}
+	}
+
+	//! Fetch full base rows by rowid (old values for changed-unique checks)
+	vector<vector<Value>> FetchBaseRows(ClientContext &client, ScenarioTableEntry &entry,
+	                                    const vector<row_t> &row_ids) {
+		vector<vector<Value>> result;
+		if (row_ids.empty()) {
+			return result;
+		}
+		auto column_count = entry.GetColumns().LogicalColumnCount();
+		auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
+		auto &storage = base_duck.GetStorage();
+		auto &transaction = DuckTransaction::Get(client, base_duck.catalog);
+		vector<StorageIndex> fetch_columns;
+		vector<LogicalType> fetch_types;
+		for (idx_t col = 0; col < column_count; col++) {
+			fetch_columns.emplace_back(col);
+			fetch_types.push_back(entry.GetColumn(LogicalIndex(col)).Type());
+		}
+		idx_t offset = 0;
+		while (offset < row_ids.size()) {
+			idx_t batch = MinValue<idx_t>(row_ids.size() - offset, STANDARD_VECTOR_SIZE);
+			DataChunk fetched;
+			fetched.Initialize(Allocator::Get(client), fetch_types);
+			Vector fetch_rowids(LogicalType::ROW_TYPE, batch);
+			for (idx_t i = 0; i < batch; i++) {
+				fetch_rowids.SetValue(i, Value::BIGINT(row_ids[offset + i]));
+			}
+			ColumnFetchState fetch_state;
+			storage.Fetch(transaction, fetched, fetch_columns, fetch_rowids, batch, fetch_state);
+			for (idx_t i = 0; i < batch; i++) {
+				vector<Value> row_values;
+				for (idx_t col = 0; col < column_count; col++) {
+					row_values.push_back(fetched.GetValue(col, i));
+				}
+				result.push_back(std::move(row_values));
+			}
+			offset += batch;
+		}
+		return result;
 	}
 
 	//! Fetch the full payload of delta rows by rowid (before deleting them),
@@ -389,6 +489,15 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 	vector<row_t> rows_to_remove;
 	SelectionVector base_verify_sel(chunk.size());
 	idx_t base_verify_count = 0;
+	// rows whose secondary-unique values must be compared old vs new
+	struct SecCandidate {
+		idx_t row;
+		int8_t origin;
+		row_t old_row_id;
+	};
+	vector<SecCandidate> sec_candidates;
+	bool check_secondary = gstate.base_secondary_state != nullptr;
+	idx_t base_rowid_pos = row_id_start + 1 + gstate.pk_columns.size();
 	auto null_payload_row = [&](DataChunk &keys_chunk, const vector<idx_t> &positions, idx_t row) {
 		vector<Value> row_values;
 		for (idx_t col = 0; col < column_count; col++) {
@@ -416,6 +525,9 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 		if (new_key == old_key) {
 			if (origin == 0) {
 				// base row: record the update in the delta
+				if (check_secondary) {
+					sec_candidates.push_back({i, 0, chunk.GetValue(base_rowid_pos, i).GetValue<row_t>()});
+				}
 				append_ops.push_back('U');
 				append_rows.push_back(std::move(row_values));
 				ScenarioDeltaKeyInfo info;
@@ -429,6 +541,9 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 				if (existing == gstate.delta_keys.keys.end()) {
 					throw InternalException("anofox_scenario: delta row for updated key not found in key map");
 				}
+				if (check_secondary) {
+					sec_candidates.push_back({i, 1, existing->second.row_id});
+				}
 				rows_to_remove.push_back(existing->second.row_id);
 				append_ops.push_back(existing->second.op);
 				append_rows.push_back(std::move(row_values));
@@ -440,6 +555,12 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 
 		// --- PK move ------------------------------------------------------
 		gstate.CheckDoubleTouch(new_key, "UPDATE");
+		if (check_secondary) {
+			if (origin == 0) {
+				sec_candidates.push_back({i, 0, chunk.GetValue(base_rowid_pos, i).GetValue<row_t>()});
+			}
+			// origin==1 handled below once the old delta row is resolved
+		}
 		// old side: vacate the key
 		if (origin == 0) {
 			append_ops.push_back('D');
@@ -452,6 +573,9 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 			auto existing = gstate.delta_keys.keys.find(old_key);
 			if (existing == gstate.delta_keys.keys.end()) {
 				throw InternalException("anofox_scenario: delta row for moved key not found in key map");
+			}
+			if (check_secondary) {
+				sec_candidates.push_back({i, 1, existing->second.row_id});
 			}
 			rows_to_remove.push_back(existing->second.row_id);
 			if (existing->second.op == 'U') {
@@ -490,6 +614,66 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 			gstate.delta_keys.keys[new_key] = info;
 		}
 		gstate.affected_count++;
+	}
+	// Secondary UNIQUEs: probe the base only for rows whose unique values
+	// actually changed (an unchanged value would match the row itself). A
+	// value held by a base row the scenario vacated is still rejected -
+	// conservative, documented.
+	if (check_secondary && !sec_candidates.empty()) {
+		vector<row_t> base_ids, delta_ids;
+		vector<idx_t> base_slots, delta_slots;
+		for (auto &cand : sec_candidates) {
+			if (cand.origin == 0) {
+				base_ids.push_back(cand.old_row_id);
+				base_slots.push_back(cand.row);
+			} else {
+				delta_ids.push_back(cand.old_row_id);
+				delta_slots.push_back(cand.row);
+			}
+		}
+		auto base_old = gstate.FetchBaseRows(client, entry, base_ids);
+		auto delta_old = gstate.FetchDeltaRows(client, entry, delta_ids);
+		vector<const vector<Value> *> old_rows(chunk.size(), nullptr);
+		for (idx_t i = 0; i < base_slots.size(); i++) {
+			old_rows[base_slots[i]] = &base_old[i];
+		}
+		for (idx_t i = 0; i < delta_slots.size(); i++) {
+			old_rows[delta_slots[i]] = &delta_old[i];
+		}
+		SelectionVector probe_sel(chunk.size());
+		idx_t probe_count = 0;
+		for (auto &cand : sec_candidates) {
+			auto &old_row = *old_rows[cand.row];
+			bool changed = false;
+			for (auto &unique_set : gstate.secondary_unique_sets) {
+				for (auto col : unique_set) {
+					if (ValueOperations::DistinctFrom(old_row[col], full_chunk.GetValue(col, cand.row))) {
+						changed = true;
+						break;
+					}
+				}
+				if (changed) {
+					break;
+				}
+			}
+			if (changed) {
+				probe_sel.set_index(probe_count++, cand.row);
+			}
+		}
+		if (probe_count > 0) {
+			DataChunk verify_chunk;
+			verify_chunk.Initialize(Allocator::Get(client), entry.GetTypes());
+			verify_chunk.Reference(full_chunk);
+			verify_chunk.Slice(probe_sel, probe_count);
+			try {
+				gstate.ProbeBaseIndexes(client, entry, verify_chunk, false);
+			} catch (ConstraintException &) {
+				throw ConstraintException(
+				    "Duplicate value violates a UNIQUE constraint on scenario table \"%s\": the value exists in "
+				    "the base table",
+				    entry.name);
+			}
+		}
 	}
 	gstate.VerifyAgainstBase(client, entry, full_chunk, base_verify_sel, base_verify_count);
 	auto removed_rows = gstate.FetchDeltaRows(client, entry, rows_to_remove);
