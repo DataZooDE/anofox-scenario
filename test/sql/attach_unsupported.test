@@ -16,17 +16,20 @@ CALL scenario_create('u');
 statement ok
 ATTACH 'u' AS s (TYPE scenario);
 
-# DELETE ... RETURNING (INSERT/UPDATE RETURNING are supported since v0.4)
-statement error
-DELETE FROM s.forecast WHERE id = 1 RETURNING id;
+# DELETE ... RETURNING is supported since v0.4.1 (see attach_returning.test)
+query II
+DELETE FROM s.forecast WHERE id = 1 RETURNING id, qty;
 ----
-<REGEX>:.*RETURNING.*DELETE.*not supported.*
+1	100
 
-# RETURNING on MERGE stays gated
-statement error
-MERGE INTO s.forecast USING (SELECT 1 AS id, 1 AS qty) src ON s.forecast.id = src.id WHEN MATCHED THEN UPDATE SET qty = src.qty RETURNING *;
+statement ok
+INSERT INTO s.forecast VALUES (1, 100);
+
+# RETURNING on MERGE is supported since v0.4.1 (see attach_merge.test)
+query ITT
+MERGE INTO s.forecast USING (SELECT 1 AS id, 1 AS qty) src ON s.forecast.id = src.id WHEN MATCHED THEN UPDATE SET qty = src.qty RETURNING id, qty, merge_action;
 ----
-<REGEX>:.*RETURNING.*MERGE.*not supported.*
+1	1	UPDATE
 
 # the table is still writable through the supported surface
 statement ok

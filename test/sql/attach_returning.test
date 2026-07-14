@@ -48,12 +48,44 @@ UPDATE s.forecast SET qty = 501 WHERE id = 10 RETURNING id, qty;
 ----
 10	501
 
-# --- DELETE ... RETURNING stays gated (fetch-by-PK lands later) --------------------
+# --- DELETE ... RETURNING -----------------------------------------------------------
 
-statement error
-DELETE FROM s.forecast WHERE id = 1 RETURNING id;
+# base row: returned values come from the base table
+query ITI
+DELETE FROM s.forecast WHERE id = 3 RETURNING id, region, qty;
 ----
-<REGEX>:.*RETURNING.*DELETE.*not supported.*
+3	APAC	300
+
+# scenario-inserted row: values come from the delta
+query ITI
+DELETE FROM s.forecast WHERE id = 11 RETURNING id, region, qty;
+----
+11	MEA	50
+
+# scenario-updated row: RETURNING reflects the updated (visible) values
+query II
+DELETE FROM s.forecast WHERE id = 1 RETURNING id, qty;
+----
+1	101
+
+# expression over returned columns; multi-row delete
+query I rowsort
+DELETE FROM s.forecast WHERE id IN (10, 12) RETURNING id + qty;
+----
+511
+NULL
+
+# deletes actually happened
+query I
+SELECT count(*) FROM s.forecast;
+----
+1
+
+# put back the rows the rest of the flow expects (delete + re-insert lands as
+# U over the tombstones for base keys, fresh I rows for scenario keys)
+statement ok
+INSERT INTO s.forecast VALUES (1, 'EU', 101), (3, 'APAC', 300),
+                              (10, 'LATAM', 501), (11, 'MEA', 50), (12, NULL, NULL);
 
 # --- PK-column updates: delete + insert semantics (WP5.3) ---------------------------
 

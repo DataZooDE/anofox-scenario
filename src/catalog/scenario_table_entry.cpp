@@ -66,6 +66,11 @@ vector<column_t> ScenarioTableEntry::GetRowIdColumns() const {
 	for (idx_t k = 0; k < pk_columns.size(); k++) {
 		result.push_back(SCENARIO_KEY_COLUMN_START + k);
 	}
+	if (base_entry.IsDuckTable()) {
+		// base rowid trails the identity columns: DELETE ... RETURNING fetches
+		// the doomed base rows by rowid (delta rows carry NULL here)
+		result.push_back(COLUMN_IDENTIFIER_ROW_ID);
+	}
 	return result;
 }
 

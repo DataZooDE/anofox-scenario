@@ -24,7 +24,9 @@
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/delete_state.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table/update_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
 
 namespace duckdb {
 
@@ -286,7 +288,8 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 	ScenarioVerifyNotNullAndCheck(client, entry, bound_constraints, full_chunk);
 
 	// Row identity: [__scenario_origin, __scenario_key_0..n-1]
-	idx_t row_id_count = 1 + gstate.pk_columns.size();
+	// [__scenario_origin, __scenario_key_0..n-1, (duck bases) rowid]
+	idx_t row_id_count = entry.GetRowIdColumns().size();
 	idx_t row_id_start =
 	    explicit_row_id_start.IsValid() ? explicit_row_id_start.GetIndex() : chunk.ColumnCount() - row_id_count;
 	vector<idx_t> old_key_positions;
@@ -480,14 +483,16 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 class PhysicalScenarioDelete : public PhysicalOperator {
 public:
 	PhysicalScenarioDelete(PhysicalPlan &physical_plan, vector<LogicalType> types, ScenarioTableEntry &entry,
-	                       idx_t row_id_start, idx_t estimated_cardinality)
+	                       idx_t row_id_start, idx_t estimated_cardinality, bool return_chunk)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-	      entry(entry), row_id_start(row_id_start) {
+	      entry(entry), row_id_start(row_id_start), return_chunk(return_chunk) {
 	}
 
 	ScenarioTableEntry &entry;
-	//! Position of __scenario_origin in the child chunk; keys follow
+	//! Position of __scenario_origin in the child chunk; keys follow, then
+	//! (duck bases) the base rowid
 	idx_t row_id_start;
+	bool return_chunk;
 
 public:
 	string GetName() const override {
@@ -507,14 +512,14 @@ public:
 	bool IsSource() const override {
 		return true;
 	}
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		return make_uniq<ScenarioDMLSourceState>();
+	}
 
 protected:
 	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
 	                                 OperatorSourceInput &input) const override {
-		auto &gstate = sink_state->Cast<ScenarioDMLGlobalState>();
-		chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.affected_count)));
-		chunk.SetCardinality(1);
-		return SourceResultType::FINISHED;
+		return ScenarioDMLGetData(sink_state->Cast<ScenarioDMLGlobalState>(), return_chunk, chunk, input);
 	}
 };
 
@@ -533,6 +538,63 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 
 	entry.GetScenarioCatalog().MarkHostWrite(client, DatabaseModificationType::DELETE_DATA |
 	                                                     DatabaseModificationType::INSERT_DATA);
+
+	// RETURNING: fetch the visible values of the doomed rows *before* the
+	// delta is mutated. Base rows come by rowid (trails the keys in the child
+	// chunk); scenario rows come from their delta row (full payload for I/U).
+	vector<vector<Value>> returning_rows;
+	if (return_chunk) {
+		returning_rows.resize(chunk.size());
+		idx_t rowid_pos = row_id_start + 1 + gstate.pk_columns.size();
+		vector<row_t> base_rowids, delta_rowids;
+		vector<idx_t> base_slots, delta_slots;
+		for (idx_t i = 0; i < chunk.size(); i++) {
+			auto origin = chunk.GetValue(row_id_start, i).GetValue<int8_t>();
+			if (origin == 0) {
+				base_rowids.push_back(chunk.GetValue(rowid_pos, i).GetValue<row_t>());
+				base_slots.push_back(i);
+			} else {
+				auto key = ScenarioDelta::MakeKey(chunk, i, key_positions);
+				auto existing = gstate.delta_keys.keys.find(key);
+				if (existing == gstate.delta_keys.keys.end()) {
+					throw InternalException("anofox_scenario: delta row for deleted key not found in key map");
+				}
+				delta_rowids.push_back(existing->second.row_id);
+				delta_slots.push_back(i);
+			}
+		}
+		auto fetch_rows = [&](TableCatalogEntry &table, const vector<row_t> &rowids, idx_t first_storage_col,
+		                      const vector<idx_t> &slots) {
+			if (rowids.empty()) {
+				return;
+			}
+			auto &storage = table.GetStorage();
+			auto &transaction = DuckTransaction::Get(client, table.catalog);
+			vector<StorageIndex> fetch_columns;
+			vector<LogicalType> fetch_types;
+			for (idx_t col = 0; col < column_count; col++) {
+				fetch_columns.emplace_back(first_storage_col + col);
+				fetch_types.push_back(entry.GetColumn(LogicalIndex(col)).Type());
+			}
+			DataChunk fetched;
+			fetched.Initialize(Allocator::Get(client), fetch_types);
+			Vector fetch_rowids(LogicalType::ROW_TYPE, rowids.size());
+			for (idx_t i = 0; i < rowids.size(); i++) {
+				fetch_rowids.SetValue(i, Value::BIGINT(rowids[i]));
+			}
+			ColumnFetchState fetch_state;
+			storage.Fetch(transaction, fetched, fetch_columns, fetch_rowids, rowids.size(), fetch_state);
+			for (idx_t i = 0; i < rowids.size(); i++) {
+				vector<Value> row_values;
+				for (idx_t col = 0; col < column_count; col++) {
+					row_values.push_back(fetched.GetValue(col, i));
+				}
+				returning_rows[slots[i]] = std::move(row_values);
+			}
+		};
+		fetch_rows(entry.base_entry, base_rowids, 0, base_slots);
+		fetch_rows(*gstate.delta_table, delta_rowids, ScenarioDelta::PAYLOAD_START, delta_slots);
+	}
 
 	vector<char> append_ops;
 	vector<vector<Value>> append_rows;
@@ -591,6 +653,21 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 	}
 	gstate.FlushDeletes(client, rows_to_remove);
 	gstate.FlushAppends(client, entry, append_ops, append_rows, rows_to_remove, removed_keys);
+
+	if (return_chunk) {
+		if (!gstate.return_collection) {
+			gstate.return_collection = make_uniq<ColumnDataCollection>(client, entry.GetTypes());
+		}
+		DataChunk out_chunk;
+		out_chunk.Initialize(Allocator::Get(client), entry.GetTypes());
+		for (idx_t i = 0; i < returning_rows.size(); i++) {
+			for (idx_t col = 0; col < column_count; col++) {
+				out_chunk.SetValue(col, i, returning_rows[i][col]);
+			}
+		}
+		out_chunk.SetCardinality(returning_rows.size());
+		gstate.return_collection->Append(out_chunk);
+	}
 	return SinkResultType::NEED_MORE_INPUT;
 }
 
@@ -610,8 +687,9 @@ PhysicalOperator &MakeScenarioUpdateOperator(PhysicalPlanGenerator &planner, vec
 
 PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                              ScenarioTableEntry &entry, idx_t row_id_start,
-                                             idx_t estimated_cardinality) {
-	return planner.Make<PhysicalScenarioDelete>(std::move(types), entry, row_id_start, estimated_cardinality);
+                                             idx_t estimated_cardinality, bool return_chunk) {
+	return planner.Make<PhysicalScenarioDelete>(std::move(types), entry, row_id_start, estimated_cardinality,
+	                                            return_chunk);
 }
 
 //===----------------------------------------------------------------------===//
@@ -636,17 +714,18 @@ PhysicalOperator &ScenarioCatalog::PlanUpdate(ClientContext &context, PhysicalPl
 PhysicalOperator &ScenarioCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalDelete &op, PhysicalOperator &plan) {
 	ThrowIfFrozen(context, "DELETE");
-	if (op.return_chunk) {
-		throw NotImplementedException(
-		    "RETURNING on DELETE from scenario tables is not supported yet (planned for v0.4.1)");
-	}
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
+	if (op.return_chunk && !entry.base_entry.IsDuckTable()) {
+		throw NotImplementedException("DELETE ... RETURNING on scenarios over non-DuckDB bases (e.g. DuckLake) is "
+		                              "not supported yet - SELECT the rows before deleting them");
+	}
 	if (entry.key_columns.empty()) {
 		throw NotImplementedException("UPDATE/DELETE in scenarios requires a PRIMARY KEY on the base table or "
 		                              "key_columns declared at scenario_create (v1 limitation)");
 	}
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
-	auto &del = planner.Make<PhysicalScenarioDelete>(op.types, entry, bound_ref.index, op.estimated_cardinality);
+	auto &del = planner.Make<PhysicalScenarioDelete>(op.types, entry, bound_ref.index, op.estimated_cardinality,
+	                                                 op.return_chunk);
 	del.children.push_back(plan);
 	return del;
 }
