@@ -98,6 +98,24 @@ SELECT count(*) FROM sb.forecast WHERE id = 1;
 ----
 0
 
+# two scenarios read in ONE statement stay distinct (the common-subplan
+# optimizer dedups operators by serialization; the scan must serialize its
+# scenario identity or both sides silently return the first world's rows)
+query TI rowsort
+SELECT 'a' AS w, sum(qty)::INTEGER FROM sa.forecast
+UNION ALL
+SELECT 'b', sum(qty)::INTEGER FROM sb.forecast;
+----
+a	2012
+b	2901
+
+# and a same-statement join across the two worlds
+query II
+SELECT count(*), count(b.id)
+FROM sa.forecast a LEFT JOIN sb.forecast b ON a.id = b.id;
+----
+5	3
+
 statement ok
 DETACH sa;
 
