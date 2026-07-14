@@ -45,7 +45,7 @@ virtual_column_map_t ScenarioTableEntry::GetVirtualColumns() const {
 	auto result = TableCatalogEntry::GetVirtualColumns(); // rowid
 	result.insert(
 	    make_pair(SCENARIO_ORIGIN_COLUMN_ID, TableColumn("__scenario_origin", LogicalType::TINYINT)));
-	auto pk_columns = ScenarioDelta::GetPKColumns(base_entry);
+	auto &pk_columns = key_columns;
 	for (idx_t k = 0; k < pk_columns.size(); k++) {
 		auto &column = GetColumn(LogicalIndex(pk_columns[k]));
 		result.insert(make_pair(SCENARIO_KEY_COLUMN_START + k,
@@ -55,7 +55,7 @@ virtual_column_map_t ScenarioTableEntry::GetVirtualColumns() const {
 }
 
 vector<column_t> ScenarioTableEntry::GetRowIdColumns() const {
-	auto pk_columns = ScenarioDelta::GetPKColumns(base_entry);
+	auto &pk_columns = key_columns;
 	if (pk_columns.empty()) {
 		// no-PK tables: default rowid identity; PlanUpdate/PlanDelete throw
 		// the v1 limitation error before it is ever used

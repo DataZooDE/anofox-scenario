@@ -175,7 +175,7 @@ protected:
 
 unique_ptr<GlobalSinkState> PhysicalScenarioInsert::GetGlobalSinkState(ClientContext &context) const {
 	auto result = make_uniq<ScenarioInsertGlobalState>();
-	result->pk_columns = ScenarioDelta::GetPKColumns(entry.base_entry);
+	result->pk_columns = entry.key_columns;
 	return std::move(result);
 }
 

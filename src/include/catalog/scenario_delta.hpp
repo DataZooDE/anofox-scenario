@@ -39,9 +39,12 @@ public:
 	//! The materialized base copy for a scenario table, if any
 	static optional_ptr<DuckTableEntry> TryGetMatTable(ClientContext &context, Catalog &host_catalog,
 	                                                   int64_t scenario_id, const string &table_name);
-	//! Create the delta table lazily (caller's transaction); returns it
+	//! Create the delta table lazily (caller's transaction); returns it.
+	//! declared_keys (tables without a PK) become the delta's PRIMARY KEY -
+	//! that constraint IS the persisted key declaration.
 	static DuckTableEntry &EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-	                                        TableCatalogEntry &base_entry);
+	                                        TableCatalogEntry &base_entry,
+	                                        const vector<string> *declared_keys = nullptr);
 	//! Create the materialized copy of a base table (schema incl. PK) and
 	//! bulk-copy its rows, all in the caller's transaction
 	static DuckTableEntry &CreateMatTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
@@ -53,6 +56,10 @@ public:
 
 	//! Logical column ids of the base table's PRIMARY KEY (empty when none)
 	static vector<idx_t> GetPKColumns(const TableCatalogEntry &base_entry);
+	//! Row identity for a scenario table: the base PK, or the key columns
+	//! declared at scenario_create (persisted as the delta table's PK)
+	static vector<idx_t> GetKeyColumns(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                                   const string &logical_name, TableCatalogEntry &base_entry);
 
 	//! Serialize the key columns of a row into a canonical comparable string
 	//! (length-prefixed, NULL-tagged). Used for suppression sets and the

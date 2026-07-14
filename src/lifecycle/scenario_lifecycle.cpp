@@ -52,6 +52,8 @@ struct LifecycleBindData : public TableFunctionData {
 	string from_scenario;
 	//! Phase 4: attached catalog serving as the base (empty = host default)
 	string base_catalog;
+	//! Declared row identity for keyless tables: table -> key column names
+	map<string, vector<string>> key_columns;
 };
 
 struct LifecycleGlobalState : public GlobalTableFunctionState {
@@ -90,6 +92,20 @@ unique_ptr<FunctionData> LifecycleBind(TableFunctionBindInput &input, vector<Log
 			result->from_scenario = param.second.GetValue<string>();
 		} else if (param.first == "base") {
 			result->base_catalog = param.second.GetValue<string>();
+		} else if (param.first == "key_columns") {
+			// MAP {'table': ['col', ...], ...}
+			for (auto &map_entry : ListValue::GetChildren(param.second)) {
+				auto &kv = StructValue::GetChildren(map_entry);
+				auto table_name = kv[0].GetValue<string>();
+				vector<string> columns;
+				for (auto &col : ListValue::GetChildren(kv[1])) {
+					columns.push_back(col.GetValue<string>());
+				}
+				if (columns.empty()) {
+					throw InvalidInputException("key_columns for table '%s' must not be empty", table_name);
+				}
+				result->key_columns[table_name] = std::move(columns);
+			}
 		}
 	}
 	if (!result->base_catalog.empty() && (result->mode == "materialized" || !result->from_scenario.empty())) {
@@ -187,9 +203,34 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		}
 		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
 	});
+	// validate declared keys up front (typo safety)
+	for (auto &declared : bind_data.key_columns) {
+		bool table_found = false;
+		for (auto &base_table : base_tables) {
+			if (base_table.get().name != declared.first) {
+				continue;
+			}
+			table_found = true;
+			if (base_table.get().HasPrimaryKey()) {
+				throw InvalidInputException(
+				    "key_columns declared for table '%s', but it already has a PRIMARY KEY", declared.first);
+			}
+			for (auto &column_name : declared.second) {
+				if (!base_table.get().ColumnExists(column_name)) {
+					throw InvalidInputException("key_columns for table '%s': column '%s' does not exist",
+					                            declared.first, column_name);
+				}
+			}
+		}
+		if (!table_found) {
+			throw InvalidInputException("key_columns declared for unknown table '%s'", declared.first);
+		}
+	}
 	for (auto &base_table : base_tables) {
-		auto &delta =
-		    ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry.scenario_id, base_table.get());
+		auto declared = bind_data.key_columns.find(base_table.get().name);
+		auto &delta = ScenarioDelta::EnsureDeltaTable(
+		    context, host_catalog, entry.scenario_id, base_table.get(),
+		    declared == bind_data.key_columns.end() ? nullptr : &declared->second);
 		if (bind_data.mode == "materialized") {
 			ScenarioDelta::CreateMatTable(context, host_catalog, entry.scenario_id, base_table.get());
 		}
@@ -415,6 +456,8 @@ TableFunctionSet MakeVerbSet(const string &name, table_function_t function, bool
 		one_arg.named_parameters["mode"] = LogicalType::VARCHAR;
 		one_arg.named_parameters["from_scenario"] = LogicalType::VARCHAR;
 		one_arg.named_parameters["base"] = LogicalType::VARCHAR;
+		one_arg.named_parameters["key_columns"] =
+		    LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
 	}
 	set.AddFunction(one_arg);
 	if (is_create) {
@@ -423,6 +466,8 @@ TableFunctionSet MakeVerbSet(const string &name, table_function_t function, bool
 		two_arg.named_parameters["mode"] = LogicalType::VARCHAR;
 		two_arg.named_parameters["from_scenario"] = LogicalType::VARCHAR;
 		two_arg.named_parameters["base"] = LogicalType::VARCHAR;
+		two_arg.named_parameters["key_columns"] =
+		    LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
 		set.AddFunction(two_arg);
 	}
 	return set;

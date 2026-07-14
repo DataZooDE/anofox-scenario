@@ -120,7 +120,7 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 }
 
 DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-                                                TableCatalogEntry &base_entry) {
+                                                TableCatalogEntry &base_entry, const vector<string> *declared_keys) {
 	auto existing = TryGetDeltaTable(context, host_catalog, scenario_id, base_entry.name);
 	if (existing) {
 		return *existing;
@@ -142,13 +142,17 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TS_COL)));
 
 	// The base PK becomes the delta PK: one delta row per user-visible key.
-	// (No-PK tables get no delta PK; they are insert-only in v1.)
+	// Tables without a PK may declare one via key_columns := at create;
+	// otherwise they stay insert-only.
 	auto pk_columns = GetPKColumns(base_entry);
 	if (!pk_columns.empty()) {
 		vector<string> pk_names;
 		for (auto col_id : pk_columns) {
 			pk_names.push_back(base_entry.GetColumn(LogicalIndex(col_id)).Name());
 		}
+		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
+	} else if (declared_keys && !declared_keys->empty()) {
+		vector<string> pk_names = *declared_keys;
 		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
 	}
 	host_catalog.CreateTable(context, std::move(info));
@@ -174,6 +178,28 @@ vector<idx_t> ScenarioDelta::GetPKColumns(const TableCatalogEntry &base_entry) {
 	}
 	for (auto &name : unique.GetColumnNames()) {
 		result.push_back(columns.GetColumn(name).Logical().index);
+	}
+	return result;
+}
+
+vector<idx_t> ScenarioDelta::GetKeyColumns(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                           const string &logical_name, TableCatalogEntry &base_entry) {
+	auto pk_columns = GetPKColumns(base_entry);
+	if (!pk_columns.empty()) {
+		return pk_columns;
+	}
+	// no base PK: a declared key lives as the delta table's PRIMARY KEY
+	auto delta = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
+	if (!delta) {
+		return {};
+	}
+	auto delta_pk = GetPKColumns(*delta);
+	vector<idx_t> result;
+	for (auto delta_col : delta_pk) {
+		if (delta_col < PAYLOAD_START) {
+			throw InternalException("anofox_scenario: delta PK references a metadata column");
+		}
+		result.push_back(delta_col - PAYLOAD_START);
 	}
 	return result;
 }

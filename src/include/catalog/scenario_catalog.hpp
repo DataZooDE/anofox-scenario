@@ -72,6 +72,9 @@ public:
 
 	//! The base table in the host catalog this entry mirrors
 	TableCatalogEntry &base_entry;
+	//! Row identity: base PK or the key declared at scenario_create
+	//! (resolved at entry construction; empty = keyless, insert-only DML)
+	vector<idx_t> key_columns;
 
 public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;

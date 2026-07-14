@@ -85,9 +85,9 @@ PhysicalOperator &ScenarioCatalog::PlanMergeInto(ClientContext &context, Physica
                                                  LogicalMergeInto &op, PhysicalOperator &plan) {
 	ThrowIfFrozen(context, "MERGE INTO");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
-	if (ScenarioDelta::GetPKColumns(entry.base_entry).empty()) {
-		throw NotImplementedException(
-		    "MERGE INTO / ON CONFLICT in scenarios requires a PRIMARY KEY on the base table (v1 limitation)");
+	if (entry.key_columns.empty()) {
+		throw NotImplementedException("MERGE INTO / ON CONFLICT in scenarios requires a PRIMARY KEY on the base "
+		                              "table or key_columns declared at scenario_create (v1 limitation)");
 	}
 	if (op.return_chunk) {
 		throw NotImplementedException(

@@ -91,7 +91,8 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 		if (!base_entry) {
 			continue; // base table vanished; scenario_merge reports the error
 		}
-		auto pk_columns = ScenarioDelta::GetPKColumns(*base_entry);
+		auto pk_columns =
+		    ScenarioDelta::GetKeyColumns(context, host, entry->scenario_id, logical_name, *base_entry);
 		string key_expr, pk_match;
 		if (pk_columns.empty()) {
 			key_expr = "CAST('(row)' AS VARCHAR)";
@@ -268,7 +269,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			    "Cannot merge scenario '%s': base table '%s' no longer exists", bind_data.name, logical_name);
 		}
 		auto &base_duck = base_entry->Cast<DuckTableEntry>();
-		auto pk_columns = ScenarioDelta::GetPKColumns(*base_entry);
+		auto pk_columns =
+		    ScenarioDelta::GetKeyColumns(context, host, entry->scenario_id, logical_name, *base_entry);
 		if (pk_columns.empty() ) {
 			// no-PK tables carry only 'I' rows (v1 write limits): plain appends
 			for (auto &row : rows) {

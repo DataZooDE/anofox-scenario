@@ -82,7 +82,7 @@ public:
 			}
 			base_constraint_state = base_duck.GetStorage().InitializeConstraintState(base_duck, base_constraints);
 		}
-		pk_columns = ScenarioDelta::GetPKColumns(entry.base_entry);
+		pk_columns = entry.key_columns;
 		delta_keys.Load(client, *delta_ptr, pk_columns);
 		delta_chunk.Initialize(Allocator::Get(client), delta_ptr->GetStorage().GetTypes());
 	}
@@ -622,9 +622,9 @@ PhysicalOperator &ScenarioCatalog::PlanUpdate(ClientContext &context, PhysicalPl
                                               LogicalUpdate &op, PhysicalOperator &plan) {
 	ThrowIfFrozen(context, "UPDATE");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
-	if (ScenarioDelta::GetPKColumns(entry.base_entry).empty()) {
-		throw NotImplementedException(
-		    "UPDATE/DELETE in scenarios requires a PRIMARY KEY on the base table (v1 limitation)");
+	if (entry.key_columns.empty()) {
+		throw NotImplementedException("UPDATE/DELETE in scenarios requires a PRIMARY KEY on the base table or "
+		                              "key_columns declared at scenario_create (v1 limitation)");
 	}
 	auto &update = planner.Make<PhysicalScenarioUpdate>(
 	    op.types, entry, op.columns, std::move(op.expressions), std::move(op.bound_defaults),
@@ -641,9 +641,9 @@ PhysicalOperator &ScenarioCatalog::PlanDelete(ClientContext &context, PhysicalPl
 		    "RETURNING on DELETE from scenario tables is not supported yet (planned for v0.4.1)");
 	}
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
-	if (ScenarioDelta::GetPKColumns(entry.base_entry).empty()) {
-		throw NotImplementedException(
-		    "UPDATE/DELETE in scenarios requires a PRIMARY KEY on the base table (v1 limitation)");
+	if (entry.key_columns.empty()) {
+		throw NotImplementedException("UPDATE/DELETE in scenarios requires a PRIMARY KEY on the base table or "
+		                              "key_columns declared at scenario_create (v1 limitation)");
 	}
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
 	auto &del = planner.Make<PhysicalScenarioDelete>(op.types, entry, bound_ref.index, op.estimated_cardinality);

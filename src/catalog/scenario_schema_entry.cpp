@@ -55,6 +55,8 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	table_info.table = logical_name;
 
 	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table);
+	entry->key_columns = ScenarioDelta::GetKeyColumns(context, scenario_catalog.GetHostCatalog(context),
+	                                                  scenario_catalog.scenario_id, logical_name, base_table);
 	auto &result = *entry;
 	transaction.table_entries[logical_name] = std::move(entry);
 	return result;

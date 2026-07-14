@@ -23,7 +23,7 @@ statement ok
 INSERT INTO lake.forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
 
 statement ok
-CALL scenario_create('lakescen', 'over a ducklake', base := 'lake');
+CALL scenario_create('lakescen', 'over a ducklake', base := 'lake', key_columns := MAP {'forecast': ['id']});
 
 statement ok
 ATTACH 'lakescen' AS s (TYPE scenario);
@@ -76,16 +76,28 @@ SELECT count(*) FROM lake.forecast WHERE id = 10;
 ----
 0
 
-# ducklake tables have no PK: UPDATE/DELETE fall under the existing no-PK rule
-statement error
-UPDATE s.forecast SET qty = 1 WHERE id = 1;
-----
-<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+# key_columns declared at create unlock the full DML surface on the lake
+statement ok
+UPDATE s.forecast SET qty = 111 WHERE id = 1;
 
-statement error
-DELETE FROM s.forecast WHERE id = 1;
+statement ok
+DELETE FROM s.forecast WHERE id = 2;
+
+# merged view: pinned base + scenario edits (still ignoring all lake churn)
+query ITI
+SELECT id, region, qty FROM s.forecast ORDER BY id;
 ----
-<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+1	EU	111
+3	APAC	300
+10	MEA	50
+
+# diff reads the declared-key changelog
+query ITT
+SELECT id, change_type, new_value FROM scenario_diff('lakescen', 'forecast') ORDER BY id;
+----
+1	modified	111
+2	removed	NULL
+10	added	NULL
 
 # merge-back into a foreign catalog is refused (single-writer rule)
 statement error

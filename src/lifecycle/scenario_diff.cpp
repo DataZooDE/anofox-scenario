@@ -102,10 +102,11 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 		    Q(base_catalog->GetName()) + "." + Q(string(DEFAULT_SCHEMA)) + "." + Q(table_name);
 	}
 
-	auto pk_columns = ScenarioDelta::GetPKColumns(*base_entry);
+	auto pk_columns =
+	    ScenarioDelta::GetKeyColumns(context, host_catalog, entry->scenario_id, table_name, *base_entry);
 	if (pk_columns.empty()) {
-		throw NotImplementedException(
-		    "scenario_diff requires a PRIMARY KEY on the base table (v1 limitation)");
+		throw NotImplementedException("scenario_diff requires a PRIMARY KEY on the base table or key_columns "
+		                              "declared at scenario_create (v1 limitation)");
 	}
 	unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
 	for (auto &col : base_entry->GetColumns().Logical()) {
