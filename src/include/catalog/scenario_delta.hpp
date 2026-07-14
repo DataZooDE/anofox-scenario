@@ -25,14 +25,27 @@ class TableCatalogEntry;
 
 class ScenarioDelta {
 public:
-	//! Delta column layout: _op, _ts, then all base columns in base order
+	//! Delta column layout: _op, _ts, then all base columns in base order.
+	//! Keyless tables (no PK, no declared key) append a trailing _count
+	//! BIGINT: the delta is a bag changelog (I/D rows with multiplicities,
+	//! aggregated on read) because whole-row identity cannot be a PK (NULLs).
 	static constexpr idx_t OP_COL = 0;
 	static constexpr idx_t TS_COL = 1;
 	static constexpr idx_t PAYLOAD_START = 2;
+	static constexpr const char *COUNT_COLUMN = "_count";
+
+	//! Position of the trailing _count column, if this delta has one
+	static optional_idx CountColumnIndex(const TableCatalogEntry &delta_table);
 
 	static string DeltaTableName(int64_t scenario_id, const string &table_name);
 	//! Materialized base copy: __anofox_scenario.s<id>_mat_<table> (Phase 2)
 	static string MatTableName(int64_t scenario_id, const string &table_name);
+	//! Logical name of a base table within a scenario: plain for the main
+	//! schema, '<schema>.<table>' otherwise. This is the key of the delta/mat
+	//! naming contract for multi-schema bases.
+	static string LogicalName(const TableCatalogEntry &table);
+	//! Split a logical name back into (schema, table)
+	static void SplitLogicalName(const string &logical_name, string &schema_name, string &table_name);
 	//! The delta table for a scenario table, if any writes happened yet
 	static optional_ptr<DuckTableEntry> TryGetDeltaTable(ClientContext &context, Catalog &host_catalog,
 	                                                     int64_t scenario_id, const string &table_name);
@@ -44,11 +57,12 @@ public:
 	//! that constraint IS the persisted key declaration.
 	static DuckTableEntry &EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
 	                                        TableCatalogEntry &base_entry,
-	                                        const vector<string> *declared_keys = nullptr);
+	                                        const vector<string> *declared_keys = nullptr,
+	                                        const string *logical_name_override = nullptr);
 	//! Create the materialized copy of a base table (schema incl. PK) and
 	//! bulk-copy its rows, all in the caller's transaction
 	static DuckTableEntry &CreateMatTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-	                                      TableCatalogEntry &base_entry);
+	                                      TableCatalogEntry &base_entry, const string *logical_name_override = nullptr);
 	//! Vectorized row copy between two tables with identical column layout
 	//! (offset maps source column i -> target column i + offset)
 	static void CopyTableData(ClientContext &context, DuckTableEntry &from_table, DuckTableEntry &to_table,

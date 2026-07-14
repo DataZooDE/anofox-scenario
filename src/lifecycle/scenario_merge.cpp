@@ -17,6 +17,10 @@
 #include "catalog/scenario_dml.hpp"
 #include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/common/value_operations/value_operations.hpp"
+#include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -86,7 +90,9 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 	}
 	for (auto &delta_pair : ListDeltaTables(context, host, entry->scenario_id)) {
 		auto &logical_name = delta_pair.second;
-		auto base_entry = preview_base->GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, logical_name,
+		string schema_name, table_name;
+		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
+		auto base_entry = preview_base->GetEntry<TableCatalogEntry>(context, schema_name, table_name,
 		                                                            OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			continue; // base table vanished; scenario_merge reports the error
@@ -107,18 +113,56 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 				pk_match += "b." + QM(name) + " = d." + QM(name);
 			}
 		}
-		auto base_name = QM(preview_base->GetName()) + "." + QM(string(DEFAULT_SCHEMA)) + "." + QM(logical_name);
+		auto base_name = QM(preview_base->GetName()) + "." + QM(schema_name) + "." + QM(table_name);
 		string exists_clause = pk_columns.empty()
 		                           ? string("false")
 		                           : "EXISTS (SELECT 1 FROM " + base_name + " b WHERE " + pk_match + ")";
+
+		// Scenarios with a creation snapshot (materialized: the mat copy;
+		// cross-catalog/DuckLake: the AT-pinned base) get 3-way conflicts:
+		// base drift on a touched key mirrors scenario_merge's check
+		string drift_clause = "false";
+		string snapshot_ref; // includes the "m" alias (AT clauses follow the alias)
+		if (entry->mode == "materialized") {
+			snapshot_ref =
+			    internal_prefix + QM(ScenarioDelta::MatTableName(entry->scenario_id, logical_name)) + " m";
+		} else if (!entry->base_catalog.empty()) {
+			snapshot_ref =
+			    base_name + " AS m AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry->created_at) + "')";
+		}
+		if (!snapshot_ref.empty() && !pk_columns.empty()) {
+			string mat_match, drift_columns;
+			unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
+			for (auto pk_col : pk_columns) {
+				auto &name = base_entry->GetColumn(LogicalIndex(pk_col)).Name();
+				if (!mat_match.empty()) {
+					mat_match += " AND ";
+				}
+				mat_match += "m." + QM(name) + " = d." + QM(name);
+			}
+			for (idx_t col = 0; col < base_entry->GetColumns().LogicalColumnCount(); col++) {
+				if (pk_set.find(col) != pk_set.end()) {
+					continue;
+				}
+				auto &name = base_entry->GetColumn(LogicalIndex(col)).Name();
+				if (!drift_columns.empty()) {
+					drift_columns += " OR ";
+				}
+				drift_columns += "b." + QM(name) + " IS DISTINCT FROM m." + QM(name);
+			}
+			if (!drift_columns.empty()) {
+				drift_clause = "EXISTS (SELECT 1 FROM " + base_name + " b, " + snapshot_ref + " WHERE " + pk_match +
+				               " AND " + mat_match + " AND (" + drift_columns + "))";
+			}
+		}
 		if (!sql.empty()) {
 			sql += " UNION ALL ";
 		}
 		sql += "SELECT CAST('" + logical_name + "' AS VARCHAR) AS table_name, " + key_expr +
 		       " AS key, CASE d._op WHEN 'I' THEN 'insert' WHEN 'U' THEN 'update' ELSE 'delete' END AS action, "
 		       "CASE WHEN d._op = 'I' THEN " +
-		       exists_clause + " WHEN d._op = 'U' THEN NOT " + exists_clause +
-		       " ELSE false END AS conflict FROM " + internal_prefix + QM(delta_pair.first) + " d";
+		       exists_clause + " WHEN d._op = 'U' THEN (NOT " + exists_clause + " OR " + drift_clause +
+		       ") ELSE " + drift_clause + " END AS conflict FROM " + internal_prefix + QM(delta_pair.first) + " d";
 	}
 	if (sql.empty()) {
 		sql = "SELECT CAST(NULL AS VARCHAR) AS table_name, CAST(NULL AS VARCHAR) AS key, CAST(NULL AS VARCHAR) AS "
@@ -180,8 +224,172 @@ unique_ptr<GlobalTableFunctionState> MergeInit(ClientContext &context, TableFunc
 struct MergeRow {
 	char op;
 	row_t delta_row_id;
+	int64_t count = 1;     // keyless bag deltas: multiplicity
 	vector<Value> payload; // base-table layout
 };
+
+//! Merge-back into a cross-catalog (e.g. DuckLake) base. DuckDB transactions
+//! write a single attached database (no 2PC), so the lake apply runs
+//! atomically in its OWN transaction on a second connection (lake = sole
+//! writer, host deltas only read), after which the caller's transaction does
+//! the host bookkeeping. Requires autocommit; if the process dies between
+//! the two, the delta is still present and a re-merge surfaces the overlap
+//! as conflicts (documented).
+void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioRegistryEntry &entry,
+                          MergeConflictPolicy policy, idx_t &tables_changed, idx_t &rows_applied,
+                          idx_t &conflicts_resolved) {
+	if (!context.transaction.IsAutoCommit()) {
+		throw NotImplementedException(
+		    "Merging scenario '%s' into base catalog '%s' requires autocommit: the two catalogs cannot commit in "
+		    "one transaction (single-writer rule)",
+		    entry.name, entry.base_catalog);
+	}
+	auto base_catalog = Catalog::GetCatalogEntry(context, entry.base_catalog);
+	if (!base_catalog) {
+		throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", entry.name,
+		                            entry.base_catalog);
+	}
+
+	Connection con(*context.db);
+	con.BeginTransaction();
+	auto run = [&](const string &sql) {
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			con.Rollback();
+			result->ThrowError();
+		}
+		return result;
+	};
+	auto count_of = [&](const string &sql) {
+		auto result = run(sql);
+		auto chunk = result->Fetch();
+		return NumericCast<idx_t>(chunk->GetValue(0, 0).GetValue<int64_t>());
+	};
+
+	auto host_prefix = QM(host.GetName()) + ".";
+	auto internal_prefix = host_prefix + QM(ScenarioRegistry::SCHEMA_NAME) + ".";
+	for (auto &delta_pair : ListDeltaTables(context, host, entry.scenario_id)) {
+		auto &logical_name = delta_pair.second;
+		string schema_name, table_name;
+		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
+		auto base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, schema_name, table_name,
+		                                                            OnEntryNotFound::RETURN_NULL);
+		if (!base_entry) {
+			con.Rollback();
+			throw InvalidInputException("Cannot merge scenario '%s': base table '%s' no longer exists in '%s'",
+			                            entry.name, logical_name, entry.base_catalog);
+		}
+		auto delta_ref = internal_prefix + QM(delta_pair.first);
+		auto base_ref = QM(base_catalog->GetName()) + "." + QM(schema_name) + "." + QM(table_name);
+		auto snapshot_ref =
+		    base_ref + " AS m AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry.created_at) + "')";
+		auto pk_columns = ScenarioDelta::GetKeyColumns(context, host, entry.scenario_id, logical_name, *base_entry);
+
+		// payload column list, delta side
+		string payload_cols;
+		for (auto &col : base_entry->GetColumns().Logical()) {
+			if (!payload_cols.empty()) {
+				payload_cols += ", ";
+			}
+			payload_cols += "d." + QM(col.Name());
+		}
+
+		if (pk_columns.empty()) {
+			// keyless bag deltas cannot be applied to a foreign base by SQL
+			// alone (deleting N of M identical rows needs rowids): refuse
+			// loudly instead of silently dropping the deletes
+			auto deletes = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'D'");
+			if (deletes > 0) {
+				con.Rollback();
+				throw NotImplementedException(
+				    "Cannot merge scenario '%s': keyless table '%s' has scenario deletes/updates, which cannot "
+				    "be applied to base catalog '%s'. Declare key_columns at scenario_create for keyed "
+				    "merge-back",
+				    entry.name, logical_name, entry.base_catalog);
+			}
+			auto inserted = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'I'");
+			if (inserted > 0) {
+				run("INSERT INTO " + base_ref + " SELECT " + payload_cols + " FROM " + delta_ref +
+				    " d WHERE d._op = 'I'");
+				rows_applied += inserted;
+				tables_changed++;
+			}
+			continue;
+		}
+
+		unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
+		string pk_match_b, pk_match_b2, pk_match_m, pk_match_c, pk_list, key_expr, drift_columns;
+		for (auto pk_col : pk_columns) {
+			auto &name = base_entry->GetColumn(LogicalIndex(pk_col)).Name();
+			if (!pk_match_b.empty()) {
+				pk_match_b += " AND ";
+				pk_match_b2 += " AND ";
+				pk_match_m += " AND ";
+				pk_match_c += " AND ";
+				pk_list += ", ";
+				key_expr += " || '|' || ";
+			}
+			pk_match_b += "b." + QM(name) + " = d." + QM(name);
+			pk_match_b2 += "b2." + QM(name) + " = d." + QM(name);
+			pk_match_m += "m." + QM(name) + " = d." + QM(name);
+			pk_match_c += "c." + QM(name) + " = d." + QM(name);
+			pk_list += "d." + QM(name);
+			key_expr += "CAST(d." + QM(name) + " AS VARCHAR)";
+		}
+		for (idx_t col = 0; col < base_entry->GetColumns().LogicalColumnCount(); col++) {
+			if (pk_set.find(col) != pk_set.end()) {
+				continue;
+			}
+			auto &name = base_entry->GetColumn(LogicalIndex(col)).Name();
+			if (!drift_columns.empty()) {
+				drift_columns += " OR ";
+			}
+			drift_columns += "b2." + QM(name) + " IS DISTINCT FROM m." + QM(name);
+		}
+		string exists_b = "EXISTS (SELECT 1 FROM " + base_ref + " b WHERE " + pk_match_b + ")";
+		string drift = drift_columns.empty()
+		                   ? string("false")
+		                   : "EXISTS (SELECT 1 FROM " + base_ref + " b2, " + snapshot_ref + " WHERE " +
+		                         pk_match_b2 + " AND " + pk_match_m + " AND (" + drift_columns + "))";
+		string conflict_pred = "(d._op = 'I' AND " + exists_b + ") OR (d._op = 'U' AND NOT " + exists_b +
+		                       ") OR (d._op IN ('U', 'D') AND (" + drift + "))";
+
+		// conflict keys + pre-mutation counts (the lake must not have been
+		// touched yet when these are evaluated)
+		run("CREATE OR REPLACE TEMP TABLE __anofox_merge_conflicts AS SELECT " + pk_list + " FROM " + delta_ref +
+		    " d WHERE " + conflict_pred);
+		string in_conflicts = "EXISTS (SELECT 1 FROM __anofox_merge_conflicts c WHERE " + pk_match_c + ")";
+		auto n_conflicts = count_of("SELECT count(*) FROM __anofox_merge_conflicts");
+		if (n_conflicts > 0 && policy == MergeConflictPolicy::ABORT) {
+			auto sample = run("SELECT " + key_expr + " FROM " + delta_ref + " d WHERE " + conflict_pred + " LIMIT 1");
+			auto sample_key = sample->Fetch()->GetValue(0, 0).ToString();
+			con.Rollback();
+			throw ConstraintException(
+			    "Cannot merge scenario '%s': the base changed underneath it (e.g. key %s of table '%s'). Rerun "
+			    "with on_conflict := 'ours' (scenario wins) or 'theirs' (base wins)",
+			    entry.name, sample_key, logical_name);
+		}
+		conflicts_resolved += n_conflicts;
+
+		string theirs_filter = policy == MergeConflictPolicy::THEIRS ? " AND NOT " + in_conflicts : "";
+		auto d_hits = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'D' AND " + exists_b +
+		                       theirs_filter);
+
+		// deletes: U/D keys vacate; with 'ours', I over an existing row replaces
+		string delete_ops = policy == MergeConflictPolicy::OURS ? "('U', 'D', 'I')" : "('U', 'D')";
+		auto deleted = count_of("WITH doomed AS (SELECT " + pk_list + " FROM " + delta_ref +
+		                        " d WHERE d._op IN " + delete_ops + theirs_filter + ") DELETE FROM " + base_ref +
+		                        " b WHERE EXISTS (SELECT 1 FROM doomed d WHERE " + pk_match_b + ")");
+		auto inserted = count_of("INSERT INTO " + base_ref + " SELECT " + payload_cols + " FROM " + delta_ref +
+		                         " d WHERE d._op IN ('I', 'U')" + theirs_filter);
+		run("DROP TABLE __anofox_merge_conflicts");
+		rows_applied += inserted + d_hits;
+		if (inserted + deleted > 0) {
+			tables_changed++;
+		}
+	}
+	con.Commit();
+}
 
 void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<MergeState>();
@@ -200,17 +408,11 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	if (entry->has_merged_at) {
 		throw InvalidInputException("Scenario '%s' was already merged back into the base", bind_data.name);
 	}
-	if (entry->mode == "materialized") {
-		throw NotImplementedException(
-		    "Merging a materialized scenario back is not supported (v1): materialized scenarios are full "
-		    "copies, not changelogs");
-	}
-	if (!entry->base_catalog.empty()) {
-		throw NotImplementedException(
-		    "Merging back a scenario whose base lives in another catalog ('%s') is not supported (v1): "
-		    "DuckDB transactions write a single database",
-		    entry->base_catalog);
-	}
+	// Materialized scenarios merge like delta scenarios (writes live in the
+	// delta; the mat tables are the immutable creation snapshot) - and the
+	// snapshot upgrades conflict detection to a true 3-way: base drift on a
+	// touched row is a conflict even when the overlay model cannot see it.
+	bool is_materialized = entry->mode == "materialized";
 	if (entry->frozen) {
 		throw InvalidInputException("Scenario '%s' is frozen. Unfreeze it before merging", bind_data.name);
 	}
@@ -225,6 +427,54 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	idx_t rows_applied = 0;
 	idx_t conflicts_resolved = 0;
 
+	if (!entry->base_catalog.empty()) {
+		// cross-catalog base: apply on a second connection (lake commits
+		// atomically on its own), then do host bookkeeping below
+		MergeIntoForeignBase(context, host, *entry, bind_data.policy, tables_changed, rows_applied,
+		                     conflicts_resolved);
+		// empty the deltas in the caller's transaction
+		for (auto &delta_pair : ListDeltaTables(context, host, entry->scenario_id)) {
+			auto delta_entry =
+			    ScenarioDelta::TryGetDeltaTable(context, host, entry->scenario_id, delta_pair.second);
+			if (!delta_entry) {
+				continue;
+			}
+			vector<row_t> delta_row_ids;
+			vector<StorageIndex> rowid_col;
+			rowid_col.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+			vector<LogicalType> rowid_type = {LogicalType::ROW_TYPE};
+			ScenarioDelta::ScanTableRows(context, *delta_entry, std::move(rowid_col), rowid_type,
+			                             [&](DataChunk &chunk, idx_t row) {
+				                             delta_row_ids.push_back(chunk.GetValue(0, row).GetValue<row_t>());
+				                             return true;
+			                             });
+			if (delta_row_ids.empty()) {
+				continue;
+			}
+			auto binder = Binder::CreateBinder(context);
+			auto delta_constraints = binder->BindConstraints(*delta_entry);
+			auto &delta_storage = delta_entry->GetStorage();
+			auto delete_state = delta_storage.InitializeDelete(*delta_entry, context, delta_constraints);
+			idx_t offset = 0;
+			while (offset < delta_row_ids.size()) {
+				idx_t batch = MinValue<idx_t>(delta_row_ids.size() - offset, STANDARD_VECTOR_SIZE);
+				Vector row_ids(LogicalType::ROW_TYPE);
+				for (idx_t i = 0; i < batch; i++) {
+					row_ids.SetValue(i, Value::BIGINT(delta_row_ids[offset + i]));
+				}
+				delta_storage.Delete(*delete_state, context, row_ids, batch);
+				offset += batch;
+			}
+		}
+		ScenarioRegistry::MarkMerged(context, host, entry->scenario_id);
+		ScenarioRegistry::SetFrozen(context, host, entry->scenario_id, true);
+		output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
+		output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
+		output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
+		output.SetCardinality(1);
+		return;
+	}
+
 	for (auto &delta_pair : ListDeltaTables(context, host, entry->scenario_id)) {
 		auto &logical_name = delta_pair.second;
 		auto delta_entry =
@@ -236,7 +486,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 
 		// load the delta rows
 		auto delta_types = delta_table.GetStorage().GetTypes();
-		idx_t payload_count = delta_types.size() - ScenarioDelta::PAYLOAD_START;
+		auto count_column = ScenarioDelta::CountColumnIndex(delta_table);
+		idx_t payload_count = delta_types.size() - ScenarioDelta::PAYLOAD_START - (count_column.IsValid() ? 1 : 0);
 		vector<StorageIndex> column_ids;
 		vector<LogicalType> scan_types;
 		column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
@@ -255,6 +506,10 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				                             merge_row.payload.push_back(
 				                                 chunk.GetValue(1 + ScenarioDelta::PAYLOAD_START + i, row));
 			                             }
+			                             if (count_column.IsValid()) {
+				                             merge_row.count =
+				                                 chunk.GetValue(1 + count_column.GetIndex(), row).GetValue<int64_t>();
+			                             }
 			                             rows.push_back(std::move(merge_row));
 			                             return true;
 		                             });
@@ -262,8 +517,10 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			continue;
 		}
 
+		string schema_name, table_name;
+		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
 		auto base_entry =
-		    host.GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, logical_name, OnEntryNotFound::RETURN_NULL);
+		    host.GetEntry<TableCatalogEntry>(context, schema_name, table_name, OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			throw InvalidInputException(
 			    "Cannot merge scenario '%s': base table '%s' no longer exists", bind_data.name, logical_name);
@@ -271,14 +528,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		auto &base_duck = base_entry->Cast<DuckTableEntry>();
 		auto pk_columns =
 		    ScenarioDelta::GetKeyColumns(context, host, entry->scenario_id, logical_name, *base_entry);
-		if (pk_columns.empty() ) {
-			// no-PK tables carry only 'I' rows (v1 write limits): plain appends
-			for (auto &row : rows) {
-				if (row.op != 'I') {
-					throw InternalException("anofox_scenario: unexpected op '%c' in no-PK delta", row.op);
-				}
-			}
-		}
+
 
 		// resolve base rowids for the delta's keys
 		unordered_map<string, row_t> base_row_ids;
@@ -304,24 +554,75 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			for (auto &row : rows) {
 				wanted.insert(key_of(row));
 			}
+			auto column_count = base_entry->GetColumns().LogicalColumnCount();
 			vector<StorageIndex> base_cols;
 			vector<LogicalType> base_scan_types;
 			base_cols.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
 			base_scan_types.push_back(LogicalType::ROW_TYPE);
 			vector<idx_t> key_positions;
-			for (auto pk_col : pk_columns) {
-				key_positions.push_back(base_cols.size());
-				base_cols.emplace_back(pk_col);
-				base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(pk_col)).Type());
+			if (is_materialized) {
+				// 3-way drift detection needs full payloads: scan every column
+				for (idx_t col = 0; col < column_count; col++) {
+					base_cols.emplace_back(col);
+					base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(col)).Type());
+				}
+				for (auto pk_col : pk_columns) {
+					key_positions.push_back(1 + pk_col);
+				}
+			} else {
+				for (auto pk_col : pk_columns) {
+					key_positions.push_back(base_cols.size());
+					base_cols.emplace_back(pk_col);
+					base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(pk_col)).Type());
+				}
 			}
+			unordered_map<string, vector<Value>> base_payloads;
 			ScenarioDelta::ScanTableRows(context, base_duck, std::move(base_cols), base_scan_types,
 			                             [&](DataChunk &chunk, idx_t row) {
 				                             auto key = ScenarioDelta::MakeKey(chunk, row, key_positions);
 				                             if (wanted.find(key) != wanted.end()) {
 					                             base_row_ids[key] = chunk.GetValue(0, row).GetValue<row_t>();
+					                             if (is_materialized) {
+						                             vector<Value> payload;
+						                             for (idx_t col = 0; col < column_count; col++) {
+							                             payload.push_back(chunk.GetValue(1 + col, row));
+						                             }
+						                             base_payloads[key] = std::move(payload);
+					                             }
 				                             }
 				                             return true;
 			                             });
+
+			// the creation snapshot's values for the touched keys
+			unordered_map<string, vector<Value>> mat_payloads;
+			if (is_materialized) {
+				auto mat_entry =
+				    ScenarioDelta::TryGetMatTable(context, host, entry->scenario_id, logical_name);
+				if (mat_entry) {
+					vector<StorageIndex> mat_cols;
+					vector<LogicalType> mat_types;
+					vector<idx_t> mat_key_positions;
+					for (idx_t col = 0; col < column_count; col++) {
+						mat_cols.emplace_back(col);
+						mat_types.push_back(base_entry->GetColumn(LogicalIndex(col)).Type());
+					}
+					for (auto pk_col : pk_columns) {
+						mat_key_positions.push_back(pk_col);
+					}
+					ScenarioDelta::ScanTableRows(context, *mat_entry, std::move(mat_cols), mat_types,
+					                             [&](DataChunk &chunk, idx_t row) {
+						                             auto key = ScenarioDelta::MakeKey(chunk, row, mat_key_positions);
+						                             if (wanted.find(key) != wanted.end()) {
+							                             vector<Value> payload;
+							                             for (idx_t col = 0; col < column_count; col++) {
+								                             payload.push_back(chunk.GetValue(col, row));
+							                             }
+							                             mat_payloads[key] = std::move(payload);
+						                             }
+						                             return true;
+					                             });
+				}
+			}
 
 			// classify, resolve conflicts, and apply
 			vector<row_t> base_rows_to_delete;      // rows replaced or deleted
@@ -333,7 +634,22 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				auto key = key_of(row);
 				auto base_hit = base_row_ids.find(key);
 				bool in_base = base_hit != base_row_ids.end();
-				bool conflict = (row.op == 'I' && in_base) || (row.op == 'U' && !in_base);
+				// 3-way (materialized only): the base row drifted away from the
+				// creation snapshot while the scenario touched the same key
+				bool drift = false;
+				if (is_materialized && in_base) {
+					auto mat_it = mat_payloads.find(key);
+					auto base_it = base_payloads.find(key);
+					if (mat_it != mat_payloads.end() && base_it != base_payloads.end()) {
+						for (idx_t col = 0; col < mat_it->second.size(); col++) {
+							if (ValueOperations::DistinctFrom(mat_it->second[col], base_it->second[col])) {
+								drift = true;
+								break;
+							}
+						}
+					}
+				}
+				bool conflict = (row.op == 'I' && in_base) || (row.op == 'U' && !in_base) || drift;
 				if (conflict) {
 					table_conflicts++;
 					if (bind_data.policy == MergeConflictPolicy::ABORT) {
@@ -448,29 +764,111 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				tables_changed++;
 			}
 		} else {
-			// no-PK: plain appends
+			// keyless bag: aggregate net multiplicity per value, delete that
+			// many matching base rows for negative nets, append for positive
+			auto value_key = [&](const vector<Value> &payload) {
+				string key;
+				for (auto &value : payload) {
+					if (value.IsNull()) {
+						key += "N|";
+					} else {
+						auto str = value.ToString();
+						key += to_string(str.size()) + ":" + str;
+					}
+				}
+				return key;
+			};
+			struct BagNet {
+				int64_t net = 0;
+				const vector<Value> *payload = nullptr;
+			};
+			unordered_map<string, BagNet> nets;
+			for (auto &row : rows) {
+				auto &net = nets[value_key(row.payload)];
+				net.net += (row.op == 'I') ? row.count : -row.count;
+				if (!net.payload) {
+					net.payload = &row.payload;
+				}
+			}
+			// negative nets: collect up to |net| base rowids per value
+			unordered_map<string, idx_t> delete_budget;
+			for (auto &net_pair : nets) {
+				if (net_pair.second.net < 0) {
+					delete_budget[net_pair.first] = NumericCast<idx_t>(-net_pair.second.net);
+				}
+			}
+			vector<row_t> base_rows_to_delete;
+			if (!delete_budget.empty()) {
+				vector<StorageIndex> base_cols;
+				vector<LogicalType> base_scan_types;
+				base_cols.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+				base_scan_types.push_back(LogicalType::ROW_TYPE);
+				vector<idx_t> value_positions;
+				for (idx_t col = 0; col < base_entry->GetColumns().LogicalColumnCount(); col++) {
+					value_positions.push_back(base_cols.size());
+					base_cols.emplace_back(col);
+					base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(col)).Type());
+				}
+				ScenarioDelta::ScanTableRows(context, base_duck, std::move(base_cols), base_scan_types,
+				                             [&](DataChunk &chunk, idx_t row) {
+					                             auto key = ScenarioDelta::MakeKey(chunk, row, value_positions);
+					                             auto budget = delete_budget.find(key);
+					                             if (budget != delete_budget.end() && budget->second > 0) {
+						                             budget->second--;
+						                             base_rows_to_delete.push_back(
+						                                 chunk.GetValue(0, row).GetValue<row_t>());
+					                             }
+					                             return true;
+				                             });
+			}
 			auto binder = Binder::CreateBinder(context);
 			auto base_constraints = binder->BindConstraints(base_duck);
+			if (!base_rows_to_delete.empty()) {
+				auto &base_storage = base_duck.GetStorage();
+				auto delete_state = base_storage.InitializeDelete(base_duck, context, base_constraints);
+				idx_t offset = 0;
+				while (offset < base_rows_to_delete.size()) {
+					idx_t batch = MinValue<idx_t>(base_rows_to_delete.size() - offset, STANDARD_VECTOR_SIZE);
+					Vector row_ids(LogicalType::ROW_TYPE);
+					for (idx_t i = 0; i < batch; i++) {
+						row_ids.SetValue(i, Value::BIGINT(base_rows_to_delete[offset + i]));
+					}
+					base_storage.Delete(*delete_state, context, row_ids, batch);
+					offset += batch;
+				}
+				rows_applied += base_rows_to_delete.size();
+			}
+			// positive nets: append that many copies
 			DataChunk append_chunk;
 			append_chunk.Initialize(Allocator::Get(context), base_duck.GetStorage().GetTypes());
 			idx_t count = 0;
-			for (auto &row : rows) {
-				for (idx_t col = 0; col < row.payload.size(); col++) {
-					append_chunk.SetValue(col, count, row.payload[col]);
+			auto flush_appends = [&]() {
+				if (count == 0) {
+					return;
 				}
-				if (++count == STANDARD_VECTOR_SIZE) {
-					append_chunk.SetCardinality(count);
-					base_duck.GetStorage().LocalAppend(base_duck, context, append_chunk, base_constraints);
-					append_chunk.Reset();
-					count = 0;
-				}
-				rows_applied++;
-			}
-			if (count > 0) {
 				append_chunk.SetCardinality(count);
 				base_duck.GetStorage().LocalAppend(base_duck, context, append_chunk, base_constraints);
+				append_chunk.Reset();
+				count = 0;
+			};
+			idx_t inserted = 0;
+			for (auto &net_pair : nets) {
+				for (int64_t n = 0; n < net_pair.second.net; n++) {
+					auto &payload = *net_pair.second.payload;
+					for (idx_t col = 0; col < payload.size(); col++) {
+						append_chunk.SetValue(col, count, payload[col]);
+					}
+					inserted++;
+					if (++count == STANDARD_VECTOR_SIZE) {
+						flush_appends();
+					}
+				}
 			}
-			tables_changed++;
+			flush_appends();
+			rows_applied += inserted;
+			if (inserted + base_rows_to_delete.size() > 0) {
+				tables_changed++;
+			}
 		}
 
 		// empty the delta (the scenario has been absorbed)

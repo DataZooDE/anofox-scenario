@@ -190,7 +190,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	// scenario_create; DML never creates catalog entries (single-writer rule).
 	if (!gstate.delta_table) {
 		auto delta_ptr =
-		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, entry.name);
+		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
 		if (!delta_ptr) {
 			throw InvalidInputException(
 			    "Table '%s' was created in the base after scenario '%s': it is readable but not writable in "
@@ -313,6 +313,11 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	delta_chunk.data[ScenarioDelta::TS_COL].Reference(Value::TIMESTAMP(now));
 	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 		delta_chunk.data[ScenarioDelta::PAYLOAD_START + col].Reference(chunk.data[col]);
+	}
+	auto count_column = ScenarioDelta::CountColumnIndex(delta_table);
+	if (count_column.IsValid()) {
+		// keyless bag deltas: every appended row carries multiplicity 1
+		delta_chunk.data[count_column.GetIndex()].Reference(Value::BIGINT(1));
 	}
 	delta_chunk.SetCardinality(chunk.size());
 

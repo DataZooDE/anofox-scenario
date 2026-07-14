@@ -19,6 +19,16 @@ namespace duckdb {
 constexpr idx_t ScenarioDelta::OP_COL;
 constexpr idx_t ScenarioDelta::TS_COL;
 constexpr idx_t ScenarioDelta::PAYLOAD_START;
+constexpr const char *ScenarioDelta::COUNT_COLUMN;
+
+optional_idx ScenarioDelta::CountColumnIndex(const TableCatalogEntry &delta_table) {
+	auto &columns = delta_table.GetColumns();
+	auto count = columns.LogicalColumnCount();
+	if (count > PAYLOAD_START && columns.GetColumn(LogicalIndex(count - 1)).Name() == COUNT_COLUMN) {
+		return optional_idx(count - 1);
+	}
+	return optional_idx();
+}
 
 string ScenarioDelta::DeltaTableName(int64_t scenario_id, const string &table_name) {
 	return "s" + to_string(scenario_id) + "_delta_" + table_name;
@@ -26,6 +36,32 @@ string ScenarioDelta::DeltaTableName(int64_t scenario_id, const string &table_na
 
 string ScenarioDelta::MatTableName(int64_t scenario_id, const string &table_name) {
 	return "s" + to_string(scenario_id) + "_mat_" + table_name;
+}
+
+string ScenarioDelta::LogicalName(const TableCatalogEntry &table) {
+	auto &schema_name = table.ParentSchema().name;
+	// '.' is the (schema, table) separator of the naming contract; names
+	// containing it would re-parse wrong in diff/preview/merge
+	if (table.name.find('.') != string::npos || schema_name.find('.') != string::npos) {
+		throw NotImplementedException(
+		    "Table or schema names containing '.' are not supported in scenarios (table '%s', schema '%s')",
+		    table.name, schema_name);
+	}
+	if (schema_name == DEFAULT_SCHEMA) {
+		return table.name;
+	}
+	return schema_name + "." + table.name;
+}
+
+void ScenarioDelta::SplitLogicalName(const string &logical_name, string &schema_name, string &table_name) {
+	auto dot = logical_name.find('.');
+	if (dot == string::npos) {
+		schema_name = DEFAULT_SCHEMA;
+		table_name = logical_name;
+	} else {
+		schema_name = logical_name.substr(0, dot);
+		table_name = logical_name.substr(dot + 1);
+	}
 }
 
 //! Internal: look up a table in the internal schema by exact name
@@ -53,18 +89,19 @@ optional_ptr<DuckTableEntry> ScenarioDelta::TryGetMatTable(ClientContext &contex
 }
 
 DuckTableEntry &ScenarioDelta::CreateMatTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-                                              TableCatalogEntry &base_entry) {
+                                              TableCatalogEntry &base_entry, const string *logical_name_override) {
+	auto logical_name = logical_name_override ? *logical_name_override : LogicalName(base_entry);
 	// Full schema copy (columns + constraints, so the PK survives)
 	auto create_info = base_entry.GetInfo();
 	auto &info = create_info->Cast<CreateTableInfo>();
 	info.catalog = host_catalog.GetName();
 	info.schema = ScenarioRegistry::SCHEMA_NAME;
-	info.table = MatTableName(scenario_id, base_entry.name);
+	info.table = MatTableName(scenario_id, logical_name);
 	info.on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 	info.temporary = false;
 	host_catalog.CreateTable(context, unique_ptr_cast<CreateInfo, CreateTableInfo>(std::move(create_info)));
 
-	auto created = TryGetMatTable(context, host_catalog, scenario_id, base_entry.name);
+	auto created = TryGetMatTable(context, host_catalog, scenario_id, logical_name);
 	if (!created) {
 		throw InternalException("anofox_scenario: failed to create materialized table for '%s'", base_entry.name);
 	}
@@ -120,8 +157,10 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 }
 
 DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-                                                TableCatalogEntry &base_entry, const vector<string> *declared_keys) {
-	auto existing = TryGetDeltaTable(context, host_catalog, scenario_id, base_entry.name);
+                                                TableCatalogEntry &base_entry, const vector<string> *declared_keys,
+                                                const string *logical_name_override) {
+	auto logical_name = logical_name_override ? *logical_name_override : LogicalName(base_entry);
+	auto existing = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (existing) {
 		return *existing;
 	}
@@ -131,7 +170,7 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 	auto info = make_uniq<CreateTableInfo>();
 	info->catalog = host_catalog.GetName();
 	info->schema = ScenarioRegistry::SCHEMA_NAME;
-	info->table = DeltaTableName(scenario_id, base_entry.name);
+	info->table = DeltaTableName(scenario_id, logical_name);
 	info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 	info->columns.AddColumn(ColumnDefinition("_op", LogicalType::VARCHAR));
 	info->columns.AddColumn(ColumnDefinition("_ts", LogicalType::TIMESTAMP));
@@ -155,9 +194,40 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 		vector<string> pk_names = *declared_keys;
 		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
 	}
+
+	bool keyless = pk_columns.empty() && (!declared_keys || declared_keys->empty());
+	if (keyless) {
+		// Bag changelog: whole-row identity cannot be a PK (NULLs), so I/D
+		// rows carry a multiplicity instead and readers aggregate. Secondary
+		// UNIQUE constraints are not mirrored here (D rows carry real
+		// payloads and would collide with their replacements).
+		info->columns.AddColumn(ColumnDefinition(COUNT_COLUMN, LogicalType::BIGINT));
+		info->constraints.push_back(
+		    make_uniq<NotNullConstraint>(LogicalIndex(PAYLOAD_START + base_entry.GetColumns().LogicalColumnCount())));
+	} else {
+		// Secondary UNIQUE constraints are mirrored so scenario-written rows
+		// are unique among themselves too (the base side is probed separately
+		// at DML time). Tombstones carry NULL payloads, which never conflict.
+		for (auto &constraint : base_entry.GetConstraints()) {
+			if (constraint->type != ConstraintType::UNIQUE) {
+				continue;
+			}
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			if (unique.IsPrimaryKey()) {
+				continue;
+			}
+			vector<string> unique_names;
+			if (unique.HasIndex()) {
+				unique_names.push_back(base_entry.GetColumn(unique.GetIndex()).Name());
+			} else {
+				unique_names = unique.GetColumnNames();
+			}
+			info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(unique_names), false));
+		}
+	}
 	host_catalog.CreateTable(context, std::move(info));
 
-	auto created = TryGetDeltaTable(context, host_catalog, scenario_id, base_entry.name);
+	auto created = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (!created) {
 		throw InternalException("anofox_scenario: failed to create delta table for '%s'", base_entry.name);
 	}

@@ -320,8 +320,12 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 					}
 				});
 				for (auto &snap_table : snap_tables) {
-					ScenarioDelta::EnsureDeltaTable(context, host, entry.scenario_id, snap_table.get());
-					ScenarioDelta::CreateMatTable(context, host, entry.scenario_id, snap_table.get());
+					// legacy snapshot tables live in a _snap_* schema but are
+					// logically main-schema tables
+					ScenarioDelta::EnsureDeltaTable(context, host, entry.scenario_id, snap_table.get(), nullptr,
+					                                &snap_table.get().name);
+					ScenarioDelta::CreateMatTable(context, host, entry.scenario_id, snap_table.get(),
+					                              &snap_table.get().name);
 				}
 				legacy_schemas_to_drop.push_back(snap.schema);
 			}

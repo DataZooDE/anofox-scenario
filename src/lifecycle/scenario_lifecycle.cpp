@@ -4,6 +4,7 @@
 #include "catalog/scenario_delta.hpp"
 #include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -164,6 +165,25 @@ void LifecycleExecute(ClientContext &context, TableFunctionInput &data, DataChun
 // Verbs
 //===----------------------------------------------------------------------===//
 
+//! Collect every user table of every mirrored schema of a base catalog
+void CollectBaseTables(ClientContext &context, Catalog &base_source, vector<reference<TableCatalogEntry>> &out) {
+	base_source.ScanSchemas(context, [&](SchemaCatalogEntry &schema) {
+		// built-in schemas (main) are marked internal, so filter by name only
+		if (schema.name == ScenarioRegistry::SCHEMA_NAME) {
+			return;
+		}
+		schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
+			if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal) {
+				return;
+			}
+			if (StringUtil::StartsWith(table_entry.name, "_scenario_")) {
+				return; // legacy v0.1 metadata
+			}
+			out.push_back(table_entry.Cast<TableCatalogEntry>());
+		});
+	});
+}
+
 void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_data) {
 	auto &host_catalog = GetHostCatalog(context);
 	ScenarioRegistry::EnsureExists(context, host_catalog);
@@ -179,12 +199,19 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		}
 	}
 
-	// Phase 4: cross-catalog base (e.g. a DuckLake attach)
+	// Phase 4: cross-catalog base (e.g. a DuckLake attach). Branches inherit
+	// the parent's base catalog - and its snapshot pin (created_at), so the
+	// child's view equals the parent's at branch time (a fresh pin would
+	// leak base churn that happened between the two creations).
+	string effective_base = bind_data.base_catalog;
+	if (parent && !parent->base_catalog.empty()) {
+		effective_base = parent->base_catalog;
+	}
 	optional_ptr<Catalog> base_catalog;
-	if (!bind_data.base_catalog.empty()) {
-		base_catalog = Catalog::GetCatalogEntry(context, bind_data.base_catalog);
+	if (!effective_base.empty()) {
+		base_catalog = Catalog::GetCatalogEntry(context, effective_base);
 		if (!base_catalog) {
-			throw InvalidInputException("Base catalog '%s' is not attached", bind_data.base_catalog);
+			throw InvalidInputException("Base catalog '%s' is not attached", effective_base);
 		}
 		if (base_catalog->GetCatalogType() == "scenario") {
 			throw InvalidInputException("A scenario cannot use another scenario as its base - branch instead "
@@ -197,10 +224,11 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	entry.name = bind_data.name;
 	entry.mode = bind_data.mode;
 	entry.parent_id = parent ? parent->scenario_id : -1;
-	entry.created_at = Timestamp::GetCurrentTimestamp();
+	entry.created_at = (parent && !parent->base_catalog.empty()) ? parent->created_at
+	                                                             : Timestamp::GetCurrentTimestamp();
 	entry.description = bind_data.description;
 	entry.has_description = bind_data.has_description;
-	entry.base_catalog = bind_data.base_catalog;
+	entry.base_catalog = effective_base;
 	ScenarioRegistry::Insert(context, host_catalog, entry);
 
 	// Eagerly create one (empty) delta table per base table, in this same
@@ -210,22 +238,13 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	// Cost: O(#tables) empty tables -- metadata only, no row data copied.
 	// Materialized mode additionally CTAS-copies every base table.
 	auto &base_source = base_catalog ? *base_catalog : host_catalog;
-	auto &host_schema = base_source.GetSchema(context, DEFAULT_SCHEMA);
 	vector<reference<TableCatalogEntry>> base_tables;
-	host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
-		if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal) {
-			return;
-		}
-		if (StringUtil::StartsWith(table_entry.name, "_scenario_")) {
-			return; // legacy v0.1 metadata
-		}
-		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
-	});
+	CollectBaseTables(context, base_source, base_tables);
 	// validate declared keys up front (typo safety)
 	for (auto &declared : bind_data.key_columns) {
 		bool table_found = false;
 		for (auto &base_table : base_tables) {
-			if (base_table.get().name != declared.first) {
+			if (ScenarioDelta::LogicalName(base_table.get()) != declared.first) {
 				continue;
 			}
 			table_found = true;
@@ -236,21 +255,40 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		}
 	}
 	for (auto &base_table : base_tables) {
-		auto declared = bind_data.key_columns.find(base_table.get().name);
+		auto logical_name = ScenarioDelta::LogicalName(base_table.get());
+		auto declared = bind_data.key_columns.find(logical_name);
+		optional_ptr<DuckTableEntry> parent_delta;
+		if (parent) {
+			parent_delta =
+			    ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id, logical_name);
+		}
+		// Branches inherit the parent's delta SHAPE (declared key or keyless
+		// _count layout) - the parent rows are copied verbatim, so a
+		// different child shape would corrupt the changelog
+		vector<string> inherited_keys;
+		if (parent_delta && ScenarioDelta::GetPKColumns(base_table.get()).empty()) {
+			for (auto delta_col : ScenarioDelta::GetPKColumns(*parent_delta)) {
+				inherited_keys.push_back(
+				    base_table.get().GetColumn(LogicalIndex(delta_col - ScenarioDelta::PAYLOAD_START)).Name());
+			}
+			if (declared != bind_data.key_columns.end() && declared->second != inherited_keys) {
+				throw InvalidInputException(
+				    "key_columns for table '%s' differ from the parent scenario's declared key - branches "
+				    "inherit the parent's row identity",
+				    logical_name);
+			}
+		}
 		auto &delta = ScenarioDelta::EnsureDeltaTable(
 		    context, host_catalog, entry.scenario_id, base_table.get(),
-		    declared == bind_data.key_columns.end() ? nullptr : &declared->second);
+		    !inherited_keys.empty() ? &inherited_keys
+		                            : (declared == bind_data.key_columns.end() ? nullptr : &declared->second));
 		if (bind_data.mode == "materialized") {
 			ScenarioDelta::CreateMatTable(context, host_catalog, entry.scenario_id, base_table.get());
 		}
-		if (parent) {
-			// Branch: inherit the parent's modifications by copying its
-			// delta rows (cheap - deltas are small by invariant)
-			auto parent_delta =
-			    ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id, base_table.get().name);
-			if (parent_delta) {
-				ScenarioDelta::CopyTableData(context, *parent_delta, delta);
-			}
+		if (parent_delta) {
+			// inherit the parent's modifications by copying its delta rows
+			// (cheap - deltas are small by invariant)
+			ScenarioDelta::CopyTableData(context, *parent_delta, delta);
 		}
 	}
 }
@@ -329,6 +367,11 @@ void ScenarioUnfreezeVerb(ClientContext &context, const LifecycleBindData &bind_
 	if (!entry) {
 		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
 	}
+	if (entry->has_merged_at) {
+		throw InvalidInputException("Scenario '%s' was already merged back into the base - its changelog is "
+		                            "closed. Create a new scenario instead",
+		                            bind_data.name);
+	}
 	ScenarioRegistry::SetFrozen(context, host_catalog, entry->scenario_id, false);
 }
 
@@ -379,6 +422,10 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 	if (!entry) {
 		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
 	}
+	if (entry->frozen) {
+		throw InvalidInputException("Cannot refresh scenario '%s': it is frozen. Unfreeze it first",
+		                            bind_data.name);
+	}
 	if (entry->mode == "materialized") {
 		throw InvalidInputException(
 		    "Cannot refresh scenario '%s': materialized scenarios are point-in-time copies and do not pick up "
@@ -397,26 +444,20 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 	MetaTransaction::Get(context).ModifyDatabase(host_catalog.GetAttached(),
 	                                             DatabaseModificationType::CREATE_CATALOG_ENTRY);
 
-	auto &base_schema = base_source->GetSchema(context, DEFAULT_SCHEMA);
 	vector<reference<TableCatalogEntry>> base_tables;
-	base_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
-		if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal ||
-		    StringUtil::StartsWith(table_entry.name, "_scenario_")) {
-			return;
-		}
-		base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
-	});
+	CollectBaseTables(context, *base_source, base_tables);
 	// validate declared keys up front: they must name a base table that is not
 	// yet tracked (identity cannot be changed once a delta table exists)
 	for (auto &declared : bind_data.key_columns) {
 		bool table_found = false;
 		for (auto &base_table : base_tables) {
-			if (base_table.get().name != declared.first) {
+			if (ScenarioDelta::LogicalName(base_table.get()) != declared.first) {
 				continue;
 			}
 			table_found = true;
 			ValidateDeclaredKey(base_table.get(), declared.second);
-			if (ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, base_table.get().name)) {
+			if (ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id,
+			                                    ScenarioDelta::LogicalName(base_table.get()))) {
 				throw InvalidInputException("key_columns declared for table '%s', but scenario '%s' already tracks "
 				                            "it - row identity cannot be changed after the fact",
 				                            declared.first, bind_data.name);
@@ -428,8 +469,9 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 	}
 	idx_t refreshed = 0;
 	for (auto &base_table : base_tables) {
-		if (!ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, base_table.get().name)) {
-			auto declared = bind_data.key_columns.find(base_table.get().name);
+		if (!ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id,
+		                                     ScenarioDelta::LogicalName(base_table.get()))) {
+			auto declared = bind_data.key_columns.find(ScenarioDelta::LogicalName(base_table.get()));
 			ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry->scenario_id, base_table.get(),
 			                                declared == bind_data.key_columns.end() ? nullptr : &declared->second);
 			refreshed++;

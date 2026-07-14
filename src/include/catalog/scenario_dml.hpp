@@ -61,7 +61,7 @@ PhysicalOperator &MakeScenarioUpdateOperator(PhysicalPlanGenerator &planner, vec
                                              optional_idx row_id_start);
 PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                              ScenarioTableEntry &entry, idx_t row_id_start,
-                                             idx_t estimated_cardinality);
+                                             idx_t estimated_cardinality, bool return_chunk);
 
 //! Source-side state for DML operators: emits either the affected-count row
 //! or, with RETURNING, the collected result rows

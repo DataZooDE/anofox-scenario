@@ -93,13 +93,14 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 				    entry->base_catalog);
 			}
 		}
-		base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, DEFAULT_SCHEMA, table_name,
+		string schema_name, plain_name;
+		ScenarioDelta::SplitLogicalName(table_name, schema_name, plain_name);
+		base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, schema_name, plain_name,
 		                                                       OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			throw InvalidInputException("Table '%s' not found in the base schema", table_name);
 		}
-		target.base_name =
-		    Q(base_catalog->GetName()) + "." + Q(string(DEFAULT_SCHEMA)) + "." + Q(table_name);
+		target.base_name = Q(base_catalog->GetName()) + "." + Q(schema_name) + "." + Q(plain_name);
 	}
 
 	auto pk_columns =
@@ -126,7 +127,9 @@ string MergedRelationSQL(ClientContext &context, const string &side, const strin
 	auto &host_catalog = GetHostCatalogForDiff(context);
 	auto host_prefix = Q(host_catalog.GetName()) + ".";
 	if (side == "main") {
-		return "(SELECT * FROM " + host_prefix + Q(string(DEFAULT_SCHEMA)) + "." + Q(table_name) + ")";
+		string schema_name, plain_name;
+		ScenarioDelta::SplitLogicalName(table_name, schema_name, plain_name);
+		return "(SELECT * FROM " + host_prefix + Q(schema_name) + "." + Q(plain_name) + ")";
 	}
 	auto target = ResolveDiffTarget(context, side, table_name);
 	string pk_match;

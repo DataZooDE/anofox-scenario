@@ -29,6 +29,10 @@ unique_ptr<MergeIntoOperator> PlanScenarioMergeAction(ClientContext &context, Lo
 		bound_constraints.push_back(constraint->Copy());
 	}
 	auto return_types = op.types;
+	if (op.return_chunk) {
+		// the trailing merge_action column is produced by the merge itself
+		return_types.pop_back();
+	}
 	auto cardinality = op.EstimateCardinality(context);
 
 	switch (action.action_type) {
@@ -39,17 +43,18 @@ unique_ptr<MergeIntoOperator> PlanScenarioMergeAction(ClientContext &context, Lo
 		}
 		result->op = &MakeScenarioUpdateOperator(planner, std::move(return_types), entry, std::move(action.columns),
 		                                         std::move(action.expressions), std::move(defaults),
-		                                         std::move(bound_constraints), cardinality, false, op.row_id_start);
+		                                         std::move(bound_constraints), cardinality, op.return_chunk,
+		                                         op.row_id_start);
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
-		result->op =
-		    &MakeScenarioDeleteOperator(planner, std::move(return_types), entry, op.row_id_start, cardinality);
+		result->op = &MakeScenarioDeleteOperator(planner, std::move(return_types), entry, op.row_id_start, cardinality,
+		                                         op.return_chunk);
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
 		result->op = &MakeScenarioInsertOperator(planner, std::move(return_types), entry,
-		                                         std::move(bound_constraints), cardinality, false);
+		                                         std::move(bound_constraints), cardinality, op.return_chunk);
 		// remap the insert expressions to the full column layout (defaults
 		// for unmentioned columns) - same transformation core performs
 		if (!action.column_index_map.empty()) {
@@ -89,9 +94,9 @@ PhysicalOperator &ScenarioCatalog::PlanMergeInto(ClientContext &context, Physica
 		throw NotImplementedException("MERGE INTO / ON CONFLICT in scenarios requires a PRIMARY KEY on the base "
 		                              "table or key_columns declared at scenario_create (v1 limitation)");
 	}
-	if (op.return_chunk) {
-		throw NotImplementedException(
-		    "RETURNING on MERGE INTO scenario tables is not supported yet (planned for v0.4.1)");
+	if (op.return_chunk && !entry.base_entry.IsDuckTable()) {
+		throw NotImplementedException("RETURNING on MERGE INTO scenarios over non-DuckDB bases (e.g. DuckLake) is "
+		                              "not supported yet");
 	}
 
 	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
@@ -105,7 +110,7 @@ PhysicalOperator &ScenarioCatalog::PlanMergeInto(ClientContext &context, Physica
 
 	// scenario sinks are single-threaded (ParallelSink() = false)
 	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
-	                                               false /* parallel */, false /* return_chunk */);
+	                                               false /* parallel */, op.return_chunk);
 	result.children.push_back(plan);
 	return result;
 }

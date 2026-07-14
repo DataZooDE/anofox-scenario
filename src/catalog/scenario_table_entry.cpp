@@ -41,13 +41,25 @@ DataTable &ScenarioTableEntry::GetStorage() {
 	return base_entry.GetStorage();
 }
 
+vector<idx_t> ScenarioTableEntry::IdentityColumns() const {
+	if (!key_columns.empty()) {
+		return key_columns;
+	}
+	// keyless: whole-row identity (bag semantics via the delta's _count)
+	vector<idx_t> result;
+	for (idx_t col = 0; col < GetColumns().LogicalColumnCount(); col++) {
+		result.push_back(col);
+	}
+	return result;
+}
+
 virtual_column_map_t ScenarioTableEntry::GetVirtualColumns() const {
 	auto result = TableCatalogEntry::GetVirtualColumns(); // rowid
 	result.insert(
 	    make_pair(SCENARIO_ORIGIN_COLUMN_ID, TableColumn("__scenario_origin", LogicalType::TINYINT)));
-	auto &pk_columns = key_columns;
-	for (idx_t k = 0; k < pk_columns.size(); k++) {
-		auto &column = GetColumn(LogicalIndex(pk_columns[k]));
+	auto identity = IdentityColumns();
+	for (idx_t k = 0; k < identity.size(); k++) {
+		auto &column = GetColumn(LogicalIndex(identity[k]));
 		result.insert(make_pair(SCENARIO_KEY_COLUMN_START + k,
 		                        TableColumn("__scenario_key_" + to_string(k), column.Type())));
 	}
@@ -55,16 +67,17 @@ virtual_column_map_t ScenarioTableEntry::GetVirtualColumns() const {
 }
 
 vector<column_t> ScenarioTableEntry::GetRowIdColumns() const {
-	auto &pk_columns = key_columns;
-	if (pk_columns.empty()) {
-		// no-PK tables: default rowid identity; PlanUpdate/PlanDelete throw
-		// the v1 limitation error before it is ever used
-		return TableCatalogEntry::GetRowIdColumns();
-	}
+	auto identity = IdentityColumns();
 	vector<column_t> result;
 	result.push_back(SCENARIO_ORIGIN_COLUMN_ID);
-	for (idx_t k = 0; k < pk_columns.size(); k++) {
+	for (idx_t k = 0; k < identity.size(); k++) {
 		result.push_back(SCENARIO_KEY_COLUMN_START + k);
+	}
+	if (base_entry.IsDuckTable() && !key_columns.empty()) {
+		// base rowid trails the identity columns: DELETE ... RETURNING fetches
+		// the doomed base rows by rowid (delta rows carry NULL here). Keyless
+		// tables carry their whole row in the identity columns instead.
+		result.push_back(COLUMN_IDENTIFIER_ROW_ID);
 	}
 	return result;
 }

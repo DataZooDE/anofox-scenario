@@ -65,6 +65,44 @@ SELECT count(*) FROM forecast WHERE id = 3;
 ----
 1
 
+# --- MERGE ... RETURNING -----------------------------------------------------------
+
+statement ok
+CREATE TABLE adjustments (id INTEGER, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO adjustments VALUES (2, 'US', 999), (3, 'APAC', 333), (20, 'ANZ', 700);
+
+# every action reports itself: id=2 updates (to its current value, so the
+# delta is unchanged for later sections), id=3 was deleted above so it
+# inserts over the tombstone, id=20 is a fresh insert
+query TITI rowsort
+MERGE INTO s.forecast t USING adjustments a ON t.id = a.id
+WHEN MATCHED THEN UPDATE SET qty = a.qty
+WHEN NOT MATCHED THEN INSERT VALUES (a.id, a.region, a.qty)
+RETURNING merge_action, id, region, qty;
+----
+INSERT	20	ANZ	700
+INSERT	3	APAC	333
+UPDATE	2	US	999
+
+# RETURNING with a DELETE action reports the removed rows' values (and puts
+# the table back in the state the later sections expect)
+query TII rowsort
+MERGE INTO s.forecast t USING adjustments a ON t.id = a.id AND a.id <> 2
+WHEN MATCHED THEN DELETE
+RETURNING merge_action, id, qty;
+----
+DELETE	20	700
+DELETE	3	333
+
+query ITI
+SELECT id, region, qty FROM s.forecast ORDER BY id;
+----
+1	EU	100
+2	US	999
+10	LATAM	500
+
 # --- ON CONFLICT (lowered through the merge machinery) ---------------------------
 
 statement ok

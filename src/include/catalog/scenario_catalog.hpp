@@ -21,6 +21,7 @@ namespace duckdb {
 
 class ScenarioCatalog;
 class ScenarioSchemaEntry;
+class ViewCatalogEntry;
 
 //! The one canonical error for any DDL attempted inside a scenario.
 [[noreturn]] void ThrowScenarioDDLError();
@@ -73,8 +74,12 @@ public:
 	//! The base table in the host catalog this entry mirrors
 	TableCatalogEntry &base_entry;
 	//! Row identity: base PK or the key declared at scenario_create
-	//! (resolved at entry construction; empty = keyless, insert-only DML)
+	//! (resolved at entry construction; empty = keyless)
 	vector<idx_t> key_columns;
+
+	//! Identity exposed through the virtual columns: the key columns, or
+	//! EVERY column for keyless tables (whole-row bag identity)
+	vector<idx_t> IdentityColumns() const;
 
 public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
@@ -137,6 +142,10 @@ private:
 	//! physical base table's (materialized copies)
 	CatalogEntry &GetOrCreateTableEntryAs(ClientContext &context, TableCatalogEntry &base_table,
 	                                      const string &logical_name);
+	//! Mirror a base view so its SQL rebinds against the scenario's tables
+	CatalogEntry &GetOrCreateViewEntry(ClientContext &context, ViewCatalogEntry &base_view);
+	//! The delta/mat naming key: plain for main, '<schema>.<table>' otherwise
+	string QualifiedName(const string &table_name) const;
 	ScenarioCatalog &GetScenarioCatalog();
 };
 
@@ -214,8 +223,14 @@ public:
 	void MarkHostWrite(ClientContext &context, DatabaseModificationType type);
 
 private:
-	//! The single synthetic schema ("main")
+	//! The synthetic "main" schema
 	unique_ptr<ScenarioSchemaEntry> main_schema;
+	//! Lazily mirrored non-main base schemas (name -> synthetic schema entry)
+	mutex schema_lock;
+	case_insensitive_map_t<unique_ptr<ScenarioSchemaEntry>> mirrored_schemas;
+
+	//! Find or create the mirror for a non-main base schema
+	ScenarioSchemaEntry &GetOrCreateMirroredSchema(const string &schema_name);
 };
 
 } // namespace duckdb

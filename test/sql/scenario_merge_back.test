@@ -156,15 +156,23 @@ SELECT count(*) FROM forecast WHERE id = 2;
 statement ok
 CALL scenario_create('matx', mode := 'materialized');
 
-statement error
+# materialized merge-back is supported since v0.4.1 (see
+# scenario_merge_materialized.test); an untouched scenario is a no-op merge
+query III
 SELECT * FROM scenario_merge('matx');
 ----
-<REGEX>:.*materialized.*
+0	0	0
 
 statement error
 SELECT * FROM scenario_merge('nope');
 ----
 <REGEX>:.*not found.*
+
+# merged scenarios are terminally frozen: unfreeze refuses
+statement error
+CALL scenario_unfreeze('mb');
+----
+<REGEX>:.*merged.*
 
 # --- cleanup ---------------------------------------------------------------------------------
 
