@@ -25,10 +25,17 @@ class TableCatalogEntry;
 
 class ScenarioDelta {
 public:
-	//! Delta column layout: _op, _ts, then all base columns in base order
+	//! Delta column layout: _op, _ts, then all base columns in base order.
+	//! Keyless tables (no PK, no declared key) append a trailing _count
+	//! BIGINT: the delta is a bag changelog (I/D rows with multiplicities,
+	//! aggregated on read) because whole-row identity cannot be a PK (NULLs).
 	static constexpr idx_t OP_COL = 0;
 	static constexpr idx_t TS_COL = 1;
 	static constexpr idx_t PAYLOAD_START = 2;
+	static constexpr const char *COUNT_COLUMN = "_count";
+
+	//! Position of the trailing _count column, if this delta has one
+	static optional_idx CountColumnIndex(const TableCatalogEntry &delta_table);
 
 	static string DeltaTableName(int64_t scenario_id, const string &table_name);
 	//! Materialized base copy: __anofox_scenario.s<id>_mat_<table> (Phase 2)

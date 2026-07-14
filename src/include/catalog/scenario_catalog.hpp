@@ -74,8 +74,12 @@ public:
 	//! The base table in the host catalog this entry mirrors
 	TableCatalogEntry &base_entry;
 	//! Row identity: base PK or the key declared at scenario_create
-	//! (resolved at entry construction; empty = keyless, insert-only DML)
+	//! (resolved at entry construction; empty = keyless)
 	vector<idx_t> key_columns;
+
+	//! Identity exposed through the virtual columns: the key columns, or
+	//! EVERY column for keyless tables (whole-row bag identity)
+	vector<idx_t> IdentityColumns() const;
 
 public:
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;

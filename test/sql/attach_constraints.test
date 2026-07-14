@@ -101,15 +101,20 @@ SELECT count(*) FROM no_pk_log;
 ----
 1
 
-statement error
-UPDATE s.no_pk_log SET event = 'x';
-----
-<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+# keyless UPDATE/DELETE work since v0.4.1 (bag semantics - see
+# attach_keyless_dml.test); the base stays untouched
+statement ok
+UPDATE s.no_pk_log SET event = 'renamed' WHERE event = 'created';
 
-statement error
-DELETE FROM s.no_pk_log WHERE event = 'created';
+query I
+DELETE FROM s.no_pk_log WHERE event = 'renamed';
 ----
-<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+1
+
+query I
+SELECT count(*) FROM no_pk_log;
+----
+1
 
 # --- secondary UNIQUE among scenario-written rows -----------------------------------
 

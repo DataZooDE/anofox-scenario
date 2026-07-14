@@ -224,6 +224,7 @@ unique_ptr<GlobalTableFunctionState> MergeInit(ClientContext &context, TableFunc
 struct MergeRow {
 	char op;
 	row_t delta_row_id;
+	int64_t count = 1;     // keyless bag deltas: multiplicity
 	vector<Value> payload; // base-table layout
 };
 
@@ -474,7 +475,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 
 		// load the delta rows
 		auto delta_types = delta_table.GetStorage().GetTypes();
-		idx_t payload_count = delta_types.size() - ScenarioDelta::PAYLOAD_START;
+		auto count_column = ScenarioDelta::CountColumnIndex(delta_table);
+		idx_t payload_count = delta_types.size() - ScenarioDelta::PAYLOAD_START - (count_column.IsValid() ? 1 : 0);
 		vector<StorageIndex> column_ids;
 		vector<LogicalType> scan_types;
 		column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
@@ -492,6 +494,10 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			                             for (idx_t i = 0; i < payload_count; i++) {
 				                             merge_row.payload.push_back(
 				                                 chunk.GetValue(1 + ScenarioDelta::PAYLOAD_START + i, row));
+			                             }
+			                             if (count_column.IsValid()) {
+				                             merge_row.count =
+				                                 chunk.GetValue(1 + count_column.GetIndex(), row).GetValue<int64_t>();
 			                             }
 			                             rows.push_back(std::move(merge_row));
 			                             return true;
@@ -511,14 +517,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		auto &base_duck = base_entry->Cast<DuckTableEntry>();
 		auto pk_columns =
 		    ScenarioDelta::GetKeyColumns(context, host, entry->scenario_id, logical_name, *base_entry);
-		if (pk_columns.empty() ) {
-			// no-PK tables carry only 'I' rows (v1 write limits): plain appends
-			for (auto &row : rows) {
-				if (row.op != 'I') {
-					throw InternalException("anofox_scenario: unexpected op '%c' in no-PK delta", row.op);
-				}
-			}
-		}
+
 
 		// resolve base rowids for the delta's keys
 		unordered_map<string, row_t> base_row_ids;
@@ -754,29 +753,111 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				tables_changed++;
 			}
 		} else {
-			// no-PK: plain appends
+			// keyless bag: aggregate net multiplicity per value, delete that
+			// many matching base rows for negative nets, append for positive
+			auto value_key = [&](const vector<Value> &payload) {
+				string key;
+				for (auto &value : payload) {
+					if (value.IsNull()) {
+						key += "N|";
+					} else {
+						auto str = value.ToString();
+						key += to_string(str.size()) + ":" + str;
+					}
+				}
+				return key;
+			};
+			struct BagNet {
+				int64_t net = 0;
+				const vector<Value> *payload = nullptr;
+			};
+			unordered_map<string, BagNet> nets;
+			for (auto &row : rows) {
+				auto &net = nets[value_key(row.payload)];
+				net.net += (row.op == 'I') ? row.count : -row.count;
+				if (!net.payload) {
+					net.payload = &row.payload;
+				}
+			}
+			// negative nets: collect up to |net| base rowids per value
+			unordered_map<string, idx_t> delete_budget;
+			for (auto &net_pair : nets) {
+				if (net_pair.second.net < 0) {
+					delete_budget[net_pair.first] = NumericCast<idx_t>(-net_pair.second.net);
+				}
+			}
+			vector<row_t> base_rows_to_delete;
+			if (!delete_budget.empty()) {
+				vector<StorageIndex> base_cols;
+				vector<LogicalType> base_scan_types;
+				base_cols.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+				base_scan_types.push_back(LogicalType::ROW_TYPE);
+				vector<idx_t> value_positions;
+				for (idx_t col = 0; col < base_entry->GetColumns().LogicalColumnCount(); col++) {
+					value_positions.push_back(base_cols.size());
+					base_cols.emplace_back(col);
+					base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(col)).Type());
+				}
+				ScenarioDelta::ScanTableRows(context, base_duck, std::move(base_cols), base_scan_types,
+				                             [&](DataChunk &chunk, idx_t row) {
+					                             auto key = ScenarioDelta::MakeKey(chunk, row, value_positions);
+					                             auto budget = delete_budget.find(key);
+					                             if (budget != delete_budget.end() && budget->second > 0) {
+						                             budget->second--;
+						                             base_rows_to_delete.push_back(
+						                                 chunk.GetValue(0, row).GetValue<row_t>());
+					                             }
+					                             return true;
+				                             });
+			}
 			auto binder = Binder::CreateBinder(context);
 			auto base_constraints = binder->BindConstraints(base_duck);
+			if (!base_rows_to_delete.empty()) {
+				auto &base_storage = base_duck.GetStorage();
+				auto delete_state = base_storage.InitializeDelete(base_duck, context, base_constraints);
+				idx_t offset = 0;
+				while (offset < base_rows_to_delete.size()) {
+					idx_t batch = MinValue<idx_t>(base_rows_to_delete.size() - offset, STANDARD_VECTOR_SIZE);
+					Vector row_ids(LogicalType::ROW_TYPE);
+					for (idx_t i = 0; i < batch; i++) {
+						row_ids.SetValue(i, Value::BIGINT(base_rows_to_delete[offset + i]));
+					}
+					base_storage.Delete(*delete_state, context, row_ids, batch);
+					offset += batch;
+				}
+				rows_applied += base_rows_to_delete.size();
+			}
+			// positive nets: append that many copies
 			DataChunk append_chunk;
 			append_chunk.Initialize(Allocator::Get(context), base_duck.GetStorage().GetTypes());
 			idx_t count = 0;
-			for (auto &row : rows) {
-				for (idx_t col = 0; col < row.payload.size(); col++) {
-					append_chunk.SetValue(col, count, row.payload[col]);
+			auto flush_appends = [&]() {
+				if (count == 0) {
+					return;
 				}
-				if (++count == STANDARD_VECTOR_SIZE) {
-					append_chunk.SetCardinality(count);
-					base_duck.GetStorage().LocalAppend(base_duck, context, append_chunk, base_constraints);
-					append_chunk.Reset();
-					count = 0;
-				}
-				rows_applied++;
-			}
-			if (count > 0) {
 				append_chunk.SetCardinality(count);
 				base_duck.GetStorage().LocalAppend(base_duck, context, append_chunk, base_constraints);
+				append_chunk.Reset();
+				count = 0;
+			};
+			idx_t inserted = 0;
+			for (auto &net_pair : nets) {
+				for (int64_t n = 0; n < net_pair.second.net; n++) {
+					auto &payload = *net_pair.second.payload;
+					for (idx_t col = 0; col < payload.size(); col++) {
+						append_chunk.SetValue(col, count, payload[col]);
+					}
+					inserted++;
+					if (++count == STANDARD_VECTOR_SIZE) {
+						flush_appends();
+					}
+				}
 			}
-			tables_changed++;
+			flush_appends();
+			rows_applied += inserted;
+			if (inserted + base_rows_to_delete.size() > 0) {
+				tables_changed++;
+			}
 		}
 
 		// empty the delta (the scenario has been absorbed)

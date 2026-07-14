@@ -40,6 +40,8 @@ class ScenarioDMLGlobalState : public GlobalSinkState {
 public:
 	optional_ptr<DuckTableEntry> delta_table;
 	vector<unique_ptr<BoundConstraint>> delta_constraints;
+	//! Keyless bag deltas: position of the trailing _count column
+	optional_idx delta_count_column;
 	ScenarioDeltaKeyMap delta_keys;
 	vector<idx_t> pk_columns;
 	//! Keys already written by this statement (double-touch detection)
@@ -85,7 +87,10 @@ public:
 			base_constraint_state = base_duck.GetStorage().InitializeConstraintState(base_duck, base_constraints);
 		}
 		pk_columns = entry.key_columns;
-		delta_keys.Load(client, *delta_ptr, pk_columns);
+		if (!pk_columns.empty()) {
+			delta_keys.Load(client, *delta_ptr, pk_columns);
+		}
+		delta_count_column = ScenarioDelta::CountColumnIndex(*delta_ptr);
 		delta_chunk.Initialize(Allocator::Get(client), delta_ptr->GetStorage().GetTypes());
 	}
 
@@ -191,6 +196,9 @@ public:
 				delta_chunk.SetValue(ScenarioDelta::TS_COL, i, Value::TIMESTAMP(now));
 				for (idx_t col = 0; col < row.size(); col++) {
 					delta_chunk.SetValue(ScenarioDelta::PAYLOAD_START + col, i, row[col]);
+				}
+				if (delta_count_column.IsValid()) {
+					delta_chunk.SetValue(delta_count_column.GetIndex(), i, Value::BIGINT(1));
 				}
 			}
 			delta_chunk.SetCardinality(batch);
@@ -328,11 +336,43 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 	// Base NOT NULL + CHECK constraints hold for the post-image
 	ScenarioVerifyNotNullAndCheck(client, entry, bound_constraints, full_chunk);
 
-	// Row identity: [__scenario_origin, __scenario_key_0..n-1]
 	// [__scenario_origin, __scenario_key_0..n-1, (duck bases) rowid]
 	idx_t row_id_count = entry.GetRowIdColumns().size();
 	idx_t row_id_start =
 	    explicit_row_id_start.IsValid() ? explicit_row_id_start.GetIndex() : chunk.ColumnCount() - row_id_count;
+
+	if (gstate.pk_columns.empty()) {
+		// keyless bag: an update is D(old row) + I(new row), multiplicity 1
+		// each - the reader aggregates. The identity virtuals carry the old
+		// row; full_chunk carries the post-image.
+		entry.GetScenarioCatalog().MarkHostWrite(client, DatabaseModificationType::INSERT_DATA);
+		auto identity_count = entry.GetColumns().LogicalColumnCount();
+		vector<char> bag_ops;
+		vector<vector<Value>> bag_rows;
+		for (idx_t i = 0; i < chunk.size(); i++) {
+			vector<Value> old_row;
+			for (idx_t col = 0; col < identity_count; col++) {
+				old_row.push_back(chunk.GetValue(row_id_start + 1 + col, i));
+			}
+			bag_ops.push_back('D');
+			bag_rows.push_back(std::move(old_row));
+			vector<Value> new_row;
+			for (idx_t col = 0; col < identity_count; col++) {
+				new_row.push_back(full_chunk.GetValue(col, i));
+			}
+			bag_ops.push_back('I');
+			bag_rows.push_back(std::move(new_row));
+			gstate.affected_count++;
+		}
+		gstate.FlushAppends(client, entry, bag_ops, bag_rows);
+		if (return_chunk) {
+			if (!gstate.return_collection) {
+				gstate.return_collection = make_uniq<ColumnDataCollection>(Allocator::Get(client), entry.GetTypes());
+			}
+			gstate.return_collection->Append(full_chunk);
+		}
+		return SinkResultType::NEED_MORE_INPUT;
+	}
 	vector<idx_t> old_key_positions;
 	for (idx_t k = 0; k < gstate.pk_columns.size(); k++) {
 		old_key_positions.push_back(row_id_start + 1 + k);
@@ -527,6 +567,38 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 	entry.GetScenarioCatalog().MarkHostWrite(client, DatabaseModificationType::DELETE_DATA |
 	                                                     DatabaseModificationType::INSERT_DATA);
 
+	if (gstate.pk_columns.empty()) {
+		// keyless bag: append D(row, 1) per doomed visible row; the identity
+		// virtuals carry the whole row, so RETURNING needs no fetch
+		vector<char> bag_ops;
+		vector<vector<Value>> bag_rows;
+		for (idx_t i = 0; i < chunk.size(); i++) {
+			vector<Value> row_values;
+			for (idx_t col = 0; col < column_count; col++) {
+				row_values.push_back(chunk.GetValue(row_id_start + 1 + col, i));
+			}
+			bag_ops.push_back('D');
+			bag_rows.push_back(std::move(row_values));
+			gstate.affected_count++;
+		}
+		if (return_chunk) {
+			if (!gstate.return_collection) {
+				gstate.return_collection = make_uniq<ColumnDataCollection>(Allocator::Get(client), entry.GetTypes());
+			}
+			DataChunk out_chunk;
+			out_chunk.Initialize(Allocator::Get(client), entry.GetTypes());
+			for (idx_t i = 0; i < bag_rows.size(); i++) {
+				for (idx_t col = 0; col < column_count; col++) {
+					out_chunk.SetValue(col, i, bag_rows[i][col]);
+				}
+			}
+			out_chunk.SetCardinality(bag_rows.size());
+			gstate.return_collection->Append(out_chunk);
+		}
+		gstate.FlushAppends(client, entry, bag_ops, bag_rows);
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+
 	// RETURNING: fetch the visible values of the doomed rows *before* the
 	// delta is mutated. Base rows come by rowid (trails the keys in the child
 	// chunk); scenario rows come from their delta row (full payload for I/U).
@@ -679,14 +751,28 @@ PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vec
 // Plan hooks
 //===----------------------------------------------------------------------===//
 
+//! Keyless tables get bag-mode UPDATE/DELETE when their delta carries the
+//! _count column (scenarios created before v0.4.1 lack it)
+void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry) {
+	if (!entry.key_columns.empty()) {
+		return;
+	}
+	auto &scenario_catalog = entry.GetScenarioCatalog();
+	auto delta = ScenarioDelta::TryGetDeltaTable(context, scenario_catalog.GetHostCatalog(context),
+	                                             scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
+	if (!delta || !ScenarioDelta::CountColumnIndex(*delta).IsValid()) {
+		throw NotImplementedException(
+		    "UPDATE/DELETE on keyless table '%s' requires a scenario created with v0.4.1+ (its delta lacks the "
+		    "_count column). Recreate the scenario, or declare key_columns at scenario_create",
+		    entry.name);
+	}
+}
+
 PhysicalOperator &ScenarioCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
 	ThrowIfFrozen(context, "UPDATE");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
-	if (entry.key_columns.empty()) {
-		throw NotImplementedException("UPDATE/DELETE in scenarios requires a PRIMARY KEY on the base table or "
-		                              "key_columns declared at scenario_create (v1 limitation)");
-	}
+	ThrowIfKeylessUnsupported(context, entry);
 	auto &update = planner.Make<PhysicalScenarioUpdate>(
 	    op.types, entry, op.columns, std::move(op.expressions), std::move(op.bound_defaults),
 	    std::move(op.bound_constraints), op.estimated_cardinality, op.return_chunk, optional_idx());
@@ -698,14 +784,13 @@ PhysicalOperator &ScenarioCatalog::PlanDelete(ClientContext &context, PhysicalPl
                                               LogicalDelete &op, PhysicalOperator &plan) {
 	ThrowIfFrozen(context, "DELETE");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
-	if (op.return_chunk && !entry.base_entry.IsDuckTable()) {
+	if (op.return_chunk && !entry.base_entry.IsDuckTable() && !entry.key_columns.empty()) {
+		// keyless tables carry the whole row in their identity columns, so
+		// RETURNING needs no base fetch even for foreign bases
 		throw NotImplementedException("DELETE ... RETURNING on scenarios over non-DuckDB bases (e.g. DuckLake) is "
 		                              "not supported yet - SELECT the rows before deleting them");
 	}
-	if (entry.key_columns.empty()) {
-		throw NotImplementedException("UPDATE/DELETE in scenarios requires a PRIMARY KEY on the base table or "
-		                              "key_columns declared at scenario_create (v1 limitation)");
-	}
+	ThrowIfKeylessUnsupported(context, entry);
 	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
 	auto &del = planner.Make<PhysicalScenarioDelete>(op.types, entry, bound_ref.index, op.estimated_cardinality,
 	                                                 op.return_chunk);

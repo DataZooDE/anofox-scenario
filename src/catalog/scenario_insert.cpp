@@ -314,6 +314,11 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 		delta_chunk.data[ScenarioDelta::PAYLOAD_START + col].Reference(chunk.data[col]);
 	}
+	auto count_column = ScenarioDelta::CountColumnIndex(delta_table);
+	if (count_column.IsValid()) {
+		// keyless bag deltas: every appended row carries multiplicity 1
+		delta_chunk.data[count_column.GetIndex()].Reference(Value::BIGINT(1));
+	}
 	delta_chunk.SetCardinality(chunk.size());
 
 	// (delta_keys entries for this chunk were already recorded in the

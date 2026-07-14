@@ -33,8 +33,12 @@ struct ScenarioScanBindData : public TableFunctionData {
 	TableCatalogEntry &base_entry;
 	//! The delta table, when this scenario has modified the table
 	optional_ptr<DuckTableEntry> delta_table;
-	//! Logical PK column ids of the base table (empty when none)
+	//! Row-identity columns: the key columns, or every column for keyless
+	//! tables (whole-row bag identity, delta rows carry _count)
 	vector<idx_t> pk_columns;
+	//! Keyless bag mode: aggregate the delta by value, suppress base rows by
+	//! multiplicity budget instead of by key set
+	bool keyless = false;
 	//! Phase 4: non-duck bases are scanned through their own table function,
 	//! bound with an AT (TIMESTAMP => created_at) pin for versioned catalogs
 	bool base_is_duck = true;
@@ -86,6 +90,9 @@ struct ScenarioScanGlobalState : public GlobalTableFunctionState {
 	ColumnDataParallelScanState delta_parallel_state;
 	bool has_visible_delta = false;
 	unordered_set<string> suppressed_keys;
+	//! Keyless bag mode: how many base copies of each value to suppress
+	//! (consumed while scanning - the scan runs single-threaded then)
+	unordered_map<string, idx_t> suppress_budget;
 
 	idx_t max_threads = 1;
 	idx_t MaxThreads() const override {
@@ -332,37 +339,91 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			append_chunk.Reset();
 			append_count = 0;
 		};
-		ScenarioDelta::ScanTableRows(
-		    context, delta_table, std::move(delta_column_ids), delta_types, [&](DataChunk &chunk, idx_t row) {
-			    auto op = chunk.GetValue(0, row).GetValue<string>()[0];
-			    // Suppression keys come from ALL U/D rows, independent of any
-			    // pushed filter (a filtered-out update still hides its base row)
-			    if (op == 'U' || op == 'D') {
-				    if (!delta_key_positions.empty()) {
-					    result->suppressed_keys.insert(ScenarioDelta::MakeKey(chunk, row, delta_key_positions));
-				    }
-			    }
-			    if (op == 'I' || op == 'U') {
-				    for (idx_t out_idx = 0; out_idx < delta_pos_for_output.size(); out_idx++) {
-					    auto pos = delta_pos_for_output[out_idx];
-					    if (pos == DELTA_OUT_NULL) {
-						    append_chunk.SetValue(out_idx, append_count, Value(LogicalType::ROW_TYPE));
-					    } else if (pos == DELTA_OUT_ORIGIN) {
-						    append_chunk.SetValue(out_idx, append_count, Value::TINYINT(1));
-					    } else {
-						    append_chunk.SetValue(out_idx, append_count, chunk.GetValue(pos, row));
+		auto emit_delta_row = [&](DataChunk &chunk, idx_t row) {
+			for (idx_t out_idx = 0; out_idx < delta_pos_for_output.size(); out_idx++) {
+				auto pos = delta_pos_for_output[out_idx];
+				if (pos == DELTA_OUT_NULL) {
+					append_chunk.SetValue(out_idx, append_count, Value(LogicalType::ROW_TYPE));
+				} else if (pos == DELTA_OUT_ORIGIN) {
+					append_chunk.SetValue(out_idx, append_count, Value::TINYINT(1));
+				} else {
+					append_chunk.SetValue(out_idx, append_count, chunk.GetValue(pos, row));
+				}
+			}
+			if (++append_count == STANDARD_VECTOR_SIZE) {
+				flush();
+			}
+		};
+		if (!bind_data.keyless) {
+			ScenarioDelta::ScanTableRows(
+			    context, delta_table, std::move(delta_column_ids), delta_types, [&](DataChunk &chunk, idx_t row) {
+				    auto op = chunk.GetValue(0, row).GetValue<string>()[0];
+				    // Suppression keys come from ALL U/D rows, independent of any
+				    // pushed filter (a filtered-out update still hides its base row)
+				    if (op == 'U' || op == 'D') {
+					    if (!delta_key_positions.empty()) {
+						    result->suppressed_keys.insert(
+						        ScenarioDelta::MakeKey(chunk, row, delta_key_positions));
 					    }
 				    }
-				    if (++append_count == STANDARD_VECTOR_SIZE) {
-					    flush();
+				    if (op == 'I' || op == 'U') {
+					    emit_delta_row(chunk, row);
 				    }
-			    }
-			    return true;
-		    });
+				    return true;
+			    });
+		} else {
+			// Bag changelog: aggregate I/D multiplicities per value, then emit
+			// the positive nets as scenario rows and turn the negative nets
+			// into a base-side suppression budget
+			auto count_pos = delta_column_ids.size();
+			delta_column_ids.emplace_back(ScenarioDelta::PAYLOAD_START +
+			                              bind_data.entry.GetColumns().LogicalColumnCount());
+			delta_types.push_back(LogicalType::BIGINT);
+			struct BagEntry {
+				int64_t net = 0;
+				vector<Value> row_values; // delta scan layout, for emission
+			};
+			unordered_map<string, BagEntry> bag;
+			auto column_count = delta_column_ids.size();
+			ScenarioDelta::ScanTableRows(
+			    context, delta_table, std::move(delta_column_ids), delta_types, [&](DataChunk &chunk, idx_t row) {
+				    auto op = chunk.GetValue(0, row).GetValue<string>()[0];
+				    auto count = chunk.GetValue(count_pos, row).GetValue<int64_t>();
+				    auto key = ScenarioDelta::MakeKey(chunk, row, delta_key_positions);
+				    auto &bag_entry = bag[key];
+				    bag_entry.net += (op == 'I') ? count : -count;
+				    if (bag_entry.row_values.empty()) {
+					    for (idx_t col = 0; col < column_count; col++) {
+						    bag_entry.row_values.push_back(chunk.GetValue(col, row));
+					    }
+				    }
+				    return true;
+			    });
+			DataChunk value_chunk;
+			value_chunk.Initialize(Allocator::Get(context), delta_types);
+			for (auto &bag_pair : bag) {
+				if (bag_pair.second.net > 0) {
+					value_chunk.Reset();
+					for (idx_t col = 0; col < column_count; col++) {
+						value_chunk.SetValue(col, 0, bag_pair.second.row_values[col]);
+					}
+					value_chunk.SetCardinality(1);
+					for (int64_t n = 0; n < bag_pair.second.net; n++) {
+						emit_delta_row(value_chunk, 0);
+					}
+				} else if (bag_pair.second.net < 0) {
+					result->suppress_budget[bag_pair.first] = NumericCast<idx_t>(-bag_pair.second.net);
+				}
+			}
+		}
 		flush();
 		if (result->visible_delta->Count() > 0) {
 			result->visible_delta->InitializeScan(result->delta_parallel_state);
 			result->has_visible_delta = true;
+		}
+		if (bind_data.keyless && !result->suppress_budget.empty()) {
+			// the budget is consumed while scanning; keep that single-threaded
+			result->max_threads = 1;
 		}
 	}
 	return std::move(result);
@@ -482,6 +543,26 @@ bool EmitBaseChunk(ScenarioScanGlobalState &gstate, ScenarioScanLocalState &lsta
 		scan_target.Slice(sel, kept);
 		count = kept;
 	}
+	if (!gstate.suppress_budget.empty()) {
+		// keyless bag mode: swallow up to <budget> base copies of each value
+		// (single-threaded by construction, so plain decrements are safe)
+		SelectionVector sel(count);
+		idx_t kept = 0;
+		for (idx_t i = 0; i < count; i++) {
+			auto key = ScenarioDelta::MakeKey(scan_target, i, gstate.key_positions);
+			auto budget = gstate.suppress_budget.find(key);
+			if (budget != gstate.suppress_budget.end() && budget->second > 0) {
+				budget->second--;
+				continue;
+			}
+			sel.set_index(kept++, i);
+		}
+		if (kept == 0) {
+			return false;
+		}
+		scan_target.Slice(sel, kept);
+		count = kept;
+	}
 	if (gstate.needs_projection) {
 		for (idx_t out_idx = 0; out_idx < gstate.out_map.size(); out_idx++) {
 			auto &mapping = gstate.out_map[out_idx];
@@ -516,7 +597,8 @@ TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, Scenario
 	auto &host_catalog = scenario_catalog.GetHostCatalog(context);
 	auto delta_table =
 	    ScenarioDelta::TryGetDeltaTable(context, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
-	auto result = make_uniq<ScenarioScanBindData>(entry, entry.base_entry, delta_table, entry.key_columns);
+	auto result = make_uniq<ScenarioScanBindData>(entry, entry.base_entry, delta_table, entry.IdentityColumns());
+	result->keyless = entry.key_columns.empty();
 	result->base_is_duck = entry.base_entry.IsDuckTable();
 	// WP2.1: duck bases honor pushed filters on both merge sides; foreign
 	// scans cannot be trusted to apply someone else's filters, so pushdown

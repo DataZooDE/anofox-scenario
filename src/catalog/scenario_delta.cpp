@@ -19,6 +19,16 @@ namespace duckdb {
 constexpr idx_t ScenarioDelta::OP_COL;
 constexpr idx_t ScenarioDelta::TS_COL;
 constexpr idx_t ScenarioDelta::PAYLOAD_START;
+constexpr const char *ScenarioDelta::COUNT_COLUMN;
+
+optional_idx ScenarioDelta::CountColumnIndex(const TableCatalogEntry &delta_table) {
+	auto &columns = delta_table.GetColumns();
+	auto count = columns.LogicalColumnCount();
+	if (count > PAYLOAD_START && columns.GetColumn(LogicalIndex(count - 1)).Name() == COUNT_COLUMN) {
+		return optional_idx(count - 1);
+	}
+	return optional_idx();
+}
 
 string ScenarioDelta::DeltaTableName(int64_t scenario_id, const string &table_name) {
 	return "s" + to_string(scenario_id) + "_delta_" + table_name;
@@ -178,24 +188,35 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
 	}
 
-	// Secondary UNIQUE constraints are mirrored so scenario-written rows are
-	// unique among themselves too (the base side is probed separately at DML
-	// time). Tombstones carry NULL payloads, which never conflict.
-	for (auto &constraint : base_entry.GetConstraints()) {
-		if (constraint->type != ConstraintType::UNIQUE) {
-			continue;
+	bool keyless = pk_columns.empty() && (!declared_keys || declared_keys->empty());
+	if (keyless) {
+		// Bag changelog: whole-row identity cannot be a PK (NULLs), so I/D
+		// rows carry a multiplicity instead and readers aggregate. Secondary
+		// UNIQUE constraints are not mirrored here (D rows carry real
+		// payloads and would collide with their replacements).
+		info->columns.AddColumn(ColumnDefinition(COUNT_COLUMN, LogicalType::BIGINT));
+		info->constraints.push_back(
+		    make_uniq<NotNullConstraint>(LogicalIndex(PAYLOAD_START + base_entry.GetColumns().LogicalColumnCount())));
+	} else {
+		// Secondary UNIQUE constraints are mirrored so scenario-written rows
+		// are unique among themselves too (the base side is probed separately
+		// at DML time). Tombstones carry NULL payloads, which never conflict.
+		for (auto &constraint : base_entry.GetConstraints()) {
+			if (constraint->type != ConstraintType::UNIQUE) {
+				continue;
+			}
+			auto &unique = constraint->Cast<UniqueConstraint>();
+			if (unique.IsPrimaryKey()) {
+				continue;
+			}
+			vector<string> unique_names;
+			if (unique.HasIndex()) {
+				unique_names.push_back(base_entry.GetColumn(unique.GetIndex()).Name());
+			} else {
+				unique_names = unique.GetColumnNames();
+			}
+			info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(unique_names), false));
 		}
-		auto &unique = constraint->Cast<UniqueConstraint>();
-		if (unique.IsPrimaryKey()) {
-			continue;
-		}
-		vector<string> unique_names;
-		if (unique.HasIndex()) {
-			unique_names.push_back(base_entry.GetColumn(unique.GetIndex()).Name());
-		} else {
-			unique_names = unique.GetColumnNames();
-		}
-		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(unique_names), false));
 	}
 	host_catalog.CreateTable(context, std::move(info));
 

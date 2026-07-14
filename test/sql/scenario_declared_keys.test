@@ -11,17 +11,23 @@ CREATE TABLE events (event_id INTEGER, kind VARCHAR, payload VARCHAR);
 statement ok
 INSERT INTO events VALUES (1, 'click', 'a'), (2, 'view', 'b'), (3, 'click', 'c');
 
-# without a declared key: UPDATE/DELETE are gated (existing rule)
+# without a declared key the table still updates - via whole-row bag
+# semantics (declared keys remain the better model: keyed diffs and merges)
 statement ok
 CALL scenario_create('nokey');
 
 statement ok
 ATTACH 'nokey' AS n (TYPE scenario);
 
-statement error
+query I
 UPDATE n.events SET payload = 'x' WHERE event_id = 1;
 ----
-<REGEX>:.*PRIMARY KEY.*v1 limitation.*
+1
+
+query T
+SELECT payload FROM n.events WHERE event_id = 1;
+----
+x
 
 statement ok
 DETACH n;
