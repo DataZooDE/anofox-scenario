@@ -9,4 +9,3 @@ test/python/__pycache__/
 .codex-delegate/
 .antigravity-delegate/
 .cache/
-posthog-telemetry/
