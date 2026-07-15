@@ -141,3 +141,41 @@ CALL scenario_drop('d1');
 
 statement ok
 CALL scenario_drop('d2');
+
+# --- identifiers with embedded quotes survive the SQL builders ---------------------
+
+statement ok
+CREATE TABLE quoty (id INTEGER PRIMARY KEY, "va'l" INTEGER);
+
+statement ok
+INSERT INTO quoty VALUES (1, 10);
+
+statement ok
+CALL scenario_create('dq');
+
+statement ok
+ATTACH 'dq' AS dq (TYPE scenario);
+
+statement ok
+UPDATE dq.quoty SET "va'l" = 20 WHERE id = 1;
+
+query ITTTT
+SELECT id, change_type, column_name, old_value, new_value FROM scenario_diff('dq', 'quoty');
+----
+1	modified	va'l	10	20
+
+query TT
+SELECT table_name, action FROM scenario_merge_preview('dq');
+----
+quoty	update
+
+query II
+SELECT rows_added, rows_modified FROM scenario_diff_summary('dq') WHERE table_name = 'quoty';
+----
+0	1
+
+statement ok
+DETACH dq;
+
+statement ok
+CALL scenario_drop('dq');

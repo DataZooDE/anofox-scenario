@@ -583,6 +583,23 @@ BindInfo ScenarioScanGetBindInfo(const optional_ptr<FunctionData> bind_data) {
 	return BindInfo(data.entry);
 }
 
+//! The common-subplan optimizer dedups operators by their SERIALIZED form.
+//! Without a serializer two scans of the same-named table in DIFFERENT
+//! scenarios are byte-identical and get silently merged (both sides then
+//! return the first world's rows). Serializing the scenario identity keeps
+//! them distinct; plans are never deserialized (statement caching is off).
+void ScenarioScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                           const TableFunction &function) {
+	auto &data = bind_data->Cast<ScenarioScanBindData>();
+	serializer.WriteProperty(100, "scenario_catalog", data.entry.catalog.GetName());
+	serializer.WriteProperty(101, "schema", data.entry.ParentSchema().name);
+	serializer.WriteProperty(102, "table", data.entry.name);
+}
+
+unique_ptr<FunctionData> ScenarioScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+	throw NotImplementedException("scenario table scans cannot be deserialized - they rebind per transaction");
+}
+
 } // namespace
 
 TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, ScenarioTableEntry &entry,
@@ -591,6 +608,8 @@ TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, Scenario
 	function.init_global = ScenarioScanInitGlobal;
 	function.init_local = ScenarioScanInitLocal;
 	function.get_bind_info = ScenarioScanGetBindInfo;
+	function.serialize = ScenarioScanSerialize;
+	function.deserialize = ScenarioScanDeserialize;
 	function.projection_pushdown = true;
 
 	auto &scenario_catalog = entry.GetScenarioCatalog();

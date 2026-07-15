@@ -150,7 +150,9 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		return;
 	}
 	base_schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &base_entry) {
-		if (!ShouldExpose(base_entry)) {
+		// the "tables" catalog set also delivers views: this branch mirrors
+		// tables only (views enumerate through the VIEW_ENTRY branch above)
+		if (base_entry.type != CatalogType::TABLE_ENTRY || !ShouldExpose(base_entry)) {
 			return;
 		}
 		callback(GetOrCreateTableEntry(context, base_entry.Cast<TableCatalogEntry>()));
