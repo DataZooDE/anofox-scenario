@@ -1,0 +1,67 @@
+# name: test/sql/attach_concurrent.test
+# description: Phase 1 WP5: concurrent scenario writers surface as normal transaction/constraint conflicts
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 100), (2, 200);
+
+statement ok
+CALL scenario_create('cc');
+
+statement ok
+ATTACH 'cc' AS s (TYPE scenario);
+
+# two connections updating the SAME base row in the same scenario:
+# both write a 'U' delta row for PK 1; the second commit must fail on the
+# delta's PK index (normal DuckDB conflict semantics, no silent last-wins)
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE s.forecast SET qty = 111 WHERE id = 1;
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+UPDATE s.forecast SET qty = 222 WHERE id = 1;
+
+statement ok con1
+COMMIT;
+
+statement error con2
+COMMIT;
+----
+<REGEX>:.*(conflict|Conflict|constraint|PRIMARY KEY).*
+
+# the first writer's change won; the scenario is consistent
+query I
+SELECT qty FROM s.forecast WHERE id = 1;
+----
+111
+
+# independent rows from two connections coexist fine
+statement ok con1
+UPDATE s.forecast SET qty = 201 WHERE id = 2;
+
+statement ok con2
+INSERT INTO s.forecast VALUES (3, 300);
+
+query II
+SELECT id, qty FROM s.forecast ORDER BY id;
+----
+1	111
+2	201
+3	300
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('cc');

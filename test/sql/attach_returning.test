@@ -1,0 +1,160 @@
+# name: test/sql/attach_returning.test
+# description: Phase 5 WP5.1/5.3: RETURNING on INSERT/UPDATE; PK-column updates as D+I
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
+
+statement ok
+CALL scenario_create('r');
+
+statement ok
+ATTACH 'r' AS s (TYPE scenario);
+
+# --- INSERT ... RETURNING ------------------------------------------------------
+
+query ITI
+INSERT INTO s.forecast VALUES (10, 'LATAM', 500) RETURNING id, region, qty;
+----
+10	LATAM	500
+
+# expressions over returned columns
+query I
+INSERT INTO s.forecast VALUES (11, 'MEA', 50) RETURNING id * 2;
+----
+22
+
+# defaults are resolved in returned rows
+query ITI
+INSERT INTO s.forecast (id) VALUES (12) RETURNING id, region, qty;
+----
+12	NULL	NULL
+
+# --- UPDATE ... RETURNING --------------------------------------------------------
+
+query II
+UPDATE s.forecast SET qty = qty + 1 WHERE id = 1 RETURNING id, qty;
+----
+1	101
+
+# post-image of a scenario-inserted row
+query II
+UPDATE s.forecast SET qty = 501 WHERE id = 10 RETURNING id, qty;
+----
+10	501
+
+# --- DELETE ... RETURNING -----------------------------------------------------------
+
+# base row: returned values come from the base table
+query ITI
+DELETE FROM s.forecast WHERE id = 3 RETURNING id, region, qty;
+----
+3	APAC	300
+
+# scenario-inserted row: values come from the delta
+query ITI
+DELETE FROM s.forecast WHERE id = 11 RETURNING id, region, qty;
+----
+11	MEA	50
+
+# scenario-updated row: RETURNING reflects the updated (visible) values
+query II
+DELETE FROM s.forecast WHERE id = 1 RETURNING id, qty;
+----
+1	101
+
+# expression over returned columns; multi-row delete
+query I rowsort
+DELETE FROM s.forecast WHERE id IN (10, 12) RETURNING id + qty;
+----
+511
+NULL
+
+# deletes actually happened
+query I
+SELECT count(*) FROM s.forecast;
+----
+1
+
+# put back the rows the rest of the flow expects (delete + re-insert lands as
+# U over the tombstones for base keys, fresh I rows for scenario keys)
+statement ok
+INSERT INTO s.forecast VALUES (1, 'EU', 101), (3, 'APAC', 300),
+                              (10, 'LATAM', 501), (11, 'MEA', 50), (12, NULL, NULL);
+
+# --- PK-column updates: delete + insert semantics (WP5.3) ---------------------------
+
+# base row: old key tombstoned, new key becomes a scenario row
+statement ok
+UPDATE s.forecast SET id = 99 WHERE id = 2;
+
+query I
+SELECT count(*) FROM s.forecast WHERE id = 2;
+----
+0
+
+query ITI
+SELECT id, region, qty FROM s.forecast WHERE id = 99;
+----
+99	US	200
+
+# base untouched
+query I
+SELECT count(*) FROM forecast WHERE id = 2;
+----
+1
+
+# scenario-inserted row: key moves, row stays a scenario-insert
+statement ok
+UPDATE s.forecast SET id = 110 WHERE id = 11;
+
+query I
+SELECT count(*) FROM s.forecast WHERE id = 11;
+----
+0
+
+query II
+SELECT id, qty FROM s.forecast WHERE id = 110;
+----
+110	50
+
+# moving onto an existing visible key errors (base conflict)
+statement error
+UPDATE s.forecast SET id = 3 WHERE id = 99;
+----
+<REGEX>:.*primary key.*
+
+# moving onto a scenario-occupied key errors too
+statement error
+UPDATE s.forecast SET id = 10 WHERE id = 99;
+----
+<REGEX>:.*primary key.*
+
+# moving onto a tombstoned key is allowed (revives the slot as an update)
+statement ok
+DELETE FROM s.forecast WHERE id = 3;
+
+statement ok
+UPDATE s.forecast SET id = 3 WHERE id = 99;
+
+query ITI
+SELECT id, region, qty FROM s.forecast WHERE id = 3;
+----
+3	US	200
+
+# diff reflects the moves coherently
+query I
+SELECT count(*) FROM scenario_diff('r', 'forecast');
+----
+7
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('r');

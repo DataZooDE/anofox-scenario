@@ -1,0 +1,47 @@
+# name: test/sql/attach_unsupported.test
+# description: Phase 1: deliberately unsupported DML shapes fail with guidance (retired in v0.4/v0.5)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 100), (2, 200);
+
+statement ok
+CALL scenario_create('u');
+
+statement ok
+ATTACH 'u' AS s (TYPE scenario);
+
+# DELETE ... RETURNING is supported since v0.4.1 (see attach_returning.test)
+query II
+DELETE FROM s.forecast WHERE id = 1 RETURNING id, qty;
+----
+1	100
+
+statement ok
+INSERT INTO s.forecast VALUES (1, 100);
+
+# RETURNING on MERGE is supported since v0.4.1 (see attach_merge.test)
+query ITT
+MERGE INTO s.forecast USING (SELECT 1 AS id, 1 AS qty) src ON s.forecast.id = src.id WHEN MATCHED THEN UPDATE SET qty = src.qty RETURNING id, qty, merge_action;
+----
+1	1	UPDATE
+
+# the table is still writable through the supported surface
+statement ok
+INSERT INTO s.forecast VALUES (5, 500);
+
+query I
+SELECT count(*) FROM s.forecast;
+----
+3
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('u');

@@ -1,0 +1,254 @@
+# name: test/sql/scenario_ducklake_base.test
+# description: Phase 4: scenarios over a DuckLake base with creation-time snapshot isolation
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+require parquet
+
+# needs the ducklake extension installed for the running duckdb version;
+# run with DUCKLAKE_TESTS=1 (release build - see phase 4 spike notes)
+require-env DUCKLAKE_TESTS
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/lake_meta.ducklake' AS lake (DATA_PATH '__TEST_DIR__/lake_data');
+
+statement ok
+CREATE TABLE lake.forecast (id INTEGER, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO lake.forecast VALUES (1, 'EU', 100), (2, 'US', 200), (3, 'APAC', 300);
+
+statement ok
+CALL scenario_create('lakescen', 'over a ducklake', base := 'lake', key_columns := MAP {'forecast': ['id']});
+
+statement ok
+ATTACH 'lakescen' AS s (TYPE scenario);
+
+# reads flow through the ducklake scan
+query ITI
+SELECT id, region, qty FROM s.forecast ORDER BY id;
+----
+1	EU	100
+2	US	200
+3	APAC	300
+
+# --- REAL snapshot isolation: base churn after creation is INVISIBLE -------------
+
+statement ok
+INSERT INTO lake.forecast VALUES (4, 'LATAM', 400);
+
+statement ok
+UPDATE lake.forecast SET qty = 999 WHERE id = 1;
+
+statement ok
+DELETE FROM lake.forecast WHERE id = 3;
+
+# the lake moved on...
+query I
+SELECT count(*) FROM lake.forecast;
+----
+3
+
+# ...but the scenario still sees creation time
+query ITI
+SELECT id, region, qty FROM s.forecast ORDER BY id;
+----
+1	EU	100
+2	US	200
+3	APAC	300
+
+# --- scenario inserts overlay the pinned base (deltas live in the host) ------------
+
+statement ok
+INSERT INTO s.forecast VALUES (10, 'MEA', 50);
+
+query I
+SELECT count(*) FROM s.forecast;
+----
+4
+
+query I
+SELECT count(*) FROM lake.forecast WHERE id = 10;
+----
+0
+
+# key_columns declared at create unlock the full DML surface on the lake
+statement ok
+UPDATE s.forecast SET qty = 111 WHERE id = 1;
+
+statement ok
+DELETE FROM s.forecast WHERE id = 2;
+
+# merged view: pinned base + scenario edits (still ignoring all lake churn)
+query ITI
+SELECT id, region, qty FROM s.forecast ORDER BY id;
+----
+1	EU	111
+3	APAC	300
+10	MEA	50
+
+# diff reads the declared-key changelog
+query ITT
+SELECT id, change_type, new_value FROM scenario_diff('lakescen', 'forecast') ORDER BY id;
+----
+1	modified	111
+2	removed	NULL
+10	added	NULL
+
+# --- merge-back into the lake ---------------------------------------------------------
+# Cross-catalog merges cannot ride the caller's transaction (single-writer
+# rule, no 2PC): the lake apply commits atomically on its own, then the host
+# bookkeeping lands in the caller's transaction. Autocommit only.
+
+statement error
+BEGIN; SELECT * FROM scenario_merge('lakescen');
+----
+<REGEX>:.*autocommit.*
+
+statement ok
+ROLLBACK;
+
+# id=1 was updated by BOTH the scenario (111) and the lake (999) since the
+# snapshot: a genuine 3-way conflict, detected via the AT-pinned snapshot
+query TTT
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('lakescen') ORDER BY key;
+----
+1	update	true
+10	insert	false
+2	delete	false
+
+statement error
+SELECT * FROM scenario_merge('lakescen');
+----
+<REGEX>:.*base changed underneath.*
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('lakescen', on_conflict := 'ours');
+----
+1	3	1
+
+# the lake base now carries the scenario's changes on top of the lake's own
+# drift (id=4 was added and id=3 deleted in the lake after creation; the
+# scenario never touched them)
+query IT rowsort
+SELECT id, qty::VARCHAR FROM lake.forecast;
+----
+1	111
+10	50
+4	400
+
+# scenario ends merged + frozen with an empty changelog
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NOT NULL)::VARCHAR FROM __anofox_scenario.registry WHERE name = 'lakescen';
+----
+true	true
+
+statement error
+SELECT * FROM scenario_merge('lakescen');
+----
+<REGEX>:.*already merged.*
+
+# --- keyless lake tables: bag deletes cannot merge back (codex finding #1) ----------
+
+statement ok
+CREATE TABLE lake.rawlog (line VARCHAR);
+
+statement ok
+INSERT INTO lake.rawlog VALUES ('a'), ('b');
+
+statement ok
+CALL scenario_create('lakebag', base := 'lake');
+
+statement ok
+ATTACH 'lakebag' AS lb (TYPE scenario);
+
+statement ok
+DELETE FROM lb.rawlog WHERE line = 'a';
+
+query I
+SELECT count(*) FROM lb.rawlog;
+----
+1
+
+statement error
+SELECT * FROM scenario_merge('lakebag');
+----
+<REGEX>:.*keyless.*key_columns.*
+
+# the lake was not touched by the refused merge
+query I
+SELECT count(*) FROM lake.rawlog;
+----
+2
+
+statement ok
+DETACH lb;
+
+statement ok
+CALL scenario_drop('lakebag');
+
+# --- branches inherit the lake base and its snapshot pin (agy finding #1) -----------
+
+statement ok
+CREATE TABLE lake.plans (id INTEGER, amount INTEGER);
+
+statement ok
+INSERT INTO lake.plans VALUES (1, 100);
+
+statement ok
+CALL scenario_create('lp', base := 'lake', key_columns := MAP {'plans': ['id']});
+
+statement ok
+ATTACH 'lp' AS lp (TYPE scenario);
+
+statement ok
+UPDATE lp.plans SET amount = 150 WHERE id = 1;
+
+# lake churn after the parent's snapshot
+statement ok
+INSERT INTO lake.plans VALUES (2, 200);
+
+statement ok
+CALL scenario_create('lpc', from_scenario := 'lp');
+
+statement ok
+ATTACH 'lpc' AS lpc (TYPE scenario);
+
+# the child reads the LAKE (not the host), sees the parent's change, and is
+# pinned to the parent's snapshot - the churn row stays invisible
+query II rowsort
+SELECT id, amount FROM lpc.plans;
+----
+1	150
+
+query T
+SELECT base_catalog FROM __anofox_scenario.registry WHERE name = 'lpc';
+----
+lake
+
+statement ok
+DETACH lpc;
+
+statement ok
+DETACH lp;
+
+statement ok
+CALL scenario_drop('lpc');
+
+statement ok
+CALL scenario_drop('lp');
+
+# --- cleanup ------------------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('lakescen');
+
+statement ok
+DETACH lake;

@@ -1,0 +1,122 @@
+# name: test/sql/attach_hardening.test
+# description: Phase 1 WP5: attach lifecycle edges - re-attach, double attach, introspection, empty tables
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE TABLE empty_table (k INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+CALL scenario_create('h');
+
+# --- the same scenario attached twice under different names -------------------
+
+statement ok
+ATTACH 'h' AS h1 (TYPE scenario);
+
+statement ok
+ATTACH 'h' AS h2 (TYPE scenario);
+
+statement ok
+INSERT INTO h1.forecast VALUES (3, 300);
+
+# both handles see the same scenario state
+query I
+SELECT count(*) FROM h2.forecast;
+----
+3
+
+statement ok
+DETACH h2;
+
+# --- empty base tables scan cleanly (zero row groups) ---------------------------
+
+query I
+SELECT count(*) FROM h1.empty_table;
+----
+0
+
+statement ok
+INSERT INTO h1.empty_table VALUES (1, 'only in scenario');
+
+query IT
+SELECT k, v FROM h1.empty_table;
+----
+1	only in scenario
+
+query I
+SELECT count(*) FROM empty_table;
+----
+0
+
+# --- introspection ---------------------------------------------------------------
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'h1' AND table_name IN ('forecast', 'empty_table');
+----
+2
+
+# scenario internals stay in the host, namespaced away from user schemas
+query I
+SELECT count(*) > 0 FROM duckdb_tables() WHERE schema_name = '__anofox_scenario';
+----
+true
+
+# --- freeze respected across handles and re-attach --------------------------------
+
+statement ok
+CALL scenario_freeze('h');
+
+statement error
+INSERT INTO h1.forecast VALUES (4, 400);
+----
+<REGEX>:.*frozen.*
+
+statement ok
+DETACH h1;
+
+statement ok
+ATTACH 'h' AS h3 (TYPE scenario);
+
+# still frozen after re-attach; reads fine
+query I
+SELECT count(*) FROM h3.forecast;
+----
+3
+
+statement error
+DELETE FROM h3.forecast WHERE id = 1;
+----
+<REGEX>:.*frozen.*
+
+statement ok
+CALL scenario_unfreeze('h');
+
+statement ok
+INSERT INTO h3.forecast VALUES (4, 400);
+
+# --- drop guard + cleanup -----------------------------------------------------------
+
+statement error
+CALL scenario_drop('h');
+----
+<REGEX>:.*attached.*
+
+statement ok
+DETACH h3;
+
+statement ok
+CALL scenario_drop('h');
+
+# delta tables are gone after drop
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%_delta_%';
+----
+0

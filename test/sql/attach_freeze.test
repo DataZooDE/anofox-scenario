@@ -1,0 +1,74 @@
+# name: test/sql/attach_freeze.test
+# description: Phase 1: freeze blocks all DML paths, reads keep working, unfreeze restores writes
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 100), (2, 200);
+
+statement ok
+CALL scenario_create('fr');
+
+statement ok
+ATTACH 'fr' AS s (TYPE scenario);
+
+statement ok
+INSERT INTO s.forecast VALUES (3, 300);
+
+statement ok
+CALL scenario_freeze('fr');
+
+# all three DML paths blocked
+statement error
+INSERT INTO s.forecast VALUES (4, 400);
+----
+<REGEX>:.*frozen.*
+
+statement error
+UPDATE s.forecast SET qty = 0 WHERE id = 1;
+----
+<REGEX>:.*frozen.*
+
+statement error
+DELETE FROM s.forecast WHERE id = 1;
+----
+<REGEX>:.*frozen.*
+
+# reads still work, including the delta
+query I
+SELECT count(*) FROM s.forecast;
+----
+3
+
+query I
+SELECT qty FROM s.forecast WHERE id = 3;
+----
+300
+
+# freezing a nonexistent scenario errors
+statement error
+CALL scenario_freeze('nope');
+----
+<REGEX>:.*nope.*not found.*
+
+# unfreeze restores writes
+statement ok
+CALL scenario_unfreeze('fr');
+
+statement ok
+INSERT INTO s.forecast VALUES (4, 400);
+
+query I
+SELECT count(*) FROM s.forecast;
+----
+4
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('fr');

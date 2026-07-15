@@ -1,0 +1,172 @@
+# name: test/sql/scenario_declared_keys.test
+# description: key_columns := declares row identity for keyless tables, unlocking UPDATE/DELETE
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# a keyless table - typical for lake/staging data
+statement ok
+CREATE TABLE events (event_id INTEGER, kind VARCHAR, payload VARCHAR);
+
+statement ok
+INSERT INTO events VALUES (1, 'click', 'a'), (2, 'view', 'b'), (3, 'click', 'c');
+
+# without a declared key the table still updates - via whole-row bag
+# semantics (declared keys remain the better model: keyed diffs and merges)
+statement ok
+CALL scenario_create('nokey');
+
+statement ok
+ATTACH 'nokey' AS n (TYPE scenario);
+
+query I
+UPDATE n.events SET payload = 'x' WHERE event_id = 1;
+----
+1
+
+query T
+SELECT payload FROM n.events WHERE event_id = 1;
+----
+x
+
+statement ok
+DETACH n;
+
+statement ok
+CALL scenario_drop('nokey');
+
+# --- with a declared key, the full DML surface opens up -------------------------
+
+statement ok
+CALL scenario_create('keyed', 'declared identity', key_columns := MAP {'events': ['event_id']});
+
+statement ok
+ATTACH 'keyed' AS k (TYPE scenario);
+
+statement ok
+UPDATE k.events SET payload = 'updated' WHERE event_id = 2;
+
+statement ok
+DELETE FROM k.events WHERE event_id = 3;
+
+statement ok
+INSERT INTO k.events VALUES (10, 'purchase', 'z');
+
+query ITT
+SELECT event_id, kind, payload FROM k.events ORDER BY event_id;
+----
+1	click	a
+2	view	updated
+10	purchase	z
+
+# base untouched
+query I
+SELECT count(*) FROM events;
+----
+3
+
+# duplicate declared keys within the scenario are rejected (delta PK)
+statement error
+INSERT INTO k.events VALUES (10, 'dup', 'w');
+----
+<REGEX>:.*primary key.*scenario.*
+
+# diff works off the declared key
+query ITT
+SELECT event_id, change_type, new_value FROM scenario_diff('keyed', 'events') ORDER BY event_id;
+----
+2	modified	updated
+3	removed	NULL
+10	added	NULL
+
+# merge-back applies by declared key
+query I
+SELECT rows_applied FROM scenario_merge('keyed');
+----
+3
+
+query ITT
+SELECT event_id, kind, payload FROM events ORDER BY event_id;
+----
+1	click	a
+2	view	updated
+10	purchase	z
+
+# --- validation ---------------------------------------------------------------------
+
+statement error
+CALL scenario_create('bad', key_columns := MAP {'events': ['no_such_column']});
+----
+<REGEX>:.*no_such_column.*
+
+# declared key on a table that already has a PK is rejected (ambiguous intent)
+statement ok
+CREATE TABLE with_pk (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement error
+CALL scenario_create('bad2', key_columns := MAP {'with_pk': ['v']});
+----
+<REGEX>:.*already has a PRIMARY KEY.*
+
+# --- branches inherit the parent's declared row identity (codex finding #4) --------
+
+statement ok
+CREATE TABLE readings (sensor VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO readings VALUES ('a', 1), ('b', 2);
+
+statement ok
+CALL scenario_create('kp', key_columns := MAP {'readings': ['sensor']});
+
+statement ok
+ATTACH 'kp' AS kp (TYPE scenario);
+
+statement ok
+UPDATE kp.readings SET val = 10 WHERE sensor = 'a';
+
+statement ok
+CALL scenario_create('kc', from_scenario := 'kp');
+
+statement ok
+ATTACH 'kc' AS kc (TYPE scenario);
+
+# the child sees the parent's change AND inherits the declared identity
+query I
+SELECT val FROM kc.readings WHERE sensor = 'a';
+----
+10
+
+statement ok
+UPDATE kc.readings SET val = 20 WHERE sensor = 'a';
+
+query I
+SELECT val FROM kc.readings WHERE sensor = 'a';
+----
+20
+
+# a conflicting redeclaration on a branch is rejected
+statement error
+CALL scenario_create('kc2', from_scenario := 'kp', key_columns := MAP {'readings': ['val']});
+----
+<REGEX>:.*inherit.*
+
+statement ok
+DETACH kc;
+
+statement ok
+DETACH kp;
+
+statement ok
+CALL scenario_drop('kc');
+
+statement ok
+CALL scenario_drop('kp');
+
+# --- cleanup --------------------------------------------------------------------------
+
+statement ok
+DETACH k;
+
+statement ok
+CALL scenario_drop('keyed');

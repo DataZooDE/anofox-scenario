@@ -1,0 +1,79 @@
+# name: test/sql/attach_copy.test
+# description: COPY into/out of scenario tables routes through the scenario write/read paths
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 'EU', 100), (2, 'US', 200);
+
+statement ok
+CALL scenario_create('bulk');
+
+statement ok
+ATTACH 'bulk' AS s (TYPE scenario);
+
+# --- COPY ... FROM: bulk load lands in the delta, never the base -----------------
+
+statement ok
+COPY (SELECT * FROM (VALUES (10, 'LATAM', 500), (11, 'MEA', 50)) t(id, region, qty))
+TO '__TEST_DIR__/new_rows.csv' (HEADER);
+
+statement ok
+COPY s.forecast FROM '__TEST_DIR__/new_rows.csv' (HEADER);
+
+query I
+SELECT count(*) FROM s.forecast;
+----
+4
+
+query I
+SELECT count(*) FROM forecast;
+----
+2
+
+# PK enforcement holds for bulk loads too
+statement ok
+COPY (SELECT 1 AS id, 'DUP' AS region, 0 AS qty) TO '__TEST_DIR__/dup.csv' (HEADER);
+
+statement error
+COPY s.forecast FROM '__TEST_DIR__/dup.csv' (HEADER);
+----
+<REGEX>:.*primary key.*base.*
+
+# a failed COPY leaves nothing behind
+query I
+SELECT count(*) FROM s.forecast;
+----
+4
+
+# --- COPY ... TO: exports the merged view ------------------------------------------
+
+statement ok
+UPDATE s.forecast SET qty = 222 WHERE id = 2;
+
+statement ok
+COPY s.forecast TO '__TEST_DIR__/merged.csv' (HEADER);
+
+statement ok
+CREATE TABLE reimport (id INTEGER, region VARCHAR, qty INTEGER);
+
+statement ok
+COPY reimport FROM '__TEST_DIR__/merged.csv' (HEADER);
+
+query II
+SELECT id, qty FROM reimport ORDER BY id;
+----
+1	100
+2	222
+10	500
+11	50
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('bulk');

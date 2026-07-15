@@ -1,0 +1,223 @@
+# name: test/sql/attach_constraints.test
+# description: Phase 1: base NOT NULL/CHECK/PK constraints hold for scenario writes; no-PK v1 limitations
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY,
+    name VARCHAR NOT NULL,
+    price DECIMAL(8,2) CHECK (price >= 0)
+);
+
+statement ok
+INSERT INTO products VALUES (1, 'widget', 9.99), (2, 'gadget', 19.99);
+
+statement ok
+CREATE TABLE no_pk_log (event VARCHAR, logged_at TIMESTAMP);
+
+statement ok
+INSERT INTO no_pk_log VALUES ('created', TIMESTAMP '2026-01-01 00:00:00');
+
+statement ok
+CALL scenario_create('c');
+
+statement ok
+ATTACH 'c' AS s (TYPE scenario);
+
+# --- NOT NULL -----------------------------------------------------------------
+
+statement error
+INSERT INTO s.products VALUES (3, NULL, 5.00);
+----
+<REGEX>:.*NOT NULL constraint failed.*name.*
+
+statement error
+UPDATE s.products SET name = NULL WHERE id = 1;
+----
+<REGEX>:.*NOT NULL constraint failed.*name.*
+
+# --- CHECK ----------------------------------------------------------------------
+
+statement error
+INSERT INTO s.products VALUES (3, 'bad', -1.00);
+----
+<REGEX>:.*CHECK constraint failed.*
+
+statement error
+UPDATE s.products SET price = -5.00 WHERE id = 1;
+----
+<REGEX>:.*CHECK constraint failed.*
+
+# --- PK collisions: distinct messages for base vs scenario ----------------------
+
+statement error
+INSERT INTO s.products VALUES (1, 'dup', 1.00);
+----
+<REGEX>:.*primary key.*base.*
+
+statement ok
+INSERT INTO s.products VALUES (3, 'new', 3.00);
+
+statement error
+INSERT INTO s.products VALUES (3, 'dup2', 1.00);
+----
+<REGEX>:.*primary key.*scenario.*
+
+# NULL PK rejected
+statement error
+INSERT INTO s.products VALUES (NULL, 'nokey', 1.00);
+----
+<REGEX>:.*NOT NULL.*
+
+# valid writes still pass all constraints
+statement ok
+UPDATE s.products SET price = 12.50 WHERE id = 1;
+
+query I
+SELECT price FROM s.products WHERE id = 1;
+----
+12.50
+
+# --- no-PK tables: readable + insertable; UPDATE/DELETE are a v1 limitation ------
+
+query I
+SELECT count(*) FROM s.no_pk_log;
+----
+1
+
+statement ok
+INSERT INTO s.no_pk_log VALUES ('scenario event', TIMESTAMP '2026-02-01 00:00:00');
+
+query I
+SELECT count(*) FROM s.no_pk_log;
+----
+2
+
+# base unchanged
+query I
+SELECT count(*) FROM no_pk_log;
+----
+1
+
+# keyless UPDATE/DELETE work since v0.4.1 (bag semantics - see
+# attach_keyless_dml.test); the base stays untouched
+statement ok
+UPDATE s.no_pk_log SET event = 'renamed' WHERE event = 'created';
+
+query I
+DELETE FROM s.no_pk_log WHERE event = 'renamed';
+----
+1
+
+query I
+SELECT count(*) FROM no_pk_log;
+----
+1
+
+# --- secondary UNIQUE among scenario-written rows -----------------------------------
+
+statement ok
+CREATE TABLE users (id INTEGER PRIMARY KEY, email VARCHAR UNIQUE, name VARCHAR);
+
+statement ok
+INSERT INTO users VALUES (1, 'ada@corp.com', 'Ada'), (10, 'ten@corp.com', 'Ten');
+
+statement ok
+CALL scenario_create('uq');
+
+statement ok
+ATTACH 'uq' AS q (TYPE scenario);
+
+statement ok
+INSERT INTO q.users VALUES (2, 'grace@corp.com', 'Grace');
+
+# same email as another scenario-inserted row, separate statement
+statement error
+INSERT INTO q.users VALUES (3, 'grace@corp.com', 'Imposter');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# same email twice within one statement
+statement error
+INSERT INTO q.users VALUES (4, 'alan@corp.com', 'Alan'), (5, 'alan@corp.com', 'Clone');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# email already taken by a base row
+statement error
+INSERT INTO q.users VALUES (6, 'ada@corp.com', 'Shadow');
+----
+<REGEX>:.*(unique|Duplicate|constraint|key).*
+
+# updating a scenario row's email onto another scenario row's email
+statement ok
+INSERT INTO q.users VALUES (7, 'edsger@corp.com', 'Edsger');
+
+statement error
+UPDATE q.users SET email = 'grace@corp.com' WHERE id = 7;
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# updating a scenario row without changing its email is fine (self-match),
+# and exercises the delta rewrite path under the unique index
+statement ok
+UPDATE q.users SET name = 'Grace Hopper' WHERE id = 2;
+
+statement ok
+UPDATE q.users SET email = 'g.hopper@corp.com' WHERE id = 2;
+
+query T
+SELECT email FROM q.users WHERE id = 2;
+----
+g.hopper@corp.com
+
+# NULL emails never conflict
+statement ok
+INSERT INTO q.users VALUES (8, NULL, 'Nobody'), (9, NULL, 'Noone');
+
+query I
+SELECT count(*) FROM q.users;
+----
+6
+
+# changing a base row's email onto ANOTHER base row's email must fail
+# (same-key update path - codex backlog-review finding #2)
+statement error
+UPDATE q.users SET email = 'ten@corp.com' WHERE id = 1;
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# rewrite path: a scenario row's email onto a base-owned email must fail too
+statement error
+UPDATE q.users SET email = 'ada@corp.com' WHERE id = 7;
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# updating a base row without touching its unique value is fine (self-match)
+statement ok
+UPDATE q.users SET name = 'Ada L.' WHERE id = 1;
+
+# a PK move that keeps the email is fine (the old row vacates it)
+statement ok
+UPDATE q.users SET id = 20 WHERE id = 10;
+
+query T
+SELECT email FROM q.users WHERE id = 20;
+----
+ten@corp.com
+
+statement ok
+DETACH q;
+
+statement ok
+CALL scenario_drop('uq');
+
+# --- cleanup -------------------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('c');

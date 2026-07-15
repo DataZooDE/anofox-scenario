@@ -1,6 +1,12 @@
 #
 # This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
 #
+# The v2 scenario-catalog core targets DuckDB v1.5.x only (see
+# docs/spec/implementation_plan_phase1.md §4: the catalog surface the
+# extension is built on - PlanMergeInto, EntryLookupInfo with at-clauses,
+# virtual columns - does not exist in the v1.4 line). The former v1.4.5 LTS
+# job was removed together with the legacy v0.1 engine.
+#
 name: Main Extension Distribution Pipeline
 on:
   push:
@@ -16,30 +22,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build for DuckDB v1.4.5 (LTS)
-  duckdb-v1_4_5-build:
-    name: Build extension (DuckDB v1.4.5)
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.4-andium
-    with:
-      duckdb_version: v1.4.5
-      ci_tools_version: v1.4-andium
-      extension_name: anofox_scenario
-      artifact_postfix: _v1.4.5
-      exclude_archs: windows_amd64_mingw
-
-  duckdb-v1_4_5-deploy:
-    name: Deploy extension (DuckDB v1.4.5)
-    needs: duckdb-v1_4_5-build
-    uses: ./.github/workflows/_extension_deploy.yml
-    secrets: inherit
-    with:
-      duckdb_version: v1.4.5
-      extension_name: anofox_scenario
-      artifact_postfix: _v1.4.5
-      exclude_archs: windows_amd64_mingw
-      deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
-      deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
-
   # Build for DuckDB v1.5.4 (latest stable)
   duckdb-v1_5_4-build:
     name: Build extension (DuckDB v1.5.4)
@@ -63,3 +45,34 @@ jobs:
       exclude_archs: windows_amd64_mingw
       deploy_latest: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' }}
+
+  # DuckLake integration: scenario bases over a versioned lake need the
+  # binary ducklake extension, which only works against release builds
+  # (see docs/spec/implementation_plan_phase2_4.md, Phase 4 spike findings).
+  # The scenario_ducklake_base test is gated by DUCKLAKE_TESTS and skips
+  # cleanly in the distribution matrix above.
+  ducklake-integration:
+    name: DuckLake integration tests (release, linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Install dependencies
+        run: sudo apt-get update -y -qq && sudo apt-get install -y -qq ninja-build ccache
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@main
+        with:
+          key: ducklake-integration-${{ github.job }}
+
+      - name: Build (release)
+        run: GEN=ninja make release
+
+      - name: Install ducklake for the built version
+        run: ./build/release/duckdb -c "INSTALL ducklake; INSTALL parquet;"
+
+      - name: Run test suite incl. DuckLake scenarios
+        run: DUCKLAKE_TESTS=1 ./build/release/test/unittest "test/sql/*"

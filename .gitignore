@@ -7,5 +7,5 @@ testext
 test/python/__pycache__/
 .Rhistory
 .codex-delegate/
-
+.antigravity-delegate/
 .cache/

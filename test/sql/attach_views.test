@@ -1,0 +1,122 @@
+# name: test/sql/attach_views.test
+# description: Base views are exposed inside scenarios; unqualified refs rebind to scenario tables
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE orders (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO orders VALUES (1, 'EU', 100), (2, 'US', 200);
+
+statement ok
+CREATE VIEW region_totals AS SELECT region, sum(qty) AS total FROM orders GROUP BY region;
+
+statement ok
+CALL scenario_create('v');
+
+statement ok
+ATTACH 'v' AS s (TYPE scenario);
+
+# the view is visible through the scenario and initially matches the base
+query TI rowsort
+SELECT region, total FROM s.region_totals;
+----
+EU	100
+US	200
+
+# scenario writes flow through the view...
+statement ok
+INSERT INTO s.orders VALUES (3, 'EU', 50);
+
+statement ok
+UPDATE s.orders SET qty = 900 WHERE id = 2;
+
+query TI rowsort
+SELECT region, total FROM s.region_totals;
+----
+EU	150
+US	900
+
+# ...while the base view stays on base data
+query TI rowsort
+SELECT region, total FROM region_totals;
+----
+EU	100
+US	200
+
+# views compose with scenario tables in one query
+query I
+SELECT total FROM s.region_totals t JOIN s.orders o ON o.region = t.region AND o.id = 3;
+----
+150
+
+# views are read-only inside scenarios
+statement error
+INSERT INTO s.region_totals VALUES ('APAC', 1);
+----
+<REGEX>:.*
+
+# a view created in the base after the scenario is visible too (overlay reads
+# stay live, same as tables)
+statement ok
+CREATE VIEW order_count AS SELECT count(*) AS n FROM orders;
+
+query I
+SELECT n FROM s.order_count;
+----
+3
+
+# materialized scenarios: view SQL rebinds against the frozen copies
+statement ok
+CALL scenario_create('vmat', mode := 'materialized');
+
+statement ok
+ATTACH 'vmat' AS m (TYPE scenario);
+
+statement ok
+INSERT INTO orders VALUES (4, 'APAC', 700);
+
+# the live base sees id=4, the materialized scenario's view does not
+query TI rowsort
+SELECT region, total FROM m.region_totals;
+----
+EU	100
+US	200
+
+query TI rowsort
+SELECT region, total FROM region_totals;
+----
+APAC	700
+EU	100
+US	200
+
+# catalog introspection with views present must not crash (views used to leak
+# into the TABLE_ENTRY scan and get cast to tables)
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 's';
+----
+1
+
+query I
+SELECT count(*) >= 2 FROM duckdb_views() WHERE database_name = 's';
+----
+true
+
+statement ok
+SHOW ALL TABLES;
+
+# --- cleanup -------------------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+DETACH m;
+
+statement ok
+CALL scenario_drop('v');
+
+statement ok
+CALL scenario_drop('vmat');

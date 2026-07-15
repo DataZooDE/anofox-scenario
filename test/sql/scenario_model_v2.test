@@ -1,0 +1,151 @@
+# name: test/sql/scenario_model_v2.test
+# description: Phase 2: unified scenario model - materialized mode, branching, scenario_list v2
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 100), (2, 200), (3, 300);
+
+# --- materialized mode: full isolation from base changes -----------------------
+
+statement ok
+CALL scenario_create('baseline', 'frozen copy', mode := 'materialized');
+
+statement ok
+ATTACH 'baseline' AS b (TYPE scenario);
+
+query I
+SELECT count(*) FROM b.forecast;
+----
+3
+
+# base changes are INVISIBLE to a materialized scenario
+statement ok
+INSERT INTO forecast VALUES (4, 400);
+
+statement ok
+UPDATE forecast SET qty = 999 WHERE id = 1;
+
+query I
+SELECT count(*) FROM b.forecast;
+----
+3
+
+query I
+SELECT qty FROM b.forecast WHERE id = 1;
+----
+100
+
+# materialized scenarios are writable like any other (until frozen)
+statement ok
+INSERT INTO b.forecast VALUES (50, 5000);
+
+query I
+SELECT count(*) FROM b.forecast;
+----
+4
+
+# base still untouched by the scenario write
+query I
+SELECT count(*) FROM forecast WHERE id = 50;
+----
+0
+
+# --- branching: from_scenario copies the parent's changes -------------------------
+
+statement ok
+CALL scenario_create('what_if', 'delta scenario');
+
+statement ok
+ATTACH 'what_if' AS w (TYPE scenario);
+
+statement ok
+UPDATE w.forecast SET qty = 111 WHERE id = 2;
+
+statement ok
+INSERT INTO w.forecast VALUES (10, 1000);
+
+statement ok
+CALL scenario_create('what_if_v2', 'branch', from_scenario := 'what_if');
+
+statement ok
+ATTACH 'what_if_v2' AS w2 (TYPE scenario);
+
+# the branch inherits the parent's modifications (REQ-SCEN-002)
+query I
+SELECT qty FROM w2.forecast WHERE id = 2;
+----
+111
+
+query I
+SELECT count(*) FROM w2.forecast WHERE id = 10;
+----
+1
+
+# ...but evolves independently
+statement ok
+UPDATE w2.forecast SET qty = 222 WHERE id = 2;
+
+query I
+SELECT qty FROM w.forecast WHERE id = 2;
+----
+111
+
+query I
+SELECT qty FROM w2.forecast WHERE id = 2;
+----
+222
+
+# dropping while attached is refused (guard ordering: attached before branch)
+statement error
+CALL scenario_drop('what_if');
+----
+<REGEX>:.*attached.*
+
+# --- scenario_list: registry v2 view --------------------------------------------
+
+query TTT
+SELECT name, mode, frozen::VARCHAR FROM scenario_list() ORDER BY name;
+----
+baseline	materialized	false
+what_if	delta	false
+what_if_v2	delta	false
+
+# freeze shows up
+statement ok
+CALL scenario_freeze('baseline');
+
+query T
+SELECT frozen::VARCHAR FROM scenario_list() WHERE name = 'baseline';
+----
+true
+
+# --- cleanup ------------------------------------------------------------------------
+
+statement ok
+DETACH b;
+
+statement ok
+DETACH w;
+
+statement ok
+DETACH w2;
+
+# parent cannot be dropped while a branch exists
+statement error
+CALL scenario_drop('what_if');
+----
+<REGEX>:.*branch.*
+
+statement ok
+CALL scenario_drop('what_if_v2');
+
+statement ok
+CALL scenario_drop('what_if');
+
+statement ok
+CALL scenario_drop('baseline');

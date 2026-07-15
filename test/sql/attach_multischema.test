@@ -1,0 +1,140 @@
+# name: test/sql/attach_multischema.test
+# description: All base schemas are mirrored in scenarios, not just main
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE customers (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO customers VALUES (1, 'acme');
+
+statement ok
+CREATE SCHEMA analytics;
+
+statement ok
+CREATE TABLE analytics.events (event_id INTEGER PRIMARY KEY, kind VARCHAR);
+
+statement ok
+INSERT INTO analytics.events VALUES (100, 'signup');
+
+# same table name in two schemas: rows must never bleed across
+statement ok
+CREATE TABLE analytics.customers (id INTEGER PRIMARY KEY, segment VARCHAR);
+
+statement ok
+INSERT INTO analytics.customers VALUES (7, 'enterprise');
+
+statement ok
+CALL scenario_create('ms');
+
+statement ok
+ATTACH 'ms' AS s (TYPE scenario);
+
+# reads from a non-main schema
+query IT
+SELECT event_id, kind FROM s.analytics.events;
+----
+100	signup
+
+query IT
+SELECT id, name FROM s.customers;
+----
+1	acme
+
+query IT
+SELECT id, segment FROM s.analytics.customers;
+----
+7	enterprise
+
+# writes land in the right schema's delta
+statement ok
+INSERT INTO s.analytics.events VALUES (101, 'purchase');
+
+statement ok
+UPDATE s.analytics.events SET kind = 'trial' WHERE event_id = 100;
+
+statement ok
+INSERT INTO s.customers VALUES (2, 'globex');
+
+statement ok
+INSERT INTO s.analytics.customers VALUES (8, 'smb');
+
+query IT rowsort
+SELECT event_id, kind FROM s.analytics.events;
+----
+100	trial
+101	purchase
+
+# no cross-schema bleeding between the two `customers` tables
+query I
+SELECT count(*) FROM s.customers;
+----
+2
+
+query I
+SELECT count(*) FROM s.analytics.customers;
+----
+2
+
+# base stays untouched everywhere
+query I
+SELECT count(*) FROM analytics.events;
+----
+1
+
+query T
+SELECT kind FROM analytics.events;
+----
+signup
+
+query I
+SELECT count(*) FROM customers;
+----
+1
+
+# deletes in a non-main schema
+statement ok
+DELETE FROM s.analytics.customers WHERE id = 7;
+
+query IT
+SELECT id, segment FROM s.analytics.customers;
+----
+8	smb
+
+# an unknown schema still errors
+statement error
+SELECT * FROM s.nosuch.t;
+----
+<REGEX>:.*
+
+# merge-back applies each delta to the right schema
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('ms');
+----
+3	5	0
+
+query IT rowsort
+SELECT event_id, kind FROM analytics.events;
+----
+100	trial
+101	purchase
+
+query IT rowsort
+SELECT id, segment FROM analytics.customers;
+----
+8	smb
+
+query I
+SELECT count(*) FROM customers;
+----
+2
+
+# --- cleanup -------------------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('ms');

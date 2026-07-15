@@ -1,0 +1,129 @@
+# name: test/sql/attach_isolation.test
+# description: Phase 1: scenario writes never touch base; scenarios are isolated from each other; overlay semantics
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 100), (2, 200), (3, 300);
+
+statement ok
+CALL scenario_create('a');
+
+statement ok
+CALL scenario_create('b');
+
+statement ok
+ATTACH 'a' AS sa (TYPE scenario);
+
+statement ok
+ATTACH 'b' AS sb (TYPE scenario);
+
+# modify the same table differently in both scenarios
+statement ok
+UPDATE sa.forecast SET qty = 111 WHERE id = 1;
+
+statement ok
+DELETE FROM sb.forecast WHERE id = 1;
+
+statement ok
+INSERT INTO sa.forecast VALUES (10, 1000);
+
+statement ok
+INSERT INTO sb.forecast VALUES (20, 2000);
+
+# base is untouched
+query II
+SELECT id, qty FROM forecast ORDER BY id;
+----
+1	100
+2	200
+3	300
+
+# scenario a: update + its own insert
+query II
+SELECT id, qty FROM sa.forecast ORDER BY id;
+----
+1	111
+2	200
+3	300
+10	1000
+
+# scenario b: delete + its own insert
+query II
+SELECT id, qty FROM sb.forecast ORDER BY id;
+----
+2	200
+3	300
+20	2000
+
+# --- overlay semantics: base changes after creation ARE visible (documented) ---
+
+statement ok
+INSERT INTO forecast VALUES (4, 400);
+
+query I
+SELECT count(*) FROM sa.forecast;
+----
+5
+
+query I
+SELECT count(*) FROM sb.forecast;
+----
+4
+
+# base update shows through where the scenario has no delta for the key
+statement ok
+UPDATE forecast SET qty = 201 WHERE id = 2;
+
+query I
+SELECT qty FROM sa.forecast WHERE id = 2;
+----
+201
+
+# but scenario deltas win over base changes for the same key
+statement ok
+UPDATE forecast SET qty = 199 WHERE id = 1;
+
+query I
+SELECT qty FROM sa.forecast WHERE id = 1;
+----
+111
+
+query I
+SELECT count(*) FROM sb.forecast WHERE id = 1;
+----
+0
+
+# two scenarios read in ONE statement stay distinct (the common-subplan
+# optimizer dedups operators by serialization; the scan must serialize its
+# scenario identity or both sides silently return the first world's rows)
+query TI rowsort
+SELECT 'a' AS w, sum(qty)::INTEGER FROM sa.forecast
+UNION ALL
+SELECT 'b', sum(qty)::INTEGER FROM sb.forecast;
+----
+a	2012
+b	2901
+
+# and a same-statement join across the two worlds
+query II
+SELECT count(*), count(b.id)
+FROM sa.forecast a LEFT JOIN sb.forecast b ON a.id = b.id;
+----
+5	3
+
+statement ok
+DETACH sa;
+
+statement ok
+DETACH sb;
+
+statement ok
+CALL scenario_drop('a');
+
+statement ok
+CALL scenario_drop('b');

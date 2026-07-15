@@ -43,13 +43,21 @@ endif()
 
 set(EXTENSION_SOURCES
     src/anofox_scenario_extension.cpp
-    src/metadata_store.cpp
-    src/scenario_manager.cpp
-    src/snapshot_manager.cpp
-    src/protocol_manager.cpp
-    src/delta_storage_engine.cpp
-    src/comparison_engine.cpp
-    src/ddl_blocker.cpp
+    src/catalog/scenario_registry.cpp
+    src/catalog/scenario_catalog.cpp
+    src/catalog/scenario_schema_entry.cpp
+    src/catalog/scenario_table_entry.cpp
+    src/catalog/scenario_scan.cpp
+    src/catalog/scenario_delta.cpp
+    src/catalog/scenario_insert.cpp
+    src/catalog/scenario_update_delete.cpp
+    src/catalog/scenario_merge_into.cpp
+    src/catalog/scenario_transaction.cpp
+    src/catalog/scenario_storage_extension.cpp
+    src/lifecycle/scenario_lifecycle.cpp
+    src/lifecycle/scenario_diff.cpp
+    src/lifecycle/scenario_migrate.cpp
+    src/lifecycle/scenario_merge.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
@@ -58,8 +66,7 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 # Fix "multiple definition of duckdb::LogicalType::VARCHAR/BIGINT/TIMESTAMP".
 # DuckDB core is built as C++11 and emits strong out-of-line definitions of its
 # `static constexpr` LogicalType members. This extension is C++17, so when its
-# sources ODR-use those members (e.g. emplace_back(LogicalType::VARCHAR) in
-# scenario_manager.cpp) GCC emits them as STB_GNU_UNIQUE symbols, which collide
+# sources ODR-use those members GCC emits them as STB_GNU_UNIQUE symbols, which collide
 # with core's strong definitions at link time. -fno-gnu-unique emits them as
 # weak instead, so they resolve against core's definition. GCC-only (Clang/MSVC
 # do not use GNU_UNIQUE). Broke at the DuckDB v1.5.3 upgrade.

@@ -250,35 +250,45 @@ make clean && GEN=ninja make && make test
 
 ```
 src/
-  anofox_scenario_extension.cpp   # Entry point, function registration
-  include/
-    anofox_scenario_extension.hpp # Extension class
-    scenario_manager.hpp
-    delta_storage_engine.hpp
-    comparison_engine.hpp
-    snapshot_manager.hpp
-    protocol_manager.hpp
-    metadata_store.hpp
-  scenario_manager.cpp            # Lifecycle operations
-  delta_storage_engine.cpp        # COW implementation
-  comparison_engine.cpp           # Diff logic
-  snapshot_manager.cpp            # Snapshot operations
-  protocol_manager.cpp            # Documentation handling
-  metadata_store.cpp              # Registry management
+  anofox_scenario_extension.cpp        # Entry point, registration
+  include/anofox_scenario_extension.hpp
+  catalog/                             # the ATTACH-based scenario catalog (v2)
+    scenario_storage_extension.cpp     #   ATTACH (TYPE scenario) + BaseSource resolution
+    scenario_catalog.cpp               #   Catalog impl, MarkHostWrite, freeze chokepoint
+    scenario_schema_entry.cpp          #   synthetic main schema, DDL rejection
+    scenario_table_entry.cpp           #   base mirror, virtual identity columns
+    scenario_scan.cpp                  #   merge-on-read scan (delta first + suppression)
+    scenario_insert.cpp                #   insert sink + PK collision policy
+    scenario_update_delete.cpp         #   update/delete sinks (op-transition matrix)
+    scenario_delta.cpp                 #   delta/mat table management + copy helpers
+    scenario_registry.cpp              #   registry v2 (caller-transaction catalog ops)
+    scenario_transaction.cpp           #   transaction shim (ACID rides the host)
+    include under src/include/catalog/
+  lifecycle/
+    scenario_lifecycle.cpp             #   CALL create/drop/freeze/unfreeze + scenario_list
+    scenario_diff.cpp                  #   scenario_diff/_summary (bind_replace, streaming)
+    scenario_migrate.cpp               #   legacy v0.1 -> v2 migration
 ```
 
 ### Test Structure
 
 ```
 test/sql/
-  scenario_lifecycle.test         # Epic 1 tests
-  scenario_read.test              # COW read tests
-  scenario_write.test             # COW write tests (INSERT/UPDATE/DELETE)
-  scenario_constraints.test       # PK/FK/CHECK enforcement
-  scenario_comparison.test        # Diff tests
-  scenario_snapshots.test         # Snapshot tests
-  scenario_protocols.test         # Protocol tests
-  scenario_errors.test            # Error message verification
+  attach_basic.test               # ATTACH/DETACH, passthrough reads, lifecycle
+  attach_write.test               # op-transition matrix (I/U/D transitions)
+  attach_isolation.test           # base never written; scenarios independent
+  attach_constraints.test         # NOT NULL/CHECK/PK vs merged state; no-PK limits
+  attach_ddl.test                 # canonical DDL rejection
+  attach_txn.test                 # caller-transaction semantics (ROLLBACK/COMMIT)
+  attach_freeze.test              # freeze/unfreeze enforcement
+  attach_hardening.test           # re-attach, double attach, introspection
+  attach_persistence.test         # durability across restart
+  attach_concurrent.test          # write-write conflicts across connections
+  attach_perf.test                # 1M-row merge-scan smoke
+  attach_unsupported.test         # gated features error with guidance
+  scenario_model_v2.test          # materialized mode, branching, scenario_list
+  scenario_diff_v2.test           # streaming diff engine (2- and 3-arg)
+  scenario_migrate.test           # legacy v0.1 -> v2 migration
 ```
 
 ### Configuration Files
@@ -451,44 +461,32 @@ throw NotImplementedException("DDL operations not permitted in scenarios");
 
 ## Metadata Schema Reference
 
-From design doc, internal tables in `main` schema:
+All state lives in the host database under the internal `__anofox_scenario` schema
+(created lazily by the first `scenario_create`, in the caller's transaction):
 
 ```sql
--- Scenario registry
-CREATE TABLE _scenario_registry (
-    scenario_id INTEGER PRIMARY KEY,
-    scenario_name VARCHAR NOT NULL UNIQUE,
-    schema_name VARCHAR NOT NULL UNIQUE,
-    base_schema VARCHAR NOT NULL,
-    base_captured_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT current_timestamp,
-    status VARCHAR DEFAULT 'active',
-    description VARCHAR,
-    parent_scenario_id INTEGER
-);
+-- Registry v2 (reserved columns land in later phases)
+__anofox_scenario.registry(
+    scenario_id BIGINT PRIMARY KEY,      -- from __anofox_scenario.registry_seq
+    name VARCHAR NOT NULL UNIQUE,
+    mode VARCHAR NOT NULL,               -- 'delta' | 'materialized'
+    frozen BOOLEAN NOT NULL,
+    parent_id BIGINT,                    -- branches
+    base_snapshot_id BIGINT,             -- Phase 4: DuckLake bases
+    created_at TIMESTAMP NOT NULL,
+    merged_at TIMESTAMP,                 -- Phase 6: merge-back
+    description VARCHAR)
 
--- Table registration per scenario
-CREATE TABLE _scenario_tables (
-    scenario_id INTEGER,
-    table_name VARCHAR NOT NULL,
-    base_row_count BIGINT,
-    has_primary_key BOOLEAN,
-    primary_key_columns VARCHAR[],
-    PRIMARY KEY (scenario_id, table_name)
-);
+-- One delta table per (scenario, base table); the changelog contract.
+-- <table> is the logical name: plain for main, '<schema>.<table>' otherwise.
+__anofox_scenario.s<id>_delta_<table>(_op VARCHAR, _ts TIMESTAMP, <base columns>,
+                                      PRIMARY KEY (<base pk or declared key_columns>))
+-- Keyless tables (no PK, no declared key): bag changelog instead - no PK,
+-- trailing _count BIGINT multiplicity, readers aggregate I/D nets per value
 
--- Protocol storage
-CREATE TABLE _scenario_protocols (
-    entity_type VARCHAR NOT NULL,
-    entity_name VARCHAR NOT NULL,
-    section VARCHAR NOT NULL,
-    content VARCHAR,
-    updated_at TIMESTAMP DEFAULT current_timestamp,
-    PRIMARY KEY (entity_type, entity_name, section)
-);
+-- Materialized base copies (mode = 'materialized')
+__anofox_scenario.s<id>_mat_<table>     -- full schema + data copy of the base table
 ```
-
----
 
 ## Getting Unstuck
 

@@ -1,0 +1,128 @@
+# name: test/sql/attach_keyless_dml.test
+# description: UPDATE/DELETE on tables without any key via _count multiplicity (bag semantics)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE log_lines (source VARCHAR, message VARCHAR);
+
+# duplicates and NULLs are meaningful in a bag
+statement ok
+INSERT INTO log_lines VALUES
+    ('app', 'started'), ('app', 'started'),
+    ('db', 'connected'), ('db', NULL);
+
+statement ok
+CALL scenario_create('bag');
+
+statement ok
+ATTACH 'bag' AS s (TYPE scenario);
+
+# DELETE removes every matching visible row (both duplicates)
+query I
+DELETE FROM s.log_lines WHERE message = 'started';
+----
+2
+
+query I
+SELECT count(*) FROM s.log_lines;
+----
+2
+
+# base keeps all four rows
+query I
+SELECT count(*) FROM log_lines;
+----
+4
+
+# scenario-inserted duplicates delete together with base ones
+statement ok
+INSERT INTO s.log_lines VALUES ('db', 'connected'), ('db', 'connected');
+
+query I
+SELECT count(*) FROM s.log_lines WHERE message = 'connected';
+----
+3
+
+query I
+DELETE FROM s.log_lines WHERE message = 'connected';
+----
+3
+
+query I
+SELECT count(*) FROM s.log_lines;
+----
+1
+
+# UPDATE decomposes into delete + insert, preserving multiplicity
+statement ok
+INSERT INTO s.log_lines VALUES ('worker', 'retry'), ('worker', 'retry');
+
+query I
+UPDATE s.log_lines SET message = 'retried' WHERE message = 'retry';
+----
+2
+
+query TT rowsort
+SELECT source, message FROM s.log_lines WHERE source = 'worker';
+----
+worker	retried
+worker	retried
+
+# NULL-valued rows update fine (whole-row identity is NULL-safe)
+query I
+UPDATE s.log_lines SET message = 'silent' WHERE message IS NULL;
+----
+1
+
+query TT rowsort
+SELECT source, message FROM s.log_lines;
+----
+db	silent
+worker	retried
+worker	retried
+
+# RETURNING works on keyless DML
+statement ok
+INSERT INTO s.log_lines VALUES ('cron', 'tick');
+
+query TT
+DELETE FROM s.log_lines WHERE source = 'cron' RETURNING source, message;
+----
+cron	tick
+
+query T
+UPDATE s.log_lines SET message = 'quiet' WHERE source = 'db' RETURNING message;
+----
+quiet
+
+# base untouched by all of it
+query TT rowsort
+SELECT source, message FROM log_lines;
+----
+app	started
+app	started
+db	NULL
+db	connected
+
+# merge-back applies deletes with the right multiplicity and adds the news
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('bag');
+----
+1	7	0
+
+query TT rowsort
+SELECT source, message FROM log_lines;
+----
+db	quiet
+worker	retried
+worker	retried
+
+# --- cleanup -------------------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('bag');
