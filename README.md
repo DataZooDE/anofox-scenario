@@ -9,9 +9,9 @@
 <h3 align="center">Git-Like Branching for DuckDB</h3>
 
 <p align="center">
-  <a href="https://github.com/datazoo/anofox-scenario/actions"><img src="https://github.com/datazoo/anofox-scenario/actions/workflows/MainDistributionPipeline.yml/badge.svg" alt="Build Status"></a>
+  <a href="https://github.com/DataZooDE/anofox-scenario/actions/workflows/MainDistributionPipeline.yml"><img src="https://github.com/DataZooDE/anofox-scenario/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main" alt="Build Status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL_1.1-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/DuckDB-v1.4.x-green.svg" alt="DuckDB Compatibility">
+  <img src="https://img.shields.io/badge/DuckDB-v1.5.4%2B-green.svg" alt="DuckDB Compatibility">
 </p>
 
 ---
