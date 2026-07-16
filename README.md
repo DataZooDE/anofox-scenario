@@ -51,7 +51,7 @@ LOAD anofox_scenario;
 ### Build from Source
 
 ```bash
-git clone https://github.com/datazoo/anofox-scenario.git
+git clone https://github.com/DataZooDE/anofox-scenario.git
 cd anofox-scenario
 GEN=ninja make
 make test
@@ -252,7 +252,7 @@ For complete API documentation, see [docs/API_REFERENCE.md](docs/API_REFERENCE.m
 
 ```bash
 # Clone with submodules
-git clone --recurse-submodules https://github.com/datazoo/anofox-scenario.git
+git clone --recurse-submodules https://github.com/DataZooDE/anofox-scenario.git
 cd anofox-scenario
 
 # Fast incremental build (recommended)
