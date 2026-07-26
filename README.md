@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://github.com/DataZooDE/anofox-scenario/actions/workflows/MainDistributionPipeline.yml"><img src="https://github.com/DataZooDE/anofox-scenario/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main" alt="Build Status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL_1.1-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/DuckDB-v1.5.4%2B-green.svg" alt="DuckDB Compatibility">
+  <img src="https://img.shields.io/badge/DuckDB-v1.5.5%2B-green.svg" alt="DuckDB Compatibility">
 </p>
 
 ---
@@ -58,7 +58,7 @@ branch — DDL in scenarios is rejected by design.
 
 ## Installation
 
-Requires DuckDB v1.5.4 or later.
+Requires DuckDB v1.5.5 or later.
 
 ```sql
 INSTALL anofox_scenario FROM community;
