@@ -63,7 +63,7 @@ SELECT count(*) FROM scenario_diff('d2', 'forecast');
 ----
 0
 
-# --- summary: per-table I/U/D counts (REQ-COMP-002, REQ-SCEN-004) --------------------
+# --- summary: per-table I/U/D counts --------------------
 
 query TIII
 SELECT table_name, rows_added, rows_modified, rows_removed

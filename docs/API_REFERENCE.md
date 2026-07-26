@@ -49,7 +49,7 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   scenario writes against the *merged* state, with distinct errors for conflicts with base rows
   vs. scenario changes.
 - **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it.
-- **DDL:** not permitted inside scenarios (one canonical error; REQ-COW-007).
+- **DDL:** not permitted inside scenarios (one canonical error).
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time.
 

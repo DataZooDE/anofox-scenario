@@ -3,7 +3,7 @@
 // _op = 'I' ('U' when re-inserting over a tombstone). PK collisions are
 // checked against the *merged* relation: the delta key map, and the base's
 // own constraint machinery (DataTable::VerifyAppendConstraints -- the same
-// path a real base INSERT takes), with distinct error messages (REQ-NFR-005).
+// path a real base INSERT takes), with distinct error messages.
 //===----------------------------------------------------------------------===//
 
 #include "catalog/scenario_catalog.hpp"

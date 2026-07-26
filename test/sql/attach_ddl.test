@@ -1,5 +1,5 @@
 # name: test/sql/attach_ddl.test
-# description: Phase 1 WP1: all DDL inside a scenario is rejected with one canonical error (REQ-COW-007)
+# description: Phase 1 WP1: all DDL inside a scenario is rejected with one canonical error
 # group: [anofox_scenario]
 
 require anofox_scenario

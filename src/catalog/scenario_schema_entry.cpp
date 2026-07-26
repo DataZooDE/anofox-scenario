@@ -211,7 +211,7 @@ optional_ptr<CatalogEntry> ScenarioSchemaEntry::LookupEntry(CatalogTransaction t
 }
 
 //===----------------------------------------------------------------------===//
-// DDL: uniformly rejected (REQ-COW-007)
+// DDL: uniformly rejected
 //===----------------------------------------------------------------------===//
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,

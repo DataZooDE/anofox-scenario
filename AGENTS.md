@@ -10,16 +10,19 @@ This document guides AI agents in developing the anofox-scenario extension using
 
 **anofox-scenario** enables Git-like branching for analytical databases. Users create isolated scenarios for what-if analysis, compare scenarios against baselines, and maintain audit trails.
 
-### Core Components (from design doc)
+### Core Components
 
-| Component | Responsibility | Key Requirements |
-|-----------|---------------|------------------|
-| **ScenarioManager** | Lifecycle: create, branch, list, archive, drop | REQ-SCEN-001 to REQ-SCEN-008 |
-| **DeltaStorageEngine** | COW storage, transparent SQL operations | REQ-COW-001 to REQ-COW-008 |
-| **ComparisonEngine** | Diff between schemas/scenarios | REQ-COMP-001 to REQ-COMP-004 |
-| **SnapshotManager** | Immutable point-in-time captures | REQ-SNAP-001 to REQ-SNAP-005 |
-| **ProtocolManager** | Embedded documentation storage | REQ-PROT-001 to REQ-PROT-005 |
-| **MetadataStore** | Internal registry tables | Supporting infrastructure |
+| Component | Responsibility |
+|-----------|---------------|
+| **Scenario catalog** | `ATTACH (TYPE scenario)`, synthetic schema, DDL rejection, freeze enforcement |
+| **Merge-on-read scan** | Delta-first scan over the base, suppressing deleted keys |
+| **Write sinks** | Insert/update/delete against the delta, op-transition matrix, merged-state constraints |
+| **Delta storage** | Per-(scenario, table) delta tables and materialized base copies |
+| **Comparison engine** | Streaming typed diffs and per-table summaries |
+| **Merge-back** | Preview and apply a scenario's delta to the base with conflict policies |
+| **Registry** | Scenario metadata in `__anofox_scenario`, in the caller's transaction |
+
+See `docs/spec/architecture.md` for the full picture.
 
 ### Architecture Pattern
 
@@ -305,10 +308,12 @@ Makefile                          # Build orchestration
 ```
 docs/
   API_REFERENCE.md                # User-facing SQL API (MUST update per function)
-  spec/                           # Architecture docs (MUST consult before implementing)
-  features/requirements.md        # Requirements specification
-  features/design.md              # High-level design
+  spec/architecture.md            # Internal design (MUST consult before implementing)
+  UPDATING.md                     # DuckDB version-bump procedure
 ```
+
+The v0.1 requirements and design documents were removed once v2 shipped; the
+implementation plus `spec/architecture.md` are now the source of truth.
 
 ---
 
@@ -495,9 +500,9 @@ __anofox_scenario.s<id>_mat_<table>     -- full schema + data copy of the base t
 1. **Gather context:** Error messages, relevant code, what you tried
 2. **Check logging:** Enable debug logs and analyze output
 3. **Consult references:**
-   - `docs/spec/` - Architecture documentation (consult before implementation)
-   - `docs/features/requirements.md` - What should happen
-   - `docs/features/design.md` - How it should work
+   - `docs/spec/architecture.md` - Internal design: read/write paths, delta contract, tiers
+   - `docs/API_REFERENCE.md` - Behaviour users are promised, plus current limitations
+   - `test/sql/` - The executable specification; each file covers one concern
    - DuckDB source: `duckdb/src/include/duckdb/`
 
 ### Common Issues
@@ -508,16 +513,15 @@ __anofox_scenario.s<id>_mat_<table>     -- full schema + data copy of the base t
 | Function not found | Verify `ExtensionLoader::RegisterFunction` called |
 | Test fails unexpectedly | Check type indicators match actual return types |
 | Linker errors | Verify dependencies in CMakeLists.txt |
-| Rowid instability | Use PK-based identification, validate on read |
+| Keyless table rejected | Table has no PK; declare `key_columns :=` at `scenario_create` |
 
 ---
 
 ## References
 
-- **Architecture:** `docs/spec/` - Consult before implementation decisions
+- **Architecture:** `docs/spec/architecture.md` - Consult before implementation decisions
 - **API Reference:** `docs/API_REFERENCE.md` - Update per user-facing function
-- **Requirements:** `docs/features/requirements.md`
-- **Design:** `docs/features/design.md`
+- **Updating DuckDB:** `docs/UPDATING.md`
 - **DuckDB Extension Template:** https://github.com/duckdb/extension-template
 - **DuckDB Docs:** https://duckdb.org/docs/
 - **SQLLogicTest Guide:** https://duckdb.org/docs/stable/dev/sqllogictest/intro

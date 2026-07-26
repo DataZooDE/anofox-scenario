@@ -15,8 +15,8 @@ namespace duckdb {
 
 void ThrowScenarioDDLError() {
 	throw NotImplementedException(
-	    "DDL operations are not permitted in scenarios. Modify the base schema, then create a new scenario "
-	    "(REQ-COW-007)");
+	    "DDL operations are not permitted in scenarios. Modify the base schema instead, then call "
+	    "scenario_refresh() to track any newly added tables");
 }
 
 ScenarioCatalog::ScenarioCatalog(AttachedDatabase &db, string scenario_name_p, string host_catalog_name_p,

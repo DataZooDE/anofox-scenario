@@ -16,51 +16,69 @@
 
 ---
 
-**anofox-scenario** is a DuckDB extension that enables Git-like branching for analytical databases. Create isolated scenarios for what-if analysis, compare scenarios against baselines, capture immutable snapshots, and maintain structured audit trails—all within a single `.duckdb` file.
+**anofox-scenario** gives you Git-like branches over your DuckDB tables. Change data in a
+branch, see exactly what changed, then keep it or throw it away — without ever copying the
+table or touching the original.
 
-## Key Features
+```sql
+INSTALL anofox_scenario FROM community;
+LOAD anofox_scenario;
 
-| Feature | Description |
-|---------|-------------|
-| **Scenario Branching** | Create isolated branches for what-if analysis without duplicating data |
-| **Copy-on-Write Storage** | Only modifications are stored; base data remains immutable |
-| **Transparent SQL** | Standard INSERT/UPDATE/DELETE work naturally in scenarios |
-| **Scenario Comparison** | Row-level diffs between scenarios or against baselines |
-| **Immutable Snapshots** | Point-in-time captures for audit trails and rollback points |
-| **Embedded Protocols** | Built-in documentation for decisions, findings, and change logs |
-| **Database Portability** | Everything stored in a single `.duckdb` file—copy and share freely |
+-- Given any existing table, e.g. forecast(id, region, qty).
+-- Branch it. Nothing below modifies the real `forecast` table.
+CALL scenario_create('optimistic', 'demand +10%');
+ATTACH 'optimistic' AS opt (TYPE scenario);
 
-## Use Cases
+UPDATE opt.forecast SET qty = qty * 1.1 WHERE region = 'US';
 
-- **S&OP What-If Analysis**: Model demand changes, supply disruptions, or pricing scenarios
-- **Budget Planning**: Create optimistic/pessimistic/baseline variants
-- **Data Validation**: Test ETL changes in isolated scenarios before applying
-- **Audit Compliance**: Capture snapshots with embedded documentation for regulatory review
+SELECT * FROM opt.forecast;                          -- the what-if world
+SELECT * FROM forecast;                              -- the real world, untouched
+SELECT * FROM scenario_diff('optimistic', 'forecast');  -- exactly what differs
+```
+
+That's the whole idea. Only the rows you actually change are stored, so a scenario over a
+100-million-row table costs you the rows you touched — not a copy.
+
+### Is this for you?
+
+**A good fit if** you want to model what-ifs on data that fits on one machine, test a change
+before applying it, keep several named variants of a dataset side by side, or hand someone a
+single file containing both a baseline and the alternatives. Typical uses:
+
+- **S&OP and demand planning** — model demand shifts, supply disruptions, or price changes
+- **Budget planning** — keep optimistic, pessimistic, and baseline variants side by side
+- **Data validation** — try an ETL or migration change in a branch before applying it for real
+- **Audit trails** — freeze an approved plan as an immutable record you can diff against later
+
+**Not a fit if** you need multiple people writing to the same scenario concurrently, you're
+working at data-lake scale across a cluster, or you need to change the *schema* inside a
+branch — DDL in scenarios is rejected by design.
 
 ---
 
 ## Installation
 
-### From DuckDB Community Extensions (Coming Soon)
+Requires DuckDB v1.5.4 or later.
 
 ```sql
 INSTALL anofox_scenario FROM community;
 LOAD anofox_scenario;
 ```
 
-### Build from Source
+<details>
+<summary>Build from source instead</summary>
 
 ```bash
-git clone https://github.com/DataZooDE/anofox-scenario.git
+git clone --recurse-submodules https://github.com/DataZooDE/anofox-scenario.git
 cd anofox-scenario
 GEN=ninja make
 make test
 ```
 
-The extension will be built at:
-```
-build/release/extension/anofox_scenario/anofox_scenario.duckdb_extension
-```
+The extension is built at
+`build/release/extension/anofox_scenario/anofox_scenario.duckdb_extension`.
+
+</details>
 
 ---
 
@@ -69,54 +87,93 @@ build/release/extension/anofox_scenario/anofox_scenario.duckdb_extension
 ### 1. Create a Scenario
 
 ```sql
--- Load the extension
-LOAD 'anofox_scenario';
+LOAD anofox_scenario;
 
--- Create a scenario for what-if analysis
-SELECT scenario_create('price_increase', 'Analyzing 10% price increase impact');
--- Returns: true
+CREATE TABLE products (id INTEGER PRIMARY KEY, name VARCHAR, price DECIMAL(10,2));
+INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 24.50);
+
+-- Register a scenario for what-if analysis
+CALL scenario_create('price_increase', 'Analyzing 10% price increase impact');
 ```
 
 ### 2. Make Modifications
 
-```sql
--- Register a table for copy-on-write storage
-SELECT delta_create('price_increase', 'products');
+A scenario is an **attached catalog** — you edit it with ordinary SQL, and the base
+table is never written to.
 
--- Modify data in the scenario (base table unchanged)
-INSERT INTO _scen_price_increase._delta_products
-    (_op, id, name, price)
-VALUES ('U', 1, 'Widget Pro', 10.99);  -- Update price from 9.99 to 10.99
+```sql
+ATTACH 'price_increase' AS pi (TYPE scenario);
+
+UPDATE pi.products SET price = price * 1.1 WHERE id = 1;
+INSERT INTO pi.products VALUES (3, 'Doohickey', 5.00);
+DELETE FROM pi.products WHERE id = 2;
+```
+
+```sql
+SELECT count(*) FROM products;     -- 2, base untouched
+SELECT count(*) FROM pi.products;  -- 2, merged view (1 updated, 1 added, 1 removed)
 ```
 
 ### 3. Compare Changes
 
 ```sql
--- See what changed in the scenario
-SELECT * FROM scenario_compare('price_increase', 'products');
+SELECT * FROM scenario_diff('price_increase', 'products');
 ```
 
-| diff_type | id | column_name | old_value | new_value |
-|-----------|-----|-------------|-----------|-----------|
-| changed   | 1   | price       | 9.99      | 10.99     |
-
-### 4. Document Decisions
+| id | change_type | column_name | old_value | new_value |
+|----|-------------|-------------|-----------|-----------|
+| 1  | modified    | price       | 9.99      | 10.99     |
+| 2  | removed     | NULL        | NULL      | NULL      |
+| 3  | added       | NULL        | NULL      | NULL      |
 
 ```sql
--- Embed audit documentation directly in the database
-SELECT protocol_set_why('price_increase', 'Testing revenue impact of 10% price increase');
-SELECT protocol_add_finding('price_increase', 'Revenue projected to increase 8% with minimal churn');
-SELECT protocol_set_decision('price_increase', 'Approved for Q2 rollout');
+-- Per-table rollup
+SELECT * FROM scenario_diff_summary('price_increase');
+
+-- Diff any two sides, not just against the base
+SELECT * FROM scenario_diff('main', 'price_increase', 'products');
 ```
 
-### 5. Create Snapshots
+### 4. Branch and Freeze
 
 ```sql
--- Capture immutable point-in-time snapshot
-SELECT snapshot_create('price_increase', 'q2_approved', 'Final approved pricing for Q2');
+-- Branch off an existing scenario, inheriting its changes
+CALL scenario_create('price_increase_eu', from_scenario := 'price_increase');
 
--- Later, compare current state against the snapshot
-SELECT * FROM snapshot_compare('q2_approved', 'products');
+-- Full copy instead of a delta: immune to later base changes
+CALL scenario_create('q2_approved', mode := 'materialized');
+
+-- Reject further writes; reads keep working. A frozen materialized
+-- scenario is effectively an immutable snapshot.
+CALL scenario_freeze('q2_approved');
+```
+
+### 5. Merge Back
+
+```sql
+-- Inspect the planned actions and any conflicts first (no side effects)
+SELECT * FROM scenario_merge_preview('price_increase');
+```
+
+| table_name | key | action | conflict |
+|------------|-----|--------|----------|
+| products   | 1   | update | false    |
+| products   | 3   | insert | false    |
+| products   | 2   | delete | false    |
+
+```sql
+-- Merge refuses while branches exist, so drop the child from step 4 first
+CALL scenario_drop('price_increase_eu');
+
+-- Apply the scenario's changes to the base table
+SELECT * FROM scenario_merge('price_increase', on_conflict := 'abort');
+```
+
+On success the scenario ends up frozen with an empty delta. Use `on_conflict := 'ours'` to let
+the scenario win or `'theirs'` to let the base win, instead of aborting.
+
+```sql
+DETACH pi;  -- handle gone, scenario data persists
 ```
 
 ---
@@ -143,197 +200,167 @@ anofox-scenario uses the **Delta-Main pattern** for efficient copy-on-write stor
 ┌─────────────────┐       ┌─────────────────────┐
 │   Base Table    │       │    Delta Table      │
 │   (Immutable)   │       │   (Modifications)   │
-│   main.products │       │ _delta_products     │
+│   main.products │       │ s1_delta_products   │
 └─────────────────┘       └─────────────────────┘
 ```
 
+Delta tables live in the host database under the internal `__anofox_scenario` schema, named
+`s<scenario_id>_delta_<table>`. Because everything is inside the host database, a `.duckdb` file
+carries its scenarios with it — copy the file and the branches come along.
+
 **Benefits:**
-- **O(1) scenario creation** — no data copying
+- **Cheap scenario creation** — delta mode stores O(#tables) metadata and copies no rows
 - **Storage proportional to changes** — only deltas stored
 - **Full analytical performance** — DuckDB columnar scans on unchanged data
+
+### Choosing a scenario mode
+
+This is the one real decision at `scenario_create`, and it comes down to whether the scenario
+should notice later changes to the base table.
+
+| Mode | Create with | Base changes after creation… | Cost |
+|------|-------------|------------------------------|------|
+| **Delta** (default) | `scenario_create('s')` | …show through, except on rows the scenario already touched | Metadata only |
+| **Materialized** | `mode := 'materialized'` | …are invisible; the scenario is fully isolated | Copies every base table |
+| **DuckLake snapshot** | `base := '<attached lake>'` | …are invisible; reads pinned to creation time | No copy |
+
+Use the default for a short-lived what-if against a stable base. Use `materialized` when the
+scenario must stay reproducible even while the base keeps moving — for example an approved plan
+you'll be audited on later.
 
 ### Scenario Lifecycle
 
 ```
-scenario_create()     Create isolated branch
+scenario_create()                      Register a scenario
         │
-        ├── delta_create()     Enable COW for specific tables
+        ├── ATTACH (TYPE scenario)     Read/write it with ordinary SQL
         │
-        ├── scenario_branch()  Create child scenarios
+        ├── scenario_create(           Branch a child scenario
+        │       from_scenario := ...)
         │
-        ├── scenario_compare() Diff against baseline
+        ├── scenario_diff()            Diff against baseline or another scenario
         │
-        ├── snapshot_create()  Capture immutable snapshot
+        ├── scenario_freeze()          Make it read-only (immutable when materialized)
         │
-        └── scenario_drop()    Clean up when done
+        ├── scenario_merge()           Apply changes back to the base
+        │
+        └── scenario_drop()            Clean up when done
 ```
 
 ---
 
 ## API Reference
 
+### Reading and Writing
+
+| Statement | Description |
+|-----------|-------------|
+| `ATTACH 'name' AS alias (TYPE scenario)` | Expose the scenario as a catalog — this is the entire read/write UX |
+| `SELECT / INSERT / UPDATE / DELETE / TRUNCATE` on `alias.<table>` | Ordinary SQL; reads merge base + delta, writes go to the delta |
+| `DETACH alias` | Drop the handle; scenario data persists |
+
 ### Scenario Management
 
 | Function | Description |
 |----------|-------------|
-| `scenario_create(name, desc)` | Create new scenario |
-| `scenario_create(name, desc, capture_rowids)` | Create with optional rowid capture (default: true) |
-| `scenario_branch(source, name, desc)` | Branch from existing scenario |
-| `scenario_list()` | List all scenarios |
-| `scenario_stats(name)` | Get scenario statistics |
-| `scenario_validate(name)` | Check scenario integrity |
-| `scenario_archive(name)` | Mark as read-only |
-| `scenario_unarchive(name)` | Restore write capability |
-| `scenario_drop(name)` | Remove scenario |
-| `scenario_schema(name)` | Get schema name for SET search_path |
-
-### Delta Storage
-
-| Function | Description |
-|----------|-------------|
-| `delta_create(scenario, table)` | Enable COW storage for table |
-| `delta_drop(scenario, table)` | Remove delta table |
-| `scenario_write(scenario, table, op, data)` | Programmatic row modification |
+| `CALL scenario_create(name, [desc], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog], [key_columns := MAP {...}])` | Register a scenario. `materialized` copies every base table; `from_scenario` branches; `base` uses another attached catalog (DuckLake bases pin to creation time); `key_columns` declares row identity for tables without a PK |
+| `CALL scenario_drop(name)` | Remove the scenario and its delta/materialized tables. Refuses while attached or while branches exist |
+| `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | Reject/allow writes; reads keep working. A frozen materialized scenario is a snapshot |
+| `SELECT * FROM scenario_list()` | `scenario_id, name, mode, frozen, parent, created_at, description` |
+| `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | Create delta tables for base tables added after `scenario_create` |
+| `SELECT * FROM scenario_migrate()` | One-way migration of a legacy v0.1 database into the v2 layout |
 
 ### Comparison
 
 | Function | Description |
 |----------|-------------|
-| `scenario_compare(scenario, table)` | Diff scenario vs base |
-| `scenario_compare(scenario_a, scenario_b, table)` | Diff two scenarios |
-| `scenario_compare_all(scenario)` | Summary diff all tables |
+| `SELECT * FROM scenario_diff(scenario, table)` | Diff against origin: `<pk cols>`, `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value` |
+| `SELECT * FROM scenario_diff(a, b, table)` | Diff any two sides (`'main'` or any scenario); `old` = side a, `new` = side b |
+| `SELECT * FROM scenario_diff_summary(scenario)` | Per-table `rows_added / rows_modified / rows_removed` |
 
-### Snapshots
+Diffs stream through the engine, so filters and aggregates compose normally and PK columns
+keep their native types. Requires a PK or a declared `key_columns` on the table.
 
-| Function | Description |
-|----------|-------------|
-| `snapshot_create(scenario, name, desc)` | Capture point-in-time snapshot |
-| `snapshot_list()` | List all snapshots |
-| `snapshot_compare(snapshot, table)` | Diff current state vs snapshot |
-| `scenario_from_snapshot(snapshot, scenario, desc)` | Create scenario from snapshot |
-| `snapshot_drop(name)` | Remove snapshot |
-
-### Protocol Documentation
+### Merge-Back
 
 | Function | Description |
 |----------|-------------|
-| `protocol_set_why(scenario, text)` | Document scenario purpose |
-| `protocol_set_plan(scenario, text)` | Document planned approach |
-| `protocol_log_change(scenario, text)` | Append to change log |
-| `protocol_add_finding(scenario, text)` | Record analysis findings |
-| `protocol_set_decision(scenario, text)` | Document final decision |
-| `protocol_read(scenario)` | Read all protocol sections |
-| `protocol_export_markdown(scenario, path)` | Export to markdown file |
+| `SELECT * FROM scenario_merge_preview(scenario)` | Planned actions: `table_name, key, action, conflict`. Streaming, no side effects |
+| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | Apply the delta to the base. `abort` (default) throws on conflict; `ours` = scenario wins; `theirs` = base wins. On success the scenario ends frozen with an empty delta |
 
-### Configuration
+### Snapshots and Audit Notes
 
-| Setting | Description | Default |
-|---------|-------------|---------|
-| `scenario_schema_prefix` | Prefix for scenario schemas | `_scen_` |
+There is no separate snapshot or protocol API. For an immutable point-in-time capture, create a
+materialized scenario and freeze it:
 
 ```sql
-SET scenario_schema_prefix = '_my_';  -- Custom prefix
+CALL scenario_create('q2_approved', mode := 'materialized');
+CALL scenario_freeze('q2_approved');
 ```
 
-For complete API documentation, see [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+For audit notes, use a plain table — see the recipe in
+[docs/API_REFERENCE.md](docs/API_REFERENCE.md#protocols--audit-notes).
+
+For complete API documentation, including isolation tiers and current limitations, see
+[docs/API_REFERENCE.md](docs/API_REFERENCE.md).
 
 ---
 
-## Building from Source
+## Development
 
-### Prerequisites
-
-- CMake 3.5+
-- C++17 compatible compiler
-- Ninja (recommended) or Make
-- OpenSSL development libraries
-
-### Build Commands
+Prerequisites: CMake 3.5+, a C++17 compiler, Ninja (recommended), and OpenSSL development
+libraries. Supported on Linux (x86_64), macOS (x86_64 and ARM64), and Windows.
 
 ```bash
-# Clone with submodules
 git clone --recurse-submodules https://github.com/DataZooDE/anofox-scenario.git
 cd anofox-scenario
 
-# Fast incremental build (recommended)
-GEN=ninja make
+GEN=ninja make          # fast incremental build
+make debug              # debug build with symbols
+make test               # 1,100+ assertions across 28 test files
 
-# Debug build
-make debug
-
-# Release build
-make release
+./build/release/test/unittest "test/sql/attach_basic.test"   # one test file
 ```
 
-### Running Tests
+To try a locally built extension:
 
 ```bash
-# Run all tests (889+ assertions across 20 test files)
-make test
-
-# Run specific test file
-./build/release/test/unittest "test/sql/scenario_lifecycle.test"
-```
-
-### Platform Support
-
-| Platform | Status |
-|----------|--------|
-| Linux (x86_64) | Supported |
-| macOS (x86_64, ARM64) | Supported |
-| Windows | Supported |
-
----
-
-## Interactive Usage
-
-```bash
-# Start DuckDB with the extension
 ./build/release/duckdb
-
-# Load the extension
-D LOAD 'build/release/extension/anofox_scenario/anofox_scenario.duckdb_extension';
-
-# Verify it's loaded
-D SELECT * FROM duckdb_extensions() WHERE extension_name = 'anofox_scenario';
 ```
 
----
+```sql
+LOAD 'build/release/extension/anofox_scenario/anofox_scenario.duckdb_extension';
+SELECT * FROM duckdb_extensions() WHERE extension_name = 'anofox_scenario';
+```
 
-## Architecture
-
-The extension consists of six core components:
-
-| Component | Responsibility |
-|-----------|---------------|
-| **ScenarioManager** | Lifecycle: create, branch, list, archive, drop |
-| **DeltaStorageEngine** | COW storage, merge-on-read views, constraint inheritance |
-| **ComparisonEngine** | Row-level diffs between states |
-| **SnapshotManager** | Immutable point-in-time captures |
-| **ProtocolManager** | Embedded documentation storage |
-| **MetadataStore** | Internal registry tables |
-
-For detailed architecture documentation, see [docs/spec/architecture.md](docs/spec/architecture.md).
+For how the extension works internally — the read and write paths, the delta contract, the
+isolation tiers, and a map of the source tree — see
+[docs/spec/architecture.md](docs/spec/architecture.md).
 
 ---
 
 ## Limitations
 
-- **Single-writer per scenario**: Concurrent writes to the same scenario are not supported
-- **DDL restrictions**: Schema modifications not allowed in scenario schemas
-- **Rowid stability**: VACUUM/CHECKPOINT may invalidate scenarios; use `scenario_validate()` to check
+- **Single-writer**: host writes and scenario writes cannot share one explicit transaction
+- **DDL restrictions**: schema modifications are not permitted inside scenarios
+- **Keyless tables**: tables with no PRIMARY KEY need `key_columns :=` declared to unlock
+  `scenario_diff`, `MERGE INTO`, and `ON CONFLICT`; UPDATE/DELETE work with bag semantics
+- **Overlay isolation**: in the default `delta` mode, base changes show through unless the
+  scenario touched the same key — use `mode := 'materialized'` or a DuckLake `base :=` for
+  full isolation
+
+See [docs/API_REFERENCE.md](docs/API_REFERENCE.md) for the complete list.
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Please read our contributing guidelines before submitting PRs.
+Contributions are welcome. Development is test-first: add a failing case in `test/sql/`, make it
+pass, and keep `make test` green. See [Development](#development) for build commands and
+[docs/spec/architecture.md](docs/spec/architecture.md) for how the internals fit together.
 
-```bash
-# Development workflow
-GEN=ninja make           # Build
-make test                # Run tests
-```
+Bug reports are most useful with a minimal reproducer — the `CREATE TABLE`, the
+`scenario_create`, and the statement that misbehaves.
 
 ---
 
@@ -347,11 +374,11 @@ This project is licensed under the **Business Source License 1.1 (BSL)**.
 | ✅ **Non-Production Use** | Allowed — development, testing, evaluation |
 | ✅ **Modification** | Allowed |
 | ✅ **Distribution** | Allowed — under BSL terms |
-| 🏢 **Production Use** | Requires commercial license from [DataZoo GmbH](https://datazoo.de) |
+| 🏢 **Production Use** | Requires commercial license from [DataZoo GmbH](https://www.datazoo.de) |
 | 📅 **Change Date** | 4 years from release → Apache 2.0 |
 | ℹ️ **Attribution** | Required — include copyright notice |
 
-**In short:** Free for non-production use. Contact [DataZoo GmbH](https://datazoo.de) for production licensing.
+**In short:** Free for non-production use. Contact [DataZoo GmbH](https://www.datazoo.de) for production licensing.
 
 See the [LICENSE](LICENSE) file for the complete license text.
 
@@ -360,11 +387,11 @@ See the [LICENSE](LICENSE) file for the complete license text.
 ## Related Projects
 
 - [DuckDB](https://duckdb.org/) - The in-process analytical database
-- [anofox-forecast](https://github.com/anofox/anofox-forecast) - Demand forecasting extension
+- [anofox-forecast](https://github.com/DataZooDE/anofox-forecast) - Statistical timeseries forecasting
 - [DuckLake](https://github.com/duckdb/ducklake) - Lakehouse metadata management
 
 ---
 
 <p align="center">
-  <sub>Built with care by <a href="https://datazoo.de">DataZoo GmbH</a></sub>
+  <sub>Built with care by <a href="https://www.datazoo.de">DataZoo GmbH</a></sub>
 </p>

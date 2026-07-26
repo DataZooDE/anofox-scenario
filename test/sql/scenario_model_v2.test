@@ -75,7 +75,7 @@ CALL scenario_create('what_if_v2', 'branch', from_scenario := 'what_if');
 statement ok
 ATTACH 'what_if_v2' AS w2 (TYPE scenario);
 
-# the branch inherits the parent's modifications (REQ-SCEN-002)
+# the branch inherits the parent's modifications
 query I
 SELECT qty FROM w2.forecast WHERE id = 2;
 ----
