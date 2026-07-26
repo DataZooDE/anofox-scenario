@@ -2,7 +2,7 @@
 
 **DuckDB Extension for Git-Like Database Branching**
 
-This document guides AI agents in developing the anofox-scenario extension using incremental TDD with beads for project management and git worktrees for parallel epic development.
+This document guides AI agents in developing the anofox-scenario extension using incremental TDD, with GitHub issues for work tracking and git worktrees for parallel development.
 
 ---
 
@@ -52,13 +52,12 @@ Build feature-by-feature with each increment demonstrably working:
 2. **GREEN:** Implement minimal code to make test pass
 3. **REFACTOR:** Clean up while keeping tests green
 
-### Beads for Epic/Task Management
+### Work Tracking
 
-Track work in beads (`bd`) for cross-session persistence:
-- **Epics:** Map to requirement categories (6 epics)
-- **Tasks:** Individual functions or features within an epic
-- **Dependencies:** Tasks blocked until prerequisites complete
-- **Documentation Tasks:** Every implementation task requires companion doc tasks (API_REFERENCE.md, docs/spec/)
+Work is tracked in GitHub issues. Every implementation change that touches the
+user-facing surface needs a companion documentation update in the same PR —
+`docs/API_REFERENCE.md` for the SQL API, `docs/spec/architecture.md` when the
+internals change.
 
 ### Git Worktrees for Parallelism
 
@@ -107,7 +106,7 @@ Some epics depend on others:
 - **Snapshots** can proceed independently
 - **Protocols** can proceed independently
 
-Track dependencies in beads: `bd dep add <task> <depends-on>`
+Track dependencies in the GitHub issue itself.
 
 ---
 
@@ -116,40 +115,32 @@ Track dependencies in beads: `bd dep add <task> <depends-on>`
 ### Per-Task Development Cycle
 
 ```bash
-# 1. Claim task in beads
-bd update <task-id> --status=in_progress
+# 1. Write failing test (RED)
+# Edit the test/sql/*.test file covering this concern,
+# e.g. attach_write.test for write semantics
 
-# 2. Write failing test (RED)
-# Edit test/sql/scenario_lifecycle.test
-
-# 3. Run test to confirm it fails
+# 2. Run test to confirm it fails
 GEN=ninja make && make test
 # Expected: Test fails with clear error
 
-# 4. Implement minimal code (GREEN)
-# Edit src/scenario_manager.cpp
+# 3. Implement minimal code (GREEN)
+# Edit the relevant file under src/catalog/ or src/lifecycle/
 
-# 5. Run test to confirm it passes
+# 4. Run test to confirm it passes
 GEN=ninja make && make test
 # Expected: Test passes
 
-# 6. Refactor while green
+# 5. Refactor while green
 # Clean up code, add logging, improve error messages
 
-# 7. Verify tests still pass
+# 6. Verify tests still pass
 GEN=ninja make && make test
 
-# 8. Update docs/API_REFERENCE.md if user-facing function
+# 7. Update docs/API_REFERENCE.md if user-facing function
 # Document: function name, parameters, return type, examples
 
-# 9. Update docs/spec/ if architecture changed
+# 8. Update docs/spec/architecture.md if internals changed
 # Keep architecture documentation in sync with implementation
-
-# 10. Close task
-bd close <task-id>
-
-# 11. Sync beads
-bd sync
 ```
 
 ### SQLLogicTest Patterns
@@ -317,48 +308,21 @@ implementation plus `spec/architecture.md` are now the source of truth.
 
 ---
 
-## Beads Quick Reference
+## Issue Tracking
 
-### Finding Work
-
-```bash
-bd ready                          # Show issues ready to work (no blockers)
-bd list --status=open             # All open issues
-bd show <id>                      # Detailed issue view
-```
-
-### Creating Work
-
-Before creating tasks, consult `docs/spec/` for architecture guidance. Each epic should include documentation tasks for `docs/API_REFERENCE.md` (user-facing API) and `docs/spec/` (architecture updates).
+Work is tracked in GitHub issues via the `gh` CLI.
 
 ```bash
-# Create epic
-bd create --title="Scenario Lifecycle" --type=epic --priority=0
-
-# Create task within epic context
-bd create --title="Implement scenario_create" --type=task --priority=1
-
-# Create companion documentation task
-bd create --title="Document scenario_create in API_REFERENCE.md" --type=task --priority=2
-
-# Add dependency (task depends on another)
-bd dep add <task-id> <depends-on-id>
+gh issue list                                  # Open issues
+gh issue list --label bug                      # Filter by label
+gh issue view <number>                         # Detailed view
+gh issue create --title="..." --body="..."     # File new work
+gh issue close <number>
 ```
 
-### Updating Status
-
-```bash
-bd update <id> --status=in_progress    # Claim work
-bd close <id>                          # Mark complete
-bd close <id1> <id2> ...               # Close multiple
-```
-
-### Sync with Git
-
-```bash
-bd sync                           # Commit beads changes and push
-bd sync --status                  # Check sync status
-```
+Before filing implementation work, consult `docs/spec/architecture.md`. Any issue
+that changes the user-facing SQL surface should call out the companion update to
+`docs/API_REFERENCE.md` in its description.
 
 ---
 
@@ -368,12 +332,9 @@ bd sync --status                  # Check sync status
 
 ```bash
 # 1. Check available work
-bd ready
+gh issue list
 
-# 2. Review current epic status
-bd list --status=in_progress
-
-# 3. Verify build works
+# 2. Verify build works
 GEN=ninja make && make test
 ```
 
@@ -383,17 +344,16 @@ GEN=ninja make && make test
 
 ```bash
 # 1. File issues for remaining work
-bd create --title="..." --type=task
+gh issue create --title="..." --body="..."
 
 # 2. Run quality gates (if code changed)
 GEN=ninja make && make test
 
-# 3. Update issue status
-bd close <completed-ids>
+# 3. Close completed issues
+gh issue close <number>
 
 # 4. PUSH TO REMOTE
 git pull --rebase
-bd sync
 git push
 git status  # MUST show "up to date with origin"
 
