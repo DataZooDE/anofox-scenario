@@ -12,6 +12,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
+#include "anofox_scenario_banner.hpp"
 
 namespace duckdb {
 
@@ -564,10 +565,12 @@ void ScenarioLifecycle::RegisterFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(MakeVerbSet("scenario_freeze", LifecycleExecute<ScenarioFreezeVerb>, false));
 	loader.RegisterFunction(MakeVerbSet("scenario_unfreeze", LifecycleExecute<ScenarioUnfreezeVerb>, false));
 	// Registry v2 listing (replaces legacy scenario_list in v0.2)
-	loader.RegisterFunction(TableFunction("scenario_list", {}, ScenarioListExecute, ScenarioListBind,
+	loader.RegisterFunction(TableFunction("scenario_list", {}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioListExecute),
+	                                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioListBind),
 	                                      ScenarioListInit));
 	// Pick up base tables created after the scenario
-	TableFunction refresh("scenario_refresh", {LogicalType::VARCHAR}, ScenarioRefreshExecute, ScenarioRefreshBind,
+	TableFunction refresh("scenario_refresh", {LogicalType::VARCHAR}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioRefreshExecute),
+	                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioRefreshBind),
 	                      ScenarioRefreshInit);
 	refresh.named_parameters["key_columns"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
 	loader.RegisterFunction(refresh);

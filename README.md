@@ -364,6 +364,20 @@ Bug reports are most useful with a minimal reproducer — the `CREATE TABLE`, th
 
 ---
 
+## Feedback
+
+If `anofox_scenario` misbehaves or does something surprising, please
+[open an issue](https://github.com/DataZooDE/anofox-scenario/issues). Scenario
+lifecycles interact with real schemas and constraints we cannot reproduce here, so a
+report with your setup is the fastest path to a fix. Errors from the lifecycle
+functions end with that link.
+
+If it saved you time, a star on the repo helps other people find it.
+
+The first time you load the extension in an interactive terminal each day, a small
+banner says the same thing. It never prints when output is piped, in notebooks, or in
+CI. Silence it with `SET datazoo_banner = false;` or `DATAZOO_NO_BANNER=1`.
+
 ## License
 
 This project is licensed under the **Business Source License 1.1 (BSL)**.

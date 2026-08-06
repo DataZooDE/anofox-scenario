@@ -25,6 +25,7 @@
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
+#include "anofox_scenario_banner.hpp"
 
 namespace duckdb {
 
@@ -363,7 +364,8 @@ unique_ptr<GlobalTableFunctionState> ScenarioMigrateInit(ClientContext &context,
 
 void ScenarioMigrate::RegisterFunctions(ExtensionLoader &loader) {
 	loader.RegisterFunction(
-	    TableFunction("scenario_migrate", {}, ScenarioMigrateExecute, ScenarioMigrateBind, ScenarioMigrateInit));
+	    TableFunction("scenario_migrate", {}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioMigrateExecute),
+	                  DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioMigrateBind), ScenarioMigrateInit));
 }
 
 } // namespace duckdb
