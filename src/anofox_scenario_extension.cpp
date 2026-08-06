@@ -7,10 +7,10 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/config.hpp"
+#include "anofox_scenario_banner.hpp"
 
 #ifdef HAS_POSTHOG_TELEMETRY
 #include "telemetry.hpp"
-#include "anofox_scenario_banner.hpp"
 #endif
 
 
