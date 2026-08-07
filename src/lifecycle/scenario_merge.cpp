@@ -36,6 +36,7 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
+#include "anofox_scenario_banner.hpp"
 
 namespace duckdb {
 
@@ -911,7 +912,8 @@ void ScenarioMergeBack::RegisterFunctions(ExtensionLoader &loader) {
 	preview.bind_replace = MergePreviewBindReplace;
 	loader.RegisterFunction(preview);
 
-	TableFunction merge("scenario_merge", {LogicalType::VARCHAR}, MergeExecute, MergeBind, MergeInit);
+	TableFunction merge("scenario_merge", {LogicalType::VARCHAR}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, MergeExecute),
+	                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, MergeBind), MergeInit);
 	merge.named_parameters["on_conflict"] = LogicalType::VARCHAR;
 	loader.RegisterFunction(merge);
 }

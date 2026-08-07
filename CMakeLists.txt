@@ -23,6 +23,16 @@ elseif(APPLE AND DEFINED OSX_BUILD_ARCH AND NOT "${OSX_BUILD_ARCH}" STREQUAL "${
     message(STATUS "Cross-compiling on macOS (${OSX_BUILD_ARCH} on ${CMAKE_HOST_SYSTEM_PROCESSOR}) - building without PostHog telemetry")
 endif()
 
+# Feedback banner (header-only). Its banner_shown event goes through
+# posthog-telemetry, so the flag follows whether telemetry is compiled in at
+# all -- otherwise the banner header would include a telemetry.hpp that is not
+# on the path for this configuration.
+set(DATAZOO_BANNER_TELEMETRY ${TELEMETRY_SUPPORTED} CACHE BOOL "" FORCE)
+set(DATAZOO_BANNER_TELEMETRY_INCLUDE_DIR
+    ${CMAKE_CURRENT_SOURCE_DIR}/posthog-telemetry/include CACHE PATH "" FORCE)
+add_subdirectory(datazoo-banner)
+
+
 if(TELEMETRY_SUPPORTED)
     # Static OpenSSL avoids runtime dependencies on libssl.so.1.1 (Linux) and
     # libssl-3-x64.dll / libcrypto-3-x64.dll (Windows). On Windows this requires
@@ -62,6 +72,9 @@ set(EXTENSION_SOURCES
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
+
+target_link_libraries(${EXTENSION_NAME} datazoo_banner)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} datazoo_banner)
 
 # Fix "multiple definition of duckdb::LogicalType::VARCHAR/BIGINT/TIMESTAMP".
 # DuckDB core is built as C++11 and emits strong out-of-line definitions of its

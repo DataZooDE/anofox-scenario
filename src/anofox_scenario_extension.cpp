@@ -7,11 +7,17 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/config.hpp"
+#include "anofox_scenario_banner.hpp"
 
 #ifdef HAS_POSTHOG_TELEMETRY
 #include "telemetry.hpp"
 #endif
 
+
+// Deliberately outside namespace duckdb: the banner library is DuckDB-agnostic
+// and the guard macro refers to this object from every guarded source file.
+const datazoo::BannerInfo ANOFOX_SCENARIO_BANNER {
+    "anofox_scenario", "0.1.0", "https://github.com/DataZooDE/anofox-scenario"};
 
 namespace duckdb {
 
@@ -62,6 +68,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    PostHogTelemetry::Instance().SetEnabled(BooleanValue::Get(parameter));
 	    });
 #endif
+
+	datazoo::RegisterBannerOption(loader);
+	// Last, so a load that fails earlier never advertises itself. Silent unless
+	// stderr is a terminal and the ~/.duckdb stamp is over a day old.
+	datazoo::ShowBanner(ANOFOX_SCENARIO_BANNER);
 }
 
 void AnofoxScenarioExtension::Load(ExtensionLoader &loader) {
