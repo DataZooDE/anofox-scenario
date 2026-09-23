@@ -26,6 +26,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -908,14 +909,38 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 } // namespace
 
 void ScenarioMergeBack::RegisterFunctions(ExtensionLoader &loader) {
+	// Descriptions come from the function table in README.md.
 	TableFunction preview("scenario_merge_preview", {LogicalType::VARCHAR}, nullptr);
 	preview.bind_replace = MergePreviewBindReplace;
-	loader.RegisterFunction(preview);
+	{
+		CreateTableFunctionInfo info(std::move(preview));
+		FunctionDescription desc;
+		desc.description =
+		    "Show the actions a merge would take as (table_name, key, action, conflict). Streaming, with "
+		    "no side effects.";
+		desc.examples = {"SELECT * FROM scenario_merge_preview('price_increase');"};
+		desc.parameter_names = {"scenario"};
+		desc.categories = {"scenario"};
+		info.descriptions.push_back(std::move(desc));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	TableFunction merge("scenario_merge", {LogicalType::VARCHAR}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, MergeExecute),
 	                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, MergeBind), MergeInit);
 	merge.named_parameters["on_conflict"] = LogicalType::VARCHAR;
-	loader.RegisterFunction(merge);
+	{
+		CreateTableFunctionInfo info(std::move(merge));
+		FunctionDescription desc;
+		desc.description = "Apply a scenario's changes back to its base tables.";
+		desc.examples = {"SELECT * FROM scenario_merge('price_increase', on_conflict := 'abort');"};
+		// The named parameter has to be listed too: a non-empty parameter_names replaces
+		// the whole rendered list, so naming only the positional argument would turn
+		// on_conflict into "col1".
+		desc.parameter_names = {"scenario", "on_conflict"};
+		desc.categories = {"scenario"};
+		info.descriptions.push_back(std::move(desc));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb

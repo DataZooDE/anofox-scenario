@@ -1,0 +1,97 @@
+# name: test/sql/scenario_function_docs.test
+# description: Every function anofox_scenario registers documents itself in duckdb_functions()
+# group: [scenario]
+
+require anofox_scenario
+
+statement ok
+LOAD anofox_scenario
+
+# ============================================================================
+# Nothing this extension registers is left undocumented
+#
+# Enumerated, not allow-listed. A test that lists the names it expects passes
+# green while the functions it forgot to mention stay undocumented -- which is
+# exactly what happened in anofox-similarity, where a 10-name allow-list read
+# 10/10 while the extension registered 37.
+# ============================================================================
+
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name LIKE 'scenario%'
+  AND (description IS NULL OR description = ''
+       OR len(examples) = 0
+       OR len(categories) = 0
+       OR list_contains(parameters, 'col0'));
+----
+0
+
+# ============================================================================
+# Parameter names, including the named parameters
+#
+# These pin the RENDERED list, not just the absence of col0, and they are the
+# reason the lists in scenario_lifecycle.cpp can be trusted.
+#
+# duckdb_functions() replaces the whole parameter list once parameter_names is
+# non-empty: it walks positional arguments FOLLOWED BY named ones and pads any
+# shortfall with col1, col2. So a function with named parameters has to list
+# them too -- and they come out in fun.named_parameters map order, which is a
+# case_insensitive_map_t and therefore neither sorted nor guaranteed stable.
+#
+# If that order ever shifts, these fail loudly. Without them the same shift
+# would silently misname every argument while still reporting 100% coverage.
+# ============================================================================
+
+query I
+SELECT parameters FROM duckdb_functions()
+WHERE function_name = 'scenario_create' AND len(parameters) = 5;
+----
+[scenario, key_columns, base, from_scenario, mode]
+
+query I
+SELECT parameters FROM duckdb_functions()
+WHERE function_name = 'scenario_create' AND len(parameters) = 6;
+----
+[scenario, description, key_columns, base, from_scenario, mode]
+
+query I
+SELECT parameters FROM duckdb_functions() WHERE function_name = 'scenario_refresh';
+----
+[scenario, key_columns]
+
+query I
+SELECT parameters FROM duckdb_functions() WHERE function_name = 'scenario_merge';
+----
+[scenario, on_conflict]
+
+# ============================================================================
+# Distinct overloads carry distinct descriptions
+#
+# scenario_diff's two arities mean different things -- diff against origin vs
+# diff two named sides -- so each has its own FunctionDescription keyed by
+# parameter_types. Those types cover the POSITIONAL arguments only: that is the
+# list DuckDB matches against (GetParameterLogicalTypes), even though the name
+# list above spans the named parameters too.
+#
+# A mismatch here would not throw; the description would simply fail to match
+# and the function would report as undocumented. That is why this is asserted
+# rather than assumed.
+# ============================================================================
+
+query I
+SELECT count(DISTINCT description) FROM duckdb_functions()
+WHERE function_name = 'scenario_diff';
+----
+2
+
+query I
+SELECT parameters FROM duckdb_functions()
+WHERE function_name = 'scenario_diff' AND len(parameters) = 2;
+----
+[scenario, table_name]
+
+query I
+SELECT parameters FROM duckdb_functions()
+WHERE function_name = 'scenario_diff' AND len(parameters) = 3;
+----
+[a, b, table_name]

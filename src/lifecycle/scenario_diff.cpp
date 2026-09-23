@@ -19,6 +19,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -305,11 +306,47 @@ void ScenarioDiff::RegisterFunctions(ExtensionLoader &loader) {
 	                    nullptr);
 	diff3.bind_replace = ScenarioDiffBindReplace;
 	diff_set.AddFunction(diff3);
-	loader.RegisterFunction(diff_set);
+	{
+		// The two arities genuinely differ -- one diffs against the scenario's origin,
+		// the other diffs any two named sides -- so each carries its own description,
+		// keyed by parameter_types. Descriptions come from the function table in
+		// README.md.
+		CreateTableFunctionInfo info(std::move(diff_set));
+		FunctionDescription two_sided;
+		two_sided.description =
+		    "Diff a scenario against its origin, returning the primary key columns plus change_type "
+		    "('added', 'removed' or 'modified'), column_name, old_value and new_value.";
+		two_sided.examples = {"SELECT * FROM scenario_diff('price_increase', 'products');"};
+		two_sided.parameter_names = {"scenario", "table_name"};
+		two_sided.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
+		two_sided.categories = {"scenario"};
+		info.descriptions.push_back(std::move(two_sided));
+
+		FunctionDescription three_sided;
+		three_sided.description =
+		    "Diff any two sides against each other -- 'main' or any scenario name -- where old_value "
+		    "comes from side a and new_value from side b.";
+		three_sided.examples = {"SELECT * FROM scenario_diff('main', 'price_increase', 'products');"};
+		three_sided.parameter_names = {"a", "b", "table_name"};
+		three_sided.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR};
+		three_sided.categories = {"scenario"};
+		info.descriptions.push_back(std::move(three_sided));
+		loader.RegisterFunction(std::move(info));
+	}
 
 	TableFunction summary("scenario_diff_summary", {LogicalType::VARCHAR}, nullptr);
 	summary.bind_replace = ScenarioDiffSummaryBindReplace;
-	loader.RegisterFunction(summary);
+	{
+		CreateTableFunctionInfo info(std::move(summary));
+		FunctionDescription desc;
+		desc.description =
+		    "Summarise a scenario's changes per table as rows_added, rows_modified and rows_removed.";
+		desc.examples = {"SELECT * FROM scenario_diff_summary('price_increase');"};
+		desc.parameter_names = {"scenario"};
+		desc.categories = {"scenario"};
+		info.descriptions.push_back(std::move(desc));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb
