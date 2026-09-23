@@ -10,6 +10,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "anofox_scenario_banner.hpp"
@@ -559,21 +560,94 @@ TableFunctionSet MakeVerbSet(const string &name, table_function_t function, bool
 
 } // namespace
 
+namespace {
+
+// Descriptions are lifted from the function table in README.md so the two cannot drift
+// apart silently.
+//
+// On parameter_names: duckdb_functions() replaces the WHOLE parameter list once
+// parameter_names is non-empty, walking positional arguments FOLLOWED BY named ones and
+// padding any shortfall with "col1", "col2". So a function with named parameters must
+// list those too, or naming its positional argument would overwrite them. The named
+// parameters come out in map order, which is not sorted and not guaranteed stable --
+// test/sql/scenario_function_docs.test pins the rendered list so a reordering fails
+// loudly instead of silently misnaming every argument.
+FunctionDescription ScenarioDoc(string description, vector<string> examples,
+                                vector<string> parameter_names = {},
+                                vector<LogicalType> parameter_types = {}) {
+	FunctionDescription desc;
+	desc.description = std::move(description);
+	desc.examples = std::move(examples);
+	desc.parameter_names = std::move(parameter_names);
+	desc.parameter_types = std::move(parameter_types);
+	desc.categories = {"scenario"};
+	return desc;
+}
+
+//! Register a lifecycle verb that takes a single scenario name and nothing else.
+void RegisterVerb(ExtensionLoader &loader, TableFunctionSet set, string description, string example) {
+	CreateTableFunctionInfo info(std::move(set));
+	info.descriptions.push_back(
+	    ScenarioDoc(std::move(description), {std::move(example)}, {"scenario"}));
+	loader.RegisterFunction(std::move(info));
+}
+
+} // namespace
+
 void ScenarioLifecycle::RegisterFunctions(ExtensionLoader &loader) {
-	loader.RegisterFunction(MakeVerbSet("scenario_create", LifecycleExecute<ScenarioCreateVerb>, true));
-	loader.RegisterFunction(MakeVerbSet("scenario_drop", LifecycleExecute<ScenarioDropVerb>, false));
-	loader.RegisterFunction(MakeVerbSet("scenario_freeze", LifecycleExecute<ScenarioFreezeVerb>, false));
-	loader.RegisterFunction(MakeVerbSet("scenario_unfreeze", LifecycleExecute<ScenarioUnfreezeVerb>, false));
+	{
+		// Two overloads that mean different things -- with and without a description --
+		// so each gets its own FunctionDescription keyed by parameter_types. Note those
+		// types cover the POSITIONAL arguments only: that is the list DuckDB matches
+		// against, even though the name list above also spans the named parameters.
+		CreateTableFunctionInfo info(MakeVerbSet("scenario_create", LifecycleExecute<ScenarioCreateVerb>, true));
+		const string create_doc =
+		    "Register a scenario. 'materialized' mode copies every base table, the default 'delta' mode "
+		    "stores only what changed; from_scenario branches off an existing scenario; base uses another "
+		    "attached catalog; key_columns declares row identity for tables without a primary key.";
+		info.descriptions.push_back(ScenarioDoc(
+		    create_doc, {"CALL scenario_create('optimistic');"},
+		    {"scenario", "key_columns", "base", "from_scenario", "mode"}, {LogicalType::VARCHAR}));
+		info.descriptions.push_back(ScenarioDoc(
+		    create_doc, {"CALL scenario_create('price_increase', 'Analyzing 10% price increase impact');"},
+		    {"scenario", "description", "key_columns", "base", "from_scenario", "mode"},
+		    {LogicalType::VARCHAR, LogicalType::VARCHAR}));
+		loader.RegisterFunction(std::move(info));
+	}
+	RegisterVerb(loader, MakeVerbSet("scenario_drop", LifecycleExecute<ScenarioDropVerb>, false),
+	             "Remove a scenario and its delta or materialized tables. Refuses while the scenario is "
+	             "attached or while branches of it still exist.",
+	             "CALL scenario_drop('price_increase_eu');");
+	RegisterVerb(loader, MakeVerbSet("scenario_freeze", LifecycleExecute<ScenarioFreezeVerb>, false),
+	             "Reject writes to a scenario while leaving reads working; a frozen materialized scenario "
+	             "is a snapshot.",
+	             "CALL scenario_freeze('q2_approved');");
+	RegisterVerb(loader, MakeVerbSet("scenario_unfreeze", LifecycleExecute<ScenarioUnfreezeVerb>, false),
+	             "Allow writes to a scenario again, reversing scenario_freeze.",
+	             "CALL scenario_unfreeze('q2_approved');");
 	// Registry v2 listing (replaces legacy scenario_list in v0.2)
-	loader.RegisterFunction(TableFunction("scenario_list", {}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioListExecute),
-	                                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioListBind),
-	                                      ScenarioListInit));
+	{
+		CreateTableFunctionInfo info(TableFunction("scenario_list", {},
+		                                           DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioListExecute),
+		                                           DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioListBind),
+		                                           ScenarioListInit));
+		info.descriptions.push_back(ScenarioDoc(
+		    "List every registered scenario as (scenario_id, name, mode, frozen, parent, created_at, description).",
+		    {"SELECT * FROM scenario_list();"}));
+		loader.RegisterFunction(std::move(info));
+	}
 	// Pick up base tables created after the scenario
-	TableFunction refresh("scenario_refresh", {LogicalType::VARCHAR}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioRefreshExecute),
-	                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioRefreshBind),
-	                      ScenarioRefreshInit);
-	refresh.named_parameters["key_columns"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
-	loader.RegisterFunction(refresh);
+	{
+		TableFunction refresh("scenario_refresh", {LogicalType::VARCHAR}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioRefreshExecute),
+		                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioRefreshBind),
+		                      ScenarioRefreshInit);
+		refresh.named_parameters["key_columns"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
+		CreateTableFunctionInfo info(std::move(refresh));
+		info.descriptions.push_back(ScenarioDoc(
+		    "Create delta tables for base tables that were added after the scenario itself was created.",
+		    {"SELECT * FROM scenario_refresh('price_increase');"}, {"scenario", "key_columns"}));
+		loader.RegisterFunction(std::move(info));
+	}
 }
 
 } // namespace duckdb

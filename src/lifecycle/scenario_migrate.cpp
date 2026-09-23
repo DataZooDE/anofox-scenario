@@ -21,6 +21,7 @@
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/parser/parsed_data/create_table_function_info.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -363,9 +364,16 @@ unique_ptr<GlobalTableFunctionState> ScenarioMigrateInit(ClientContext &context,
 } // namespace
 
 void ScenarioMigrate::RegisterFunctions(ExtensionLoader &loader) {
-	loader.RegisterFunction(
+	CreateTableFunctionInfo info(
 	    TableFunction("scenario_migrate", {}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioMigrateExecute),
 	                  DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioMigrateBind), ScenarioMigrateInit));
+	// Description from the function table in README.md.
+	FunctionDescription desc;
+	desc.description = "Migrate a legacy v0.1 scenario database into the v2 layout. One-way.";
+	desc.examples = {"SELECT * FROM scenario_migrate();"};
+	desc.categories = {"scenario"};
+	info.descriptions.push_back(std::move(desc));
+	loader.RegisterFunction(std::move(info));
 }
 
 } // namespace duckdb
