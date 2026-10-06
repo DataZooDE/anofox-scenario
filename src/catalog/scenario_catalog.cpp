@@ -128,9 +128,18 @@ DatabaseSize ScenarioCatalog::GetDatabaseSize(ClientContext &context) {
 }
 
 optional_idx ScenarioCatalog::GetCatalogVersion(ClientContext &context) {
-	// Forward the host catalog's version: scenario entries mirror the live
-	// base schema, so plan caching must be invalidated when the base changes.
-	return GetHostCatalog(context).GetCatalogVersion(context);
+	// Scenario entries mirror the live base schema, so plan caching must be
+	// invalidated when the base changes: fold the host catalog's version in.
+	// The version also folds in the current transaction's serial: physical
+	// DML operators (e.g. INSERT ... VALUES, which has no scenario scan whose
+	// bind data could opt out of statement caching) hold references to the
+	// per-transaction ScenarioTableEntry, which dies with the transaction. A
+	// prepared statement planned in an earlier transaction must therefore be
+	// re-bound rather than re-executed against dangling entries.
+	auto host_version = GetHostCatalog(context).GetCatalogVersion(context);
+	auto &transaction = GetScenarioTransaction(context);
+	idx_t base = host_version.IsValid() ? host_version.GetIndex() : 0;
+	return optional_idx(base * 1000003ULL + transaction.serial);
 }
 
 bool ScenarioCatalog::InMemory() {

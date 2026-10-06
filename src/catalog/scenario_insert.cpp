@@ -18,6 +18,7 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/constraints/bound_check_constraint.hpp"
+#include "duckdb/planner/constraints/bound_foreign_key_constraint.hpp"
 #include "duckdb/planner/constraints/bound_not_null_constraint.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -208,8 +209,22 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 			// evaluated by the sink itself, and FK constraints must NOT be
 			// checked against the base alone: a referenced parent row may
 			// exist only in the scenario (FKs are enforced at merge-back).
+			// DataTable::VerifyAppendConstraints pairs bound_constraints[i]
+			// with the base table's constraints[i], so the list must keep the
+			// base table's length and order: dropping entries would pair e.g.
+			// a BoundUniqueConstraint with a NotNullConstraint and throw
+			// "bound constraint type mismatch". Instead, FK entries are
+			// replaced by a non-append (referenced-side) copy, which the
+			// verifier skips; NOT NULL/CHECK entries are kept (they already
+			// passed in the sink).
 			for (auto &constraint : all_base_constraints) {
-				if (constraint->type == ConstraintType::UNIQUE) {
+				if (constraint->type == ConstraintType::FOREIGN_KEY) {
+					auto &fk = constraint->Cast<BoundForeignKeyConstraint>();
+					auto info = fk.info;
+					info.type = ForeignKeyType::FK_TYPE_PRIMARY_KEY_TABLE;
+					gstate.base_constraints.push_back(
+					    make_uniq<BoundForeignKeyConstraint>(std::move(info), fk.pk_key_set, fk.fk_key_set));
+				} else {
 					gstate.base_constraints.push_back(std::move(constraint));
 				}
 			}

@@ -1,0 +1,141 @@
+# name: test/sql/attach_insert_constraint_order.test
+# description: INSERT of a new key into a delta scenario works for tables whose NOT NULL / CHECK / FK constraints precede the PK in declaration order (composite PK, VARCHAR PK)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# Composite PK declared after a NOT NULL column: the base probe must keep the
+# base table's constraint order (bound constraints are index-aligned)
+statement ok
+CREATE TABLE t (a BIGINT, b INTEGER, q INTEGER NOT NULL, PRIMARY KEY (a, b));
+
+statement ok
+INSERT INTO t VALUES (1, 10, 1);
+
+statement ok
+CALL scenario_create('seed', 's', mode := 'materialized');
+
+statement ok
+CALL scenario_freeze('seed');
+
+statement ok
+CALL scenario_create('winner', 'w', from_scenario := 'seed');
+
+statement ok
+ATTACH 'winner' AS ws (TYPE scenario);
+
+statement ok
+DELETE FROM ws.t;
+
+statement ok
+INSERT INTO ws.t (a, b, q) VALUES (2, 10, 2);
+
+# re-inserting a deleted key is still an update of the base row
+statement ok
+INSERT INTO ws.t (a, b, q) VALUES (1, 10, 5);
+
+query III
+SELECT a, b, q FROM ws.t ORDER BY a, b;
+----
+1	10	5
+2	10	2
+
+# duplicates are still rejected
+statement error
+INSERT INTO ws.t (a, b, q) VALUES (2, 10, 3);
+----
+<REGEX>:.*Duplicate key violates primary key constraint.*
+
+# a key that exists in the base (and was not deleted here) still collides
+statement ok
+CALL scenario_create('other', 'o', from_scenario := 'seed');
+
+statement ok
+ATTACH 'other' AS wo (TYPE scenario);
+
+statement error
+INSERT INTO wo.t (a, b, q) VALUES (1, 10, 9);
+----
+<REGEX>:.*key exists in the base table.*
+
+# NOT NULL (declared before the PK) is still enforced
+statement error
+INSERT INTO wo.t (a, b, q) VALUES (7, 7, NULL);
+----
+<REGEX>:.*NOT NULL constraint failed.*
+
+# VARCHAR PK, NOT NULL value: single inserts and a re-executed PREPARE
+statement ok
+CREATE TABLE p1d_summary (metric VARCHAR PRIMARY KEY, value DOUBLE NOT NULL);
+
+statement ok
+INSERT INTO p1d_summary VALUES ('old', 1.0);
+
+statement ok
+CALL scenario_create('seed3', 's3', mode := 'materialized');
+
+statement ok
+CALL scenario_freeze('seed3');
+
+statement ok
+CALL scenario_create('w3', 'w3', from_scenario := 'seed3');
+
+statement ok
+ATTACH 'w3' AS w3 (TYPE scenario);
+
+statement ok
+DELETE FROM w3.p1d_summary;
+
+statement ok
+PREPARE ins AS INSERT INTO w3.p1d_summary (metric, value) VALUES ($1, $2);
+
+statement ok
+EXECUTE ins('total_cost', 1.0);
+
+statement ok
+EXECUTE ins('committed_unit_cost', 2.0);
+
+statement ok
+EXECUTE ins('aggregate_fill_rate', 0.5);
+
+query TT
+SELECT metric, value FROM w3.p1d_summary ORDER BY metric;
+----
+aggregate_fill_rate	0.5
+committed_unit_cost	2.0
+total_cost	1.0
+
+# Single-column PK + CHECK + FK, all declared before/around the PK
+statement ok
+CREATE TABLE parent (id INTEGER PRIMARY KEY);
+
+statement ok
+INSERT INTO parent VALUES (1);
+
+statement ok
+CREATE TABLE child (qty INTEGER CHECK (qty > 0), parent_id INTEGER REFERENCES parent (id), id INTEGER, PRIMARY KEY (id));
+
+statement ok
+INSERT INTO child VALUES (1, 1, 1);
+
+# (a scenario forked straight from the live base: materializing a table with a
+# FOREIGN KEY is a separate limitation)
+statement ok
+CALL scenario_create('w2', 'w2');
+
+statement ok
+ATTACH 'w2' AS w2 (TYPE scenario);
+
+statement ok
+INSERT INTO w2.child VALUES (3, 1, 2);
+
+statement error
+INSERT INTO w2.child VALUES (0, 1, 3);
+----
+<REGEX>:.*CHECK constraint failed.*
+
+query III
+SELECT qty, parent_id, id FROM w2.child ORDER BY id;
+----
+1	1	1
+3	1	2
