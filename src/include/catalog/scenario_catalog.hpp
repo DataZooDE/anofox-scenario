@@ -43,6 +43,8 @@ public:
 	//! gives correct staleness (fresh per transaction) and lifetime (alive
 	//! for as long as the transaction can reference them).
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> table_entries;
+	//! Process-unique id of this transaction; feeds ScenarioCatalog::GetCatalogVersion
+	idx_t serial;
 };
 
 class ScenarioTransactionManager : public TransactionManager {

@@ -2,8 +2,10 @@
 
 namespace duckdb {
 
+static atomic<idx_t> transaction_serial {0};
+
 ScenarioTransaction::ScenarioTransaction(TransactionManager &manager, ClientContext &context)
-    : Transaction(manager, context) {
+    : Transaction(manager, context), serial(++transaction_serial) {
 }
 
 ScenarioTransactionManager::ScenarioTransactionManager(AttachedDatabase &db) : TransactionManager(db) {
