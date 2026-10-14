@@ -399,6 +399,37 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 	con.Commit();
 }
 
+//! Register base rows a merge deletes in the transaction's delete indexes
+//! (the old values are fetched first), so the merge's appends may reuse their
+//! UNIQUE values - a scenario can hand a deleted row's value to another row
+static void RegisterDeletedBaseRows(ClientContext &context, DuckTableEntry &base_duck,
+                                    const vector<unique_ptr<BoundConstraint>> &base_constraints,
+                                    const vector<row_t> &row_ids) {
+	auto &base_storage = base_duck.GetStorage();
+	auto &transaction = DuckTransaction::Get(context, base_duck.catalog);
+	vector<StorageIndex> all_cols;
+	for (idx_t i = 0; i < base_duck.GetColumns().LogicalColumnCount(); i++) {
+		all_cols.emplace_back(i);
+	}
+	idx_t offset = 0;
+	while (offset < row_ids.size()) {
+		idx_t batch = MinValue<idx_t>(row_ids.size() - offset, STANDARD_VECTOR_SIZE);
+		DataChunk deleted_chunk;
+		deleted_chunk.Initialize(Allocator::Get(context), base_storage.GetTypes());
+		Vector fetch_row_ids(LogicalType::ROW_TYPE, batch);
+		for (idx_t i = 0; i < batch; i++) {
+			fetch_row_ids.SetValue(i, Value::BIGINT(row_ids[offset + i]));
+		}
+		ColumnFetchState fetch_state;
+		base_storage.Fetch(transaction, deleted_chunk, all_cols, fetch_row_ids, batch, fetch_state);
+		LocalAppendState append_state;
+		base_storage.InitializeLocalAppend(append_state, base_duck, context, base_constraints);
+		append_state.storage->AppendToDeleteIndexes(fetch_row_ids, deleted_chunk);
+		base_storage.FinalizeLocalAppend(append_state);
+		offset += batch;
+	}
+}
+
 void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<MergeState>();
 	if (state.done) {
@@ -703,33 +734,11 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			auto &base_storage = base_duck.GetStorage();
 			auto &transaction = DuckTransaction::Get(context, base_duck.catalog);
 
-			// every deleted base row - replaced or plainly deleted - goes into
-			// the transaction's delete indexes, so the appends may reuse its
-			// unique values (a scenario can hand a deleted row's UNIQUE value
-			// to another row); registration needs the old values, so fetch
-			// them before deleting
+			// every deleted base row - replaced or plainly deleted - so the
+			// appends may reuse its UNIQUE values (before deleting: the
+			// registration fetches the old values)
 			if (!append_rows.empty()) {
-				vector<StorageIndex> all_cols;
-				for (idx_t i = 0; i < base_entry->GetColumns().LogicalColumnCount(); i++) {
-					all_cols.emplace_back(i);
-				}
-				idx_t offset = 0;
-				while (offset < base_rows_to_delete.size()) {
-					idx_t batch = MinValue<idx_t>(base_rows_to_delete.size() - offset, STANDARD_VECTOR_SIZE);
-					DataChunk deleted_chunk;
-					deleted_chunk.Initialize(Allocator::Get(context), base_storage.GetTypes());
-					Vector fetch_row_ids(LogicalType::ROW_TYPE, batch);
-					for (idx_t i = 0; i < batch; i++) {
-						fetch_row_ids.SetValue(i, Value::BIGINT(base_rows_to_delete[offset + i]));
-					}
-					ColumnFetchState fetch_state;
-					base_storage.Fetch(transaction, deleted_chunk, all_cols, fetch_row_ids, batch, fetch_state);
-					LocalAppendState append_state;
-					base_storage.InitializeLocalAppend(append_state, base_duck, context, base_constraints);
-					append_state.storage->AppendToDeleteIndexes(fetch_row_ids, deleted_chunk);
-					base_storage.FinalizeLocalAppend(append_state);
-					offset += batch;
-				}
+				RegisterDeletedBaseRows(context, base_duck, base_constraints, base_rows_to_delete);
 			}
 
 			// deletes
@@ -837,6 +846,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			auto base_constraints = binder->BindConstraints(base_duck);
 			if (!base_rows_to_delete.empty()) {
 				auto &base_storage = base_duck.GetStorage();
+				// the appends below may reuse the deleted rows' UNIQUE values
+				RegisterDeletedBaseRows(context, base_duck, base_constraints, base_rows_to_delete);
 				auto delete_state = base_storage.InitializeDelete(base_duck, context, base_constraints);
 				idx_t offset = 0;
 				while (offset < base_rows_to_delete.size()) {

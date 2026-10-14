@@ -1,0 +1,139 @@
+# name: test/sql/attach_keyless_unique.test
+# description: Secondary UNIQUE constraints on keyless tables (no PK, no key_columns) hold on the merged relation
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# Keyless deltas are bags (I/D rows with _count, no delta PK), so they cannot
+# carry a mirrored UNIQUE index. The merged count of a value is
+#   base_has(v) + sum(I) - sum(D)   over the delta rows holding it.
+
+statement ok
+CREATE TABLE contacts (email VARCHAR UNIQUE, note VARCHAR);
+
+statement ok
+INSERT INTO contacts VALUES ('ada@corp.com', 'base'), ('ten@corp.com', 'base'), (NULL, 'anon'), (NULL, 'anon');
+
+statement ok
+CALL scenario_create('k');
+
+statement ok
+ATTACH 'k' AS k (TYPE scenario);
+
+statement ok
+INSERT INTO k.contacts VALUES ('grace@corp.com', 'new');
+
+# a value held by a base row
+statement error
+INSERT INTO k.contacts VALUES ('ada@corp.com', 'shadow');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# a value held by another scenario row, separate statement
+statement error
+INSERT INTO k.contacts VALUES ('grace@corp.com', 'imposter');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# twice within one statement
+statement error
+INSERT INTO k.contacts VALUES ('alan@corp.com', 'a'), ('alan@corp.com', 'b');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# NULLs never conflict
+statement ok
+INSERT INTO k.contacts VALUES (NULL, 'anon'), (NULL, 'anon');
+
+query I
+SELECT count(*) FROM k.contacts;
+----
+7
+
+# an UPDATE that leaves the unique value alone is fine (D(old) + I(new) of the same value)
+statement ok
+UPDATE k.contacts SET note = 'edited' WHERE email = 'ada@corp.com';
+
+# ...an UPDATE onto a value held elsewhere is not
+statement error
+UPDATE k.contacts SET email = 'ten@corp.com' WHERE email = 'grace@corp.com';
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+statement error
+UPDATE k.contacts SET email = 'grace@corp.com' WHERE email = 'ten@corp.com';
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# a value freed by a scenario DELETE can be reused
+statement ok
+DELETE FROM k.contacts WHERE email = 'ten@corp.com';
+
+statement ok
+INSERT INTO k.contacts VALUES ('ten@corp.com', 'reused');
+
+# ...but only once
+statement error
+INSERT INTO k.contacts VALUES ('ten@corp.com', 'again');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# a value freed by an UPDATE can be reused, also within one statement (swap)
+statement ok
+UPDATE k.contacts SET email = CASE email WHEN 'ada@corp.com' THEN 'grace@corp.com' ELSE 'ada@corp.com' END
+WHERE email IN ('ada@corp.com', 'grace@corp.com');
+
+query TT
+SELECT email, note FROM k.contacts WHERE email IS NOT NULL ORDER BY email;
+----
+ada@corp.com	new
+grace@corp.com	edited
+ten@corp.com	reused
+
+# merge-back applies the scenario
+statement ok
+DETACH k;
+
+query I
+SELECT rows_applied > 0 FROM scenario_merge('k');
+----
+true
+
+query TT
+SELECT email, note FROM contacts WHERE email IS NOT NULL ORDER BY email;
+----
+ada@corp.com	new
+grace@corp.com	edited
+ten@corp.com	reused
+
+query I
+SELECT count(*) FROM contacts WHERE email IS NULL;
+----
+4
+
+statement ok
+CALL scenario_drop('k');
+
+# materialized: the unique check runs against the scenario's own copy
+statement ok
+CALL scenario_create('km', mode := 'materialized');
+
+statement ok
+ATTACH 'km' AS km (TYPE scenario);
+
+statement error
+INSERT INTO km.contacts VALUES ('ada@corp.com', 'x');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+statement ok
+DELETE FROM km.contacts WHERE email = 'ada@corp.com';
+
+statement ok
+INSERT INTO km.contacts VALUES ('ada@corp.com', 'x');
+
+statement ok
+DETACH km;
+
+statement ok
+CALL scenario_drop('km');

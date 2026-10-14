@@ -299,6 +299,10 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 			}
 			delta_storage.Delete(*delete_state, client, row_ids, tombstones_to_remove.size());
 		}
+	} else if (gstate.base_probe.HasSecondary()) {
+		// keyless bag delta: no mirrored UNIQUE index, so secondary UNIQUEs
+		// are counted on the merged relation
+		gstate.base_probe.ProbeKeyless(client, delta_table, chunk, {});
 	}
 
 	// Build the delta chunk: _op, _ts, payload

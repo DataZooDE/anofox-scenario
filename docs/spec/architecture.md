@@ -86,6 +86,16 @@ This supports `INSERT`/`UPDATE`/`DELETE` with bag semantics, but cannot support 
 `MERGE INTO`, or `ON CONFLICT` — all three need row identity. Those are rejected with an error
 pointing at `key_columns :=`.
 
+A bag delta cannot carry a mirrored `UNIQUE` index, because `D` rows hold real payloads.
+Secondary `UNIQUE` constraints of a keyless table are therefore *counted* on the merged
+relation instead (`ScenarioBaseUniqueProbe::ProbeKeyless`):
+
+- A non-NULL tuple *v* is held `base_has(v) + Σ_I _count − Σ_D _count` times.
+- `base_has(v)` is 0 or 1, read from the base's unique index.
+- The sums run over the delta rows holding *v*, plus this statement's pending deletes. An
+  `UPDATE` is `D(old) + I(new)`, so an unchanged value nets out.
+- A new row is rejected if its tuple is already held once.
+
 ---
 
 ## Write path

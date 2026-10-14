@@ -49,7 +49,8 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   for scenario writes against the *merged* state, with distinct errors for conflicts with base
   rows vs. scenario changes. A unique value whose base row the scenario deleted or changed is
   free again: another row may take it, in the same statement or a later one, and
-  `scenario_merge` applies the result. `FOREIGN KEY` constraints are not enforced inside a scenario: a parent row
+  `scenario_merge` applies the result. Keyless tables (no PK, no `key_columns`) enforce their
+  `UNIQUE` constraints the same way. `FOREIGN KEY` constraints are not enforced inside a scenario: a parent row
   may exist only in the scenario. `scenario_merge` enforces them against the base and rolls back
   atomically on a violation. Materialized copies don't carry the FKs, so introspection through a
   materialized scenario doesn't list them. Overlay scenarios mirror the base's FKs.
@@ -65,7 +66,6 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | Host writes and scenario writes in the *same explicit transaction* | single-writer rule; documented restriction |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
 | `MERGE INTO` / `ON CONFLICT` on keyless tables (no PK, no `key_columns`) | UPDATE/DELETE work (bag semantics); declare `key_columns :=` for keyed matching |
-| Secondary `UNIQUE` constraints on *keyless* tables are not enforced between scenario rows (keyed tables enforce them fully) | rare combination; documented |
 | `scenario_diff` on keyless tables | requires a PK or `key_columns :=` |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
 | Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |

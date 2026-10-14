@@ -283,6 +283,7 @@ test/sql/
   scenario_model_v2.test          # materialized mode, branching, scenario_list
   scenario_diff_v2.test           # streaming diff engine (2- and 3-arg)
   scenario_migrate.test           # legacy v0.1 -> v2 migration
+  attach_keyless_unique.test      # UNIQUE on keyless (bag) tables vs the merged relation (#27)
   attach_insert_constraint_order.test # base PK probe vs constraint declaration order (#22)
   scenario_materialized_fk.test   # materialized copies over FK schemas; merge-back enforces FKs (#24)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)

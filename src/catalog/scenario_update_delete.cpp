@@ -413,6 +413,17 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 			bag_rows.push_back(std::move(new_row));
 			gstate.affected_count++;
 		}
+		if (gstate.base_probe.HasSecondary()) {
+			// no mirrored UNIQUE index on a bag delta: count the post-images
+			// on the merged relation, net of the old rows this chunk deletes
+			vector<vector<Value>> pending_deleted;
+			for (idx_t i = 0; i < bag_ops.size(); i++) {
+				if (bag_ops[i] == 'D') {
+					pending_deleted.push_back(bag_rows[i]);
+				}
+			}
+			gstate.base_probe.ProbeKeyless(client, *gstate.delta_table, full_chunk, pending_deleted);
+		}
 		gstate.FlushAppends(client, entry, bag_ops, bag_rows);
 		if (return_chunk) {
 			if (!gstate.return_collection) {

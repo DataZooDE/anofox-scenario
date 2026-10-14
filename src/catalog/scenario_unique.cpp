@@ -267,4 +267,142 @@ void ScenarioBaseUniqueProbe::ProbeSecondary(ClientContext &context, DuckTableEn
 	}
 }
 
+void ScenarioBaseUniqueProbe::ProbeKeyless(ClientContext &context, DuckTableEntry &delta_table, DataChunk &rows,
+                                           const vector<vector<Value>> &pending_deleted) {
+	if (secondary_indexes.empty() || rows.size() == 0) {
+		return;
+	}
+	auto count_column = ScenarioDelta::CountColumnIndex(delta_table);
+	if (!count_column.IsValid()) {
+		return; // pre-v0.4.1 delta: keyless writes are gated elsewhere
+	}
+	auto column_count = entry->GetColumns().LogicalColumnCount();
+	vector<LogicalType> table_types;
+	for (idx_t col = 0; col < column_count; col++) {
+		table_types.push_back(entry->GetColumn(LogicalIndex(col)).Type());
+	}
+	// NULL-free tuple of one unique index in a row ("" = has a NULL: never conflicts)
+	auto tuple_of = [](const vector<idx_t> &columns, const std::function<Value(idx_t)> &get) {
+		string key;
+		for (auto col : columns) {
+			auto value = get(col);
+			if (value.IsNull()) {
+				return string();
+			}
+			auto str = value.ToString();
+			key += to_string(str.size()) + ":" + str;
+		}
+		return key;
+	};
+
+	for (auto &index_entry : secondary_indexes) {
+		auto &art = index_entry.get().index->Cast<ART>();
+		auto &id_set = art.GetColumnIdSet();
+		vector<idx_t> columns(id_set.begin(), id_set.end());
+		std::sort(columns.begin(), columns.end());
+
+		// candidate tuples of the new rows; rows with a NULL are exempt
+		vector<string> row_tuples(rows.size());
+		unordered_map<string, int64_t> net;
+		for (idx_t i = 0; i < rows.size(); i++) {
+			row_tuples[i] = tuple_of(columns, [&](idx_t col) { return rows.GetValue(col, i); });
+			if (!row_tuples[i].empty()) {
+				net.emplace(row_tuples[i], 0);
+			}
+		}
+		if (net.empty()) {
+			continue;
+		}
+
+		// scenario side: sum(I) - sum(D) per tuple, flushed rows + this
+		// statement's pending deletes
+		vector<StorageIndex> delta_columns;
+		vector<LogicalType> delta_types;
+		delta_columns.emplace_back(ScenarioDelta::OP_COL);
+		delta_types.push_back(LogicalType::VARCHAR);
+		delta_columns.emplace_back(count_column.GetIndex());
+		delta_types.push_back(LogicalType::BIGINT);
+		for (auto col : columns) {
+			delta_columns.emplace_back(ScenarioDelta::PAYLOAD_START + col);
+			delta_types.push_back(table_types[col]);
+		}
+		ScenarioDelta::ScanTableRows(context, delta_table, std::move(delta_columns), delta_types,
+		                             [&](DataChunk &chunk, idx_t row) {
+			                             idx_t pos = 2;
+			                             string key;
+			                             bool has_null = false;
+			                             for (idx_t c = 0; c < columns.size(); c++, pos++) {
+				                             auto value = chunk.GetValue(pos, row);
+				                             if (value.IsNull()) {
+					                             has_null = true;
+					                             break;
+				                             }
+				                             auto str = value.ToString();
+				                             key += to_string(str.size()) + ":" + str;
+			                             }
+			                             if (has_null) {
+				                             return true;
+			                             }
+			                             auto hit = net.find(key);
+			                             if (hit != net.end()) {
+				                             auto count = chunk.GetValue(1, row).GetValue<int64_t>();
+				                             auto op = chunk.GetValue(0, row).GetValue<string>();
+				                             hit->second += op == "I" ? count : -count;
+			                             }
+			                             return true;
+		                             });
+		for (auto &deleted : pending_deleted) {
+			auto hit = net.find(tuple_of(columns, [&](idx_t col) { return deleted[col]; }));
+			if (hit != net.end()) {
+				hit->second--;
+			}
+		}
+
+		// base side: a unique index holds each tuple at most once. Fast path:
+		// none of the rows collides with a base row.
+		vector<bool> in_base(rows.size(), false);
+		try {
+			lock_guard<mutex> guard(index_entry.get().lock);
+			IndexAppendInfo append_info;
+			art.VerifyAppend(rows, append_info, nullptr);
+		} catch (ConstraintException &) {
+			DataChunk single;
+			single.Initialize(Allocator::Get(context), table_types);
+			for (idx_t i = 0; i < rows.size(); i++) {
+				if (row_tuples[i].empty()) {
+					continue;
+				}
+				single.Reset();
+				for (idx_t col = 0; col < column_count; col++) {
+					single.SetValue(col, 0, rows.GetValue(col, i));
+				}
+				single.SetCardinality(1);
+				try {
+					lock_guard<mutex> guard(index_entry.get().lock);
+					IndexAppendInfo append_info;
+					art.VerifyAppend(single, append_info, nullptr);
+				} catch (ConstraintException &) {
+					in_base[i] = true;
+				}
+			}
+		}
+
+		// each new row needs its tuple to be absent from the merged relation,
+		// counting the rows of this batch added before it
+		for (idx_t i = 0; i < rows.size(); i++) {
+			if (row_tuples[i].empty()) {
+				continue;
+			}
+			auto &held = net[row_tuples[i]];
+			if ((in_base[i] ? 1 : 0) + held > 0) {
+				throw ConstraintException(
+				    "Duplicate value violates a UNIQUE constraint on keyless scenario table \"%s\": the value is "
+				    "already held by a row of the scenario",
+				    entry->name);
+			}
+			held++;
+		}
+	}
+}
+
 } // namespace duckdb

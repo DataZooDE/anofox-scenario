@@ -71,6 +71,13 @@ public:
 	//! that are not in the delta table yet. Throws the raw ConstraintException.
 	void ProbeSecondary(ClientContext &context, DuckTableEntry &delta_table, DataChunk &rows,
 	                    const vector<vector<Value>> &pending_replaced);
+	//! Keyless tables (bag deltas, no mirrored UNIQUE index): the merged count
+	//! of a non-NULL unique tuple is base_has(v) + sum(I) - sum(D) over the
+	//! delta rows holding it. Rows (full table layout) are the new rows to
+	//! add; pending_deleted are this statement's not-yet-flushed 'D' rows.
+	//! Throws a ConstraintException if a row would duplicate a value.
+	void ProbeKeyless(ClientContext &context, DuckTableEntry &delta_table, DataChunk &rows,
+	                  const vector<vector<Value>> &pending_deleted);
 
 private:
 	//! Base rowids and full rows of every base row the scenario replaced
