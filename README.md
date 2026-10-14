@@ -274,7 +274,7 @@ scenario_create()                      Register a scenario
 
 | Function | Description |
 |----------|-------------|
-| `SELECT * FROM scenario_diff(scenario, table)` | Diff against origin: `<pk cols>`, `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value` |
+| `SELECT * FROM scenario_diff(scenario, table)` | Diff against origin: `<key cols>` (every column for keyless tables), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value` |
 | `SELECT * FROM scenario_diff(a, b, table)` | Diff any two sides (`'main'` or any scenario); `old` = side a, `new` = side b |
 | `SELECT * FROM scenario_diff_summary(scenario)` | Per-table `rows_added / rows_modified / rows_removed` |
 
@@ -344,7 +344,7 @@ isolation tiers, and a map of the source tree — see
 - **Single-writer**: host writes and scenario writes cannot share one explicit transaction
 - **DDL restrictions**: schema modifications are not permitted inside scenarios
 - **Keyless tables**: tables with no PRIMARY KEY need `key_columns :=` declared to unlock
-  `scenario_diff`, `MERGE INTO`, and `ON CONFLICT`; UPDATE/DELETE work with bag semantics
+  `MERGE INTO` and `ON CONFLICT`; UPDATE/DELETE and `scenario_diff` work with bag semantics
 - **Overlay isolation**: in the default `delta` mode, base changes show through unless the
   scenario touched the same key — use `mode := 'materialized'` or a DuckLake `base :=` for
   full isolation

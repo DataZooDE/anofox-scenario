@@ -82,9 +82,19 @@ Without a PK or declared `key_columns` there is nothing to match on, so the delt
 **bag changelog**: no PK, plus a trailing `_count BIGINT` multiplicity, with readers aggregating
 inserts and deletes per distinct value.
 
-This supports `INSERT`/`UPDATE`/`DELETE` with bag semantics, but cannot support `scenario_diff`,
-`MERGE INTO`, or `ON CONFLICT` — all three need row identity. Those are rejected with an error
-pointing at `key_columns :=`.
+This supports `INSERT`/`UPDATE`/`DELETE` with bag semantics, but cannot support `MERGE INTO` or
+`ON CONFLICT`, because both need row identity. Those are rejected with an error pointing at
+`key_columns :=`.
+
+`scenario_diff` on a keyless table is a **bag diff**:
+
+- Every column is the identity, and there is no `modified`: a changed row shows as `removed`
+  (old) plus `added` (new).
+- The 2-arg form nets the delta's `I`/`D` counts per distinct row (`GROUP BY` is NULL-safe,
+  like `MakeKey`). It emits one row per copy, so an insert later deleted again shows nothing.
+- The 3-arg form builds each side's merged bag as origin `UNION ALL` inserted copies
+  `EXCEPT ALL` deleted copies, and diffs the two with `EXCEPT ALL` in both directions.
+- `scenario_diff_summary` reports the netted counts.
 
 A bag delta cannot carry a mirrored `UNIQUE` index, because `D` rows hold real payloads.
 Secondary `UNIQUE` constraints of a keyless table are therefore *counted* on the merged

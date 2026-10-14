@@ -66,7 +66,6 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | Host writes and scenario writes in the *same explicit transaction* | single-writer rule; documented restriction |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
 | `MERGE INTO` / `ON CONFLICT` on keyless tables (no PK, no `key_columns`) | UPDATE/DELETE work (bag semantics); declare `key_columns :=` for keyed matching |
-| `scenario_diff` on keyless tables | requires a PK or `key_columns :=` |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
 | Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |
 | Table or schema names containing `.` | rejected at `scenario_create` (naming-contract separator) |
@@ -79,9 +78,9 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | `CALL scenario_drop(name)` | verb | Remove the scenario and its delta/materialized tables. Refuses while attached or while branches exist. |
 | `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | verb | Reject/allow writes through any attached handle (reads keep working). A frozen materialized scenario is a snapshot. |
 | `SELECT * FROM scenario_list()` | table | `scenario_id, name, mode, frozen, parent, created_at, description`. |
-| `SELECT * FROM scenario_diff(scenario, table)` | table | Compare to origin: `<pk cols>` (native types), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value`. Streams through the engine. |
+| `SELECT * FROM scenario_diff(scenario, table)` | table | Compare to origin: `<pk cols>` (native types), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value`. Streams through the engine. Keyless tables (no PK, no `key_columns`) get a bag diff: every column is the identity, a changed row is `removed` + `added`, and duplicates appear once per copy. |
 | `SELECT * FROM scenario_diff(a, b, table)` | table | Generic diff between two merged relations (`'main'` or any scenario). `old` = side a, `new` = side b. |
-| `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog. |
+| `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog. For keyless tables these are the net counts per distinct row (`rows_modified` is 0). |
 | `SELECT * FROM scenario_merge_preview(scenario)` | table | Planned merge-back actions: `table_name, key, action, conflict`. Streaming; no side effects. Overlay conflicts: an `insert` whose key now exists in base, an `update` whose key vanished. Scenarios with a creation snapshot (materialized, DuckLake) additionally flag 3-way *drift* conflicts: the base row changed since the snapshot on a touched key. |
 | `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). On success the scenario ends `frozen` with `merged_at` set and an empty delta. Refuses while branches exist. |
 | `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | verb | Create delta tables for base tables added after `scenario_create`, making them writable. `key_columns` declares identity for new keyless tables (rejected once a table is already tracked). Returns `refreshed_tables`. Idempotent; refuses materialized scenarios. |

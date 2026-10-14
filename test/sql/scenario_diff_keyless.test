@@ -1,0 +1,171 @@
+# name: test/sql/scenario_diff_keyless.test
+# description: scenario_diff / scenario_diff_summary on keyless tables (bag diff: all columns are the identity)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# Without a key there is no "modified": a changed row is removed(old) +
+# added(new). Duplicates show up once per copy, and the changelog's I/D rows
+# are netted per value (an insert later deleted again is no change).
+
+statement ok
+CREATE TABLE log_lines (source VARCHAR, message VARCHAR);
+
+statement ok
+INSERT INTO log_lines VALUES ('app', 'started'), ('app', 'started'), ('db', 'connected'), ('db', NULL);
+
+statement ok
+CALL scenario_create('bd');
+
+statement ok
+ATTACH 'bd' AS s (TYPE scenario);
+
+statement ok
+DELETE FROM s.log_lines WHERE message = 'started';
+
+statement ok
+INSERT INTO s.log_lines VALUES ('worker', 'retry'), ('worker', 'retry');
+
+statement ok
+UPDATE s.log_lines SET message = 'retried' WHERE message = 'retry';
+
+statement ok
+INSERT INTO s.log_lines VALUES ('cron', 'tick');
+
+statement ok
+DELETE FROM s.log_lines WHERE source = 'cron';
+
+statement ok
+UPDATE s.log_lines SET message = 'silent' WHERE message IS NULL;
+
+query TTTTTT rowsort
+SELECT * FROM scenario_diff('bd', 'log_lines');
+----
+app	started	removed	NULL	NULL	NULL
+app	started	removed	NULL	NULL	NULL
+db	NULL	removed	NULL	NULL	NULL
+db	silent	added	NULL	NULL	NULL
+worker	retried	added	NULL	NULL	NULL
+worker	retried	added	NULL	NULL	NULL
+
+# the output keeps the native column types
+query TT
+SELECT typeof(source), typeof(change_type) FROM scenario_diff('bd', 'log_lines') LIMIT 1;
+----
+VARCHAR	VARCHAR
+
+query TIII
+SELECT * FROM scenario_diff_summary('bd');
+----
+log_lines	3	0	3
+
+# generic 3-arg diff, both directions against the live base
+query TTT rowsort
+SELECT source, message, change_type FROM scenario_diff('main', 'bd', 'log_lines');
+----
+app	started	removed
+app	started	removed
+db	NULL	removed
+db	silent	added
+worker	retried	added
+worker	retried	added
+
+query TTT rowsort
+SELECT source, message, change_type FROM scenario_diff('bd', 'main', 'log_lines');
+----
+app	started	added
+app	started	added
+db	NULL	added
+db	silent	removed
+worker	retried	removed
+worker	retried	removed
+
+# scenario vs a branch of it: only the branch's own change shows
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_create('br', from_scenario := 'bd');
+
+statement ok
+ATTACH 'br' AS b (TYPE scenario);
+
+statement ok
+INSERT INTO b.log_lines VALUES ('worker', 'retried');
+
+statement ok
+DELETE FROM b.log_lines WHERE message = 'connected';
+
+query TTT rowsort
+SELECT source, message, change_type FROM scenario_diff('bd', 'br', 'log_lines');
+----
+db	connected	removed
+worker	retried	added
+
+# a branch diffs against the common origin, so it includes the parent's changes
+query TTT rowsort
+SELECT source, message, change_type FROM scenario_diff('br', 'log_lines');
+----
+app	started	removed
+app	started	removed
+db	NULL	removed
+db	connected	removed
+db	silent	added
+worker	retried	added
+worker	retried	added
+worker	retried	added
+
+query TIII
+SELECT * FROM scenario_diff_summary('br');
+----
+log_lines	4	0	4
+
+statement ok
+DETACH b;
+
+# materialized: the origin is the scenario's own copy, so later base churn does not show
+statement ok
+CALL scenario_create('mat', mode := 'materialized');
+
+statement ok
+INSERT INTO log_lines VALUES ('late', 'base row');
+
+statement ok
+ATTACH 'mat' AS m (TYPE scenario);
+
+statement ok
+INSERT INTO m.log_lines VALUES ('ops', 'deployed');
+
+query TTT
+SELECT source, message, change_type FROM scenario_diff('mat', 'log_lines');
+----
+ops	deployed	added
+
+# an untouched scenario has no diff
+statement ok
+CALL scenario_create('quiet');
+
+query I
+SELECT count(*) FROM scenario_diff('quiet', 'log_lines');
+----
+0
+
+query I
+SELECT count(*) FROM scenario_diff('main', 'quiet', 'log_lines');
+----
+0
+
+statement ok
+DETACH m;
+
+statement ok
+CALL scenario_drop('quiet');
+
+statement ok
+CALL scenario_drop('mat');
+
+statement ok
+CALL scenario_drop('br');
+
+statement ok
+CALL scenario_drop('bd');
