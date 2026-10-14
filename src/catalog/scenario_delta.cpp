@@ -91,9 +91,20 @@ optional_ptr<DuckTableEntry> ScenarioDelta::TryGetMatTable(ClientContext &contex
 DuckTableEntry &ScenarioDelta::CreateMatTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
                                               TableCatalogEntry &base_entry, const string *logical_name_override) {
 	auto logical_name = logical_name_override ? *logical_name_override : LogicalName(base_entry);
-	// Full schema copy (columns + constraints, so the PK survives)
+	// Schema copy: columns + NOT NULL/CHECK/PK/UNIQUE (the PK carries row
+	// identity and backs the base collision probe). FOREIGN KEYs are dropped -
+	// both sides, including the hidden FK_TYPE_PRIMARY_KEY_TABLE entry DuckDB
+	// keeps on referenced tables: they would resolve inside __anofox_scenario
+	// (or back at the base), and the copy is a data snapshot, not a place to
+	// enforce them. FKs are enforced at merge-back against the base.
 	auto create_info = base_entry.GetInfo();
 	auto &info = create_info->Cast<CreateTableInfo>();
+	auto &constraints = info.constraints;
+	constraints.erase(std::remove_if(constraints.begin(), constraints.end(),
+	                                 [](const unique_ptr<Constraint> &constraint) {
+		                                 return constraint->type == ConstraintType::FOREIGN_KEY;
+	                                 }),
+	                  constraints.end());
 	info.catalog = host_catalog.GetName();
 	info.schema = ScenarioRegistry::SCHEMA_NAME;
 	info.table = MatTableName(scenario_id, logical_name);

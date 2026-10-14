@@ -6,7 +6,8 @@
 //
 // The schema mirrors the reporting host: a key/value run summary plus a
 // composite-key order plan whose NOT NULL/CHECK constraints are declared before
-// the PRIMARY KEY (the declaration order that tripped the base PK probe).
+// the PRIMARY KEY (the declaration order that tripped the base PK probe) and
+// which references a supplier master (materialized copies of FK tables, #24).
 
 #include "catch.hpp"
 #include "test_helpers.hpp"
@@ -38,9 +39,13 @@ int64_t QueryInt(Connection &con, const string &sql) {
 void SetupBase(Connection &con) {
 	REQUIRE_NO_FAIL(con.Query("LOAD anofox_scenario"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE p1d_summary (metric VARCHAR PRIMARY KEY, value DOUBLE NOT NULL)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE suppliers (supplier_id BIGINT PRIMARY KEY, name VARCHAR NOT NULL)"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE order_plan (supplier_id BIGINT, period INTEGER, sku VARCHAR NOT NULL, "
 	                          "qty INTEGER NOT NULL CHECK (qty >= 0), unit_cost DOUBLE NOT NULL, "
+	                          "FOREIGN KEY (supplier_id) REFERENCES suppliers(supplier_id), "
 	                          "PRIMARY KEY (supplier_id, period))"));
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO suppliers SELECT s, 'Supplier ' || s FROM range(1, " +
+	                          std::to_string(BASE_SUPPLIERS + 1) + ") r(s)"));
 	REQUIRE_NO_FAIL(con.Query("INSERT INTO p1d_summary VALUES ('total_cost', 1250000.0), ('scored_cost', 1180000.0), "
 	                          "('committed_unit_cost', 12.75), ('orders_placed', 50000), "
 	                          "('aggregate_fill_rate', 0.93), ('feasible', 1)"));
@@ -96,7 +101,8 @@ TEST_CASE("test/cpp/prepared_insert_across_transactions", "[anofox_scenario]") {
 			expected_qty += qty;
 			expected_rows++;
 		};
-		// 10 brand-new suppliers (keys never in the base) ...
+		// 10 brand-new suppliers (keys never in the base; not in the supplier
+		// master either - FKs are enforced at merge-back, not in the scenario) ...
 		for (int64_t supplier = 1001; supplier <= 1010; supplier++) {
 			for (int32_t period = 1; period <= PERIODS; period++) {
 				insert_plan_row(supplier, period);

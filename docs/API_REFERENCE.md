@@ -47,7 +47,10 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   | `snapshot` | `base := '<ducklake attach>'`: reads pinned via `AT (TIMESTAMP => created_at)` | complete, O(1) creation - no data copied |
 - **Constraints:** base `NOT NULL`, `CHECK`, and PRIMARY KEY constraints are enforced for
   scenario writes against the *merged* state, with distinct errors for conflicts with base rows
-  vs. scenario changes.
+  vs. scenario changes. `FOREIGN KEY` constraints are not enforced inside a scenario: a parent row
+  may exist only in the scenario. `scenario_merge` enforces them against the base and rolls back
+  atomically on a violation. Materialized copies don't carry the FKs, so introspection through a
+  materialized scenario doesn't list them. Overlay scenarios mirror the base's FKs.
 - **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it.
 - **DDL:** not permitted inside scenarios (one canonical error).
 - **Host database:** the scenario registry lives in the session's *default* database at
@@ -95,7 +98,8 @@ __anofox_scenario.registry_seq          -- id sequence
 __anofox_scenario.s<id>_delta_<table>   -- (_op 'I'|'U'|'D', _ts, <base columns>) PK = base PK
                                         --   or the declared key_columns; keyless tables append
                                         --   _count BIGINT (bag changelog, no PK) instead
-__anofox_scenario.s<id>_mat_<table>     -- materialized base copies (mode = 'materialized')
+__anofox_scenario.s<id>_mat_<table>     -- materialized base copies (mode = 'materialized');
+                                        --   FOREIGN KEY constraints are not copied
 ```
 
 Non-main schemas use `<schema>.<table>` as the `<table>` part of the naming contract

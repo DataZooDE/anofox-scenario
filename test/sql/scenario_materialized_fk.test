@@ -1,0 +1,200 @@
+# name: test/sql/scenario_materialized_fk.test
+# description: Materialized scenarios over base tables with FOREIGN KEY constraints (issue #24)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+load __TEST_DIR__/scenario_materialized_fk.db
+
+# Materialized copies used to clone the base's CreateTableInfo verbatim, FKs
+# included: the copy in __anofox_scenario then bound its REFERENCES against that
+# schema ("Table with name suppliers does not exist!"). FKs are not enforced
+# inside a scenario anyway; merge-back enforces them against the base.
+
+# referenced (PK-side) table
+statement ok
+CREATE TABLE suppliers (supplier_id BIGINT PRIMARY KEY, name VARCHAR NOT NULL);
+
+# FK side, FK declared before the composite PK
+statement ok
+CREATE TABLE order_plan (
+    supplier_id BIGINT NOT NULL REFERENCES suppliers(supplier_id),
+    period INTEGER,
+    qty INTEGER NOT NULL CHECK (qty >= 0),
+    PRIMARY KEY (supplier_id, period));
+
+# self-reference
+statement ok
+CREATE TABLE emp (id INTEGER PRIMARY KEY, boss INTEGER REFERENCES emp(id));
+
+statement ok
+INSERT INTO suppliers SELECT s, 'Supplier ' || s FROM range(1, 51) r(s);
+
+statement ok
+INSERT INTO order_plan SELECT s, p, ((s * 7 + p * 3) % 100)::INTEGER FROM range(1, 51) r(s), range(1, 25) q(p);
+
+statement ok
+INSERT INTO emp VALUES (1, NULL);
+
+statement ok
+INSERT INTO emp SELECT id, 1 FROM range(2, 21) r(id);
+
+# --- materialized create works over FK schemas -------------------------------------
+
+statement ok
+CALL scenario_create('seed', 'solver input', mode := 'materialized');
+
+statement ok
+ATTACH 'seed' AS s (TYPE scenario);
+
+query IIII
+SELECT (SELECT count(*) FROM s.suppliers), (SELECT count(*) FROM s.order_plan),
+       (SELECT count(*) FROM s.emp), (SELECT sum(qty) FROM s.order_plan) = (SELECT sum(qty) FROM order_plan);
+----
+50	1200	20	true
+
+# the base keeps its FKs; the internal copies carry none
+query I
+SELECT count(*) FROM duckdb_constraints() WHERE schema_name = 'main' AND constraint_type = 'FOREIGN KEY';
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_constraints() WHERE schema_name = '__anofox_scenario' AND constraint_type = 'FOREIGN KEY';
+----
+0
+
+# ...and the base still enforces them
+statement error
+INSERT INTO order_plan VALUES (999, 1, 1);
+----
+<REGEX>:.*(foreign key|Violates foreign key).*
+
+# --- isolation from later base changes ----------------------------------------------
+
+statement ok
+INSERT INTO suppliers VALUES (51, 'Supplier 51');
+
+statement ok
+INSERT INTO order_plan SELECT 51, p, 10 FROM range(1, 25) q(p);
+
+query II
+SELECT (SELECT count(*) FROM s.suppliers), (SELECT count(*) FROM s.order_plan);
+----
+50	1200
+
+# --- FKs are not enforced inside the scenario ...------------------------------------
+
+statement ok
+INSERT INTO s.order_plan VALUES (999, 1, 5);
+
+statement ok
+INSERT INTO s.emp VALUES (21, 777);
+
+query I
+SELECT count(*) FROM s.order_plan WHERE supplier_id = 999;
+----
+1
+
+# --- ... but merge-back enforces them against the base, atomically -----------------
+
+statement error
+SELECT * FROM scenario_merge('seed');
+----
+<REGEX>:.*(foreign key|Violates foreign key).*
+
+query III
+SELECT (SELECT count(*) FROM order_plan), (SELECT count(*) FROM emp), (SELECT count(*) FROM order_plan WHERE supplier_id = 999);
+----
+1224	20	0
+
+# repair the scenario: drop the orphans, re-plan against a supplier that exists
+statement ok
+DELETE FROM s.order_plan WHERE supplier_id = 999;
+
+statement ok
+UPDATE s.emp SET boss = 1 WHERE id = 21;
+
+statement ok
+INSERT INTO s.order_plan VALUES (1, 25, 42);
+
+query II
+SELECT tables_changed, rows_applied FROM scenario_merge('seed');
+----
+2	2
+
+query II
+SELECT (SELECT qty FROM order_plan WHERE supplier_id = 1 AND period = 25), (SELECT boss FROM emp WHERE id = 21);
+----
+42	1
+
+statement ok
+DETACH s;
+
+# --- branching from a frozen materialized parent ------------------------------------
+
+statement ok
+CALL scenario_create('snap', 'frozen snapshot', mode := 'materialized');
+
+statement ok
+CALL scenario_freeze('snap');
+
+statement ok
+CALL scenario_create('branch', 'what-if', from_scenario := 'snap');
+
+statement ok
+ATTACH 'branch' AS b (TYPE scenario);
+
+query II
+SELECT (SELECT count(*) FROM b.order_plan), (SELECT sum(qty) FROM b.order_plan) = (SELECT sum(qty) FROM order_plan);
+----
+1225	true
+
+statement ok
+UPDATE b.order_plan SET qty = qty + 1 WHERE supplier_id = 2;
+
+statement ok
+DETACH b;
+
+# --- durable across a restart ---------------------------------------------------------
+
+restart
+
+statement ok
+ATTACH 'branch' AS b (TYPE scenario);
+
+query I
+SELECT sum(qty) - (SELECT sum(qty) FROM order_plan) FROM b.order_plan;
+----
+24
+
+statement ok
+INSERT INTO b.order_plan VALUES (888, 1, 1);
+
+query I
+SELECT count(*) FROM b.order_plan;
+----
+1226
+
+statement ok
+DETACH b;
+
+# --- no catalog dependency is left behind ---------------------------------------------
+
+statement ok
+CALL scenario_drop('branch');
+
+statement ok
+CALL scenario_drop('snap');
+
+statement ok
+CALL scenario_drop('seed');
+
+statement ok
+DROP TABLE order_plan;
+
+statement ok
+DROP TABLE emp;
+
+statement ok
+DROP TABLE suppliers;
