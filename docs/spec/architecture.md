@@ -111,6 +111,24 @@ run*, and keeps `scenario_diff` honest: a row updated five times reports one mod
 state, so a scenario insert colliding with an untouched base row is caught. Conflicts with base
 rows and conflicts with scenario rows raise distinct messages.
 
+The merged relation is *delta `I`/`U` rows* plus *base rows without a delta row for their key*,
+so uniqueness splits into three checks:
+
+- **Among scenario rows:** the delta's mirrored `UNIQUE` indexes. Tombstones carry NULL
+  payloads and never collide.
+- **Among untouched base rows:** the base's own indexes.
+- **Scenario row vs. base row:** `ScenarioBaseUniqueProbe` (`scenario_unique.cpp`) probes the
+  base ART indexes.
+  - A collision counts only if the owning base row is still live.
+  - Base rows the scenario *replaced* (`D` or `U` for their key, including this statement's
+    unflushed changes) are masked through a delete index holding their (values, rowid). This is
+    the mechanism core uses for a transaction's own deletes.
+  - So a value freed by a scenario delete or update can be reused, and swaps work within one
+    statement.
+  - The mask is built only after the fast, unmasked probe reports a collision.
+  - Merge-back registers every deleted base row in the transaction's delete indexes before it
+    appends, so the base accepts the reused values too.
+
 `ScenarioCatalog::MarkHostWrite` is the chokepoint enforcing the single-writer rule and the
 frozen flag.
 

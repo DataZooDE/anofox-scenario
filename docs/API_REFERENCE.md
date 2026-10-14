@@ -45,9 +45,11 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   | `overlay` (default) | delta over the live base | none - base churn shows through unless the scenario touched the same PK (documented semantics) |
   | `materialized` | `mode := 'materialized'`: full copy per table | complete |
   | `snapshot` | `base := '<ducklake attach>'`: reads pinned via `AT (TIMESTAMP => created_at)` | complete, O(1) creation - no data copied |
-- **Constraints:** base `NOT NULL`, `CHECK`, and PRIMARY KEY constraints are enforced for
-  scenario writes against the *merged* state, with distinct errors for conflicts with base rows
-  vs. scenario changes. `FOREIGN KEY` constraints are not enforced inside a scenario: a parent row
+- **Constraints:** base `NOT NULL`, `CHECK`, PRIMARY KEY and `UNIQUE` constraints are enforced
+  for scenario writes against the *merged* state, with distinct errors for conflicts with base
+  rows vs. scenario changes. A unique value whose base row the scenario deleted or changed is
+  free again: another row may take it, in the same statement or a later one, and
+  `scenario_merge` applies the result. `FOREIGN KEY` constraints are not enforced inside a scenario: a parent row
   may exist only in the scenario. `scenario_merge` enforces them against the base and rolls back
   atomically on a violation. Materialized copies don't carry the FKs, so introspection through a
   materialized scenario doesn't list them. Overlay scenarios mirror the base's FKs.
@@ -67,7 +69,6 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | `scenario_diff` on keyless tables | requires a PK or `key_columns :=` |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
 | Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |
-| Unique values *vacated* by scenario deletes/updates are conservatively still treated as taken when a scenario write reuses them | rejected with a clean error |
 | Table or schema names containing `.` | rejected at `scenario_create` (naming-contract separator) |
 
 ## Function Reference

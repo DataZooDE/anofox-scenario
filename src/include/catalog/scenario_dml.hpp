@@ -46,6 +46,43 @@ void ScenarioVerifyNotNullAndCheck(ClientContext &context, TableCatalogEntry &en
 class PhysicalPlanGenerator;
 class ScenarioTableEntry;
 class Expression;
+struct IndexEntry;
+
+//! Unique-constraint probes against a DuckDB base table, with merged-state
+//! semantics. The base's UNIQUE values must not collide with scenario rows -
+//! except values held by base rows the scenario REPLACED (a 'D' or 'U' delta
+//! row for their key): those base rows are not part of the merged relation,
+//! and a 'U' row's values are covered by the delta's mirrored UNIQUE indexes.
+//! Replaced rows are masked through a delete index holding their (values,
+//! rowid), the same mechanism core uses for a transaction's own deletes.
+class ScenarioBaseUniqueProbe {
+public:
+	void Initialize(ScenarioTableEntry &entry, const vector<idx_t> &key_columns);
+
+	bool HasSecondary() const {
+		return !secondary_indexes.empty();
+	}
+	//! Probe rows (full table layout) against the base PRIMARY KEY index.
+	//! Throws the raw ConstraintException on a collision.
+	void ProbePrimaryKey(DataChunk &rows);
+	//! Probe rows (full table layout) against the base's secondary UNIQUE
+	//! indexes, ignoring base rows the scenario replaced. pending_replaced
+	//! lists keys (full rows, key columns set) this statement turns into 'D'/'U'
+	//! that are not in the delta table yet. Throws the raw ConstraintException.
+	void ProbeSecondary(ClientContext &context, DuckTableEntry &delta_table, DataChunk &rows,
+	                    const vector<vector<Value>> &pending_replaced);
+
+private:
+	//! Base rowids and full rows of every base row the scenario replaced
+	void CollectReplaced(ClientContext &context, DuckTableEntry &delta_table,
+	                     const vector<vector<Value>> &pending_replaced, vector<row_t> &row_ids,
+	                     vector<vector<Value>> &rows);
+
+	optional_ptr<ScenarioTableEntry> entry;
+	vector<idx_t> key_columns;
+	optional_ptr<IndexEntry> key_index;
+	vector<reference<IndexEntry>> secondary_indexes;
+};
 
 //! Operator factories (used by both the DML plan hooks and PlanMergeInto)
 PhysicalOperator &MakeScenarioInsertOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,

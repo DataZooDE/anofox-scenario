@@ -214,6 +214,215 @@ DETACH q;
 statement ok
 CALL scenario_drop('uq');
 
+# --- unique values vacated by the scenario are free again ---------------------------
+# Uniqueness holds on the MERGED relation: a value whose base row was deleted
+# or moved off it in the scenario may be reused, by INSERT or UPDATE.
+
+statement ok
+CALL scenario_create('vac');
+
+statement ok
+ATTACH 'vac' AS v (TYPE scenario);
+
+statement ok
+DELETE FROM v.users WHERE id = 1;
+
+statement ok
+INSERT INTO v.users VALUES (3, 'ada@corp.com', 'Ada II');
+
+query IT
+SELECT id, email FROM v.users WHERE email = 'ada@corp.com';
+----
+3	ada@corp.com
+
+# the deleted base row cannot come back with its old email: row 3 holds it now
+statement error
+INSERT INTO v.users VALUES (1, 'ada@corp.com', 'Ada');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# re-inserting a deleted key must still respect values held by OTHER base rows
+statement error
+INSERT INTO v.users VALUES (1, 'ten@corp.com', 'Ada');
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+statement ok
+INSERT INTO v.users VALUES (1, 'ada.l@corp.com', 'Ada');
+
+# update a base row off its email, then give that email to another base row
+statement ok
+UPDATE v.users SET email = 'ten.old@corp.com' WHERE id = 10;
+
+statement ok
+UPDATE v.users SET email = 'ten@corp.com' WHERE id = 1;
+
+query IT
+SELECT id, email FROM v.users ORDER BY id;
+----
+1	ten@corp.com
+3	ada@corp.com
+10	ten.old@corp.com
+
+# ...and the original owner cannot take it back
+statement error
+UPDATE v.users SET email = 'ten@corp.com' WHERE id = 10;
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# a PK move vacates the moved row's values on its old key
+statement ok
+CREATE TABLE badges (id INTEGER PRIMARY KEY, code VARCHAR UNIQUE);
+
+statement ok
+INSERT INTO badges VALUES (1, 'A'), (2, 'B');
+
+statement ok
+DETACH v;
+
+statement ok
+CALL scenario_drop('vac');
+
+statement ok
+CALL scenario_create('vac');
+
+statement ok
+ATTACH 'vac' AS v (TYPE scenario);
+
+statement ok
+UPDATE v.badges SET id = 5, code = 'C' WHERE id = 1;
+
+statement ok
+INSERT INTO v.badges VALUES (6, 'A');
+
+query IT
+SELECT id, code FROM v.badges ORDER BY id;
+----
+2	B
+5	C
+6	A
+
+# re-inserting a tombstoned key with its own old value is fine
+statement ok
+DELETE FROM v.users WHERE id = 10;
+
+statement ok
+INSERT INTO v.users VALUES (10, 'ten@corp.com', 'Ten again');
+
+# merge-back applies the vacate-and-reuse state cleanly
+statement ok
+DELETE FROM v.users WHERE id = 1;
+
+statement ok
+INSERT INTO v.users VALUES (3, 'ada@corp.com', 'Ada II');
+
+statement ok
+DETACH v;
+
+query II
+SELECT tables_changed, rows_applied FROM scenario_merge('vac');
+----
+2	6
+
+query IT
+SELECT id, email FROM users ORDER BY id;
+----
+3	ada@corp.com
+10	ten@corp.com
+
+query IT
+SELECT id, code FROM badges ORDER BY id;
+----
+2	B
+5	C
+6	A
+
+statement ok
+CALL scenario_drop('vac');
+
+# --- several UNIQUE constraints: only the changed one is probed ---------------------
+
+statement ok
+CREATE TABLE accounts (id INTEGER PRIMARY KEY, email VARCHAR UNIQUE, username VARCHAR UNIQUE);
+
+statement ok
+INSERT INTO accounts VALUES (1, 'a@x', 'alice'), (2, 'b@x', 'bob');
+
+statement ok
+CALL scenario_create('multi');
+
+statement ok
+ATTACH 'multi' AS m (TYPE scenario);
+
+# changing only the email must not trip over the row's own unchanged username
+statement ok
+UPDATE m.accounts SET email = 'alice@x' WHERE id = 1;
+
+statement error
+UPDATE m.accounts SET username = 'bob' WHERE id = 1;
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# swap usernames across two statements via a vacated value
+statement ok
+UPDATE m.accounts SET username = 'robert' WHERE id = 2;
+
+statement ok
+UPDATE m.accounts SET username = 'bob' WHERE id = 1;
+
+query ITT
+SELECT id, email, username FROM m.accounts ORDER BY id;
+----
+1	alice@x	bob
+2	b@x	robert
+
+# ...and within ONE statement: swap emails between two rows
+statement ok
+UPDATE m.accounts SET email = CASE id WHEN 1 THEN 'b@x' ELSE 'alice@x' END WHERE id IN (1, 2);
+
+query ITT
+SELECT id, email, username FROM m.accounts ORDER BY id;
+----
+1	b@x	bob
+2	alice@x	robert
+
+statement ok
+DETACH m;
+
+statement ok
+CALL scenario_drop('multi');
+
+# --- materialized: the vacated value lives in the scenario's own copy ---------------
+
+statement ok
+CALL scenario_create('vmat', mode := 'materialized');
+
+statement ok
+ATTACH 'vmat' AS vm (TYPE scenario);
+
+statement ok
+DELETE FROM vm.accounts WHERE id = 2;
+
+statement ok
+INSERT INTO vm.accounts VALUES (7, 'b@x', 'bob');
+
+query ITT
+SELECT id, email, username FROM vm.accounts ORDER BY id;
+----
+1	a@x	alice
+7	b@x	bob
+
+statement error
+UPDATE vm.accounts SET email = 'b@x' WHERE id = 1;
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+statement ok
+DETACH vm;
+
+statement ok
+CALL scenario_drop('vmat');
+
 # --- cleanup -------------------------------------------------------------------------
 
 statement ok
