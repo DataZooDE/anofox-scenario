@@ -284,6 +284,7 @@ test/sql/
   scenario_diff_v2.test           # streaming diff engine (2- and 3-arg)
   scenario_migrate.test           # legacy v0.1 -> v2 migration
   attach_insert_constraint_order.test # base PK probe vs constraint declaration order (#22)
+  scenario_materialized_fk.test   # materialized copies over FK schemas; merge-back enforces FKs (#24)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
 ```
@@ -453,7 +454,7 @@ __anofox_scenario.s<id>_delta_<table>(_op VARCHAR, _ts TIMESTAMP, <base columns>
 -- trailing _count BIGINT multiplicity, readers aggregate I/D nets per value
 
 -- Materialized base copies (mode = 'materialized')
-__anofox_scenario.s<id>_mat_<table>     -- full schema + data copy of the base table
+__anofox_scenario.s<id>_mat_<table>     -- schema (minus FOREIGN KEYs) + data copy of the base table
 ```
 
 ## Getting Unstuck

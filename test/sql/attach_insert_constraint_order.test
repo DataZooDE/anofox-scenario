@@ -118,8 +118,8 @@ CREATE TABLE child (qty INTEGER CHECK (qty > 0), parent_id INTEGER REFERENCES pa
 statement ok
 INSERT INTO child VALUES (1, 1, 1);
 
-# (a scenario forked straight from the live base: materializing a table with a
-# FOREIGN KEY is a separate limitation)
+# (an overlay scenario here; materialized copies of FK tables are covered by
+# scenario_materialized_fk.test)
 statement ok
 CALL scenario_create('w2', 'w2');
 

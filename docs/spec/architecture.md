@@ -126,7 +126,9 @@ __anofox_scenario.registry              scenario_id, name, mode, frozen, parent_
                                         base_snapshot_id, created_at, merged_at, description
 __anofox_scenario.registry_seq          id sequence
 __anofox_scenario.s<id>_delta_<table>   the changelog described above
-__anofox_scenario.s<id>_mat_<table>     full base copies, for mode := 'materialized'
+__anofox_scenario.s<id>_mat_<table>     base copies, for mode := 'materialized' (columns, NOT NULL/
+                                        CHECK/PK/UNIQUE + data; FOREIGN KEYs stripped: they would
+                                        resolve inside this schema, and merge-back enforces them)
 ```
 
 `<table>` is the logical name: bare for `main`, otherwise `<schema>.<table>`. Since `.` is the
