@@ -226,8 +226,13 @@ public:
 		optional_ptr<DataChunk> deleted_chunk_ptr;
 		DataChunk deleted_chunk;
 		if (!deleted_row_ids.empty()) {
-			deleted_chunk.Initialize(Allocator::Get(client), delta_table->GetStorage().GetTypes());
+			auto delta_types = delta_table->GetStorage().GetTypes();
+			deleted_chunk.Initialize(Allocator::Get(client), delta_types);
 			for (idx_t i = 0; i < deleted_rows.size(); i++) {
+				// every column must hold a value, not just the payload
+				for (idx_t col = 0; col < delta_types.size(); col++) {
+					deleted_chunk.SetValue(col, i, Value(delta_types[col]));
+				}
 				for (idx_t col = 0; col < deleted_rows[i].size(); col++) {
 					deleted_chunk.SetValue(ScenarioDelta::PAYLOAD_START + col, i, deleted_rows[i][col]);
 				}

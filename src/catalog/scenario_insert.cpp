@@ -331,9 +331,15 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	} else {
 		// Register the removed tombstones in the delete indexes so the delta
 		// PK index accepts the replacement rows within this statement
+		// (a tombstone is the key plus NULLs: every column must be set, the
+		// delta's secondary UNIQUE indexes read theirs too)
 		DataChunk deleted_chunk;
-		deleted_chunk.Initialize(Allocator::Get(client), delta_table.GetStorage().GetTypes());
+		auto delta_types = delta_table.GetStorage().GetTypes();
+		deleted_chunk.Initialize(Allocator::Get(client), delta_types);
 		for (idx_t i = 0; i < tombstone_source_rows.size(); i++) {
+			for (idx_t col = 0; col < delta_types.size(); col++) {
+				deleted_chunk.SetValue(col, i, Value(delta_types[col]));
+			}
 			for (auto pk_col : gstate.pk_columns) {
 				deleted_chunk.SetValue(ScenarioDelta::PAYLOAD_START + pk_col, i,
 				                       chunk.GetValue(pk_col, tombstone_source_rows[i]));

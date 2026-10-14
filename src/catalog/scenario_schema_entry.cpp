@@ -37,9 +37,9 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateViewEntry(ClientContext &context, 
 	auto &transaction = scenario_catalog.GetScenarioTransaction(context);
 
 	auto qualified = QualifiedName(base_view.name);
-	auto cached = transaction.table_entries.find(qualified);
-	if (cached != transaction.table_entries.end()) {
-		return *cached->second;
+	auto cached = transaction.FindEntry(qualified);
+	if (cached) {
+		return *cached;
 	}
 
 	// Mirror the view into the scenario catalog: the binder derives the view
@@ -51,10 +51,7 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateViewEntry(ClientContext &context, 
 	view_info.catalog = scenario_catalog.GetName();
 	view_info.schema = name;
 
-	auto entry = make_uniq<ViewCatalogEntry>(scenario_catalog, *this, view_info);
-	auto &result = *entry;
-	transaction.table_entries[qualified] = std::move(entry);
-	return result;
+	return transaction.PublishEntry(qualified, make_uniq<ViewCatalogEntry>(scenario_catalog, *this, view_info));
 }
 
 string ScenarioSchemaEntry::QualifiedName(const string &table_name) const {
@@ -72,9 +69,9 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	auto &transaction = scenario_catalog.GetScenarioTransaction(context);
 	auto qualified = QualifiedName(table_name);
 
-	auto cached = transaction.table_entries.find(qualified);
-	if (cached != transaction.table_entries.end()) {
-		return *cached->second;
+	auto cached = transaction.FindEntry(qualified);
+	if (cached) {
+		return *cached;
 	}
 
 	// Mirror the base table's columns and constraints. For materialized
@@ -88,9 +85,7 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table);
 	entry->key_columns = ScenarioDelta::GetKeyColumns(context, scenario_catalog.GetHostCatalog(context),
 	                                                  scenario_catalog.scenario_id, qualified, base_table);
-	auto &result = *entry;
-	transaction.table_entries[qualified] = std::move(entry);
-	return result;
+	return transaction.PublishEntry(qualified, std::move(entry));
 }
 
 void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
