@@ -9,3 +9,15 @@ or
 ```bash
 make test_debug
 ```
+
+## C++ tests (`test/cpp`)
+Some paths can't be reached from SQL, for example a statement prepared through the client API
+and executed in a later transaction, which is what embedding hosts (Rust, C) do. Those tests
+are Catch test cases in `test/cpp/*.cpp`. `CMakeLists.txt` adds them to DuckDB's `unittest`
+binary. Name each test case `test/cpp/<name>`, so the `make test` filter (`test/*`) picks it
+up. Run them on their own with:
+```bash
+./build/release/test/unittest "test/cpp/*"
+```
+New files are picked up when CMake re-runs. Touch `CMakeLists.txt` (or reconfigure) after
+adding one.

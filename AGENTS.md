@@ -283,6 +283,9 @@ test/sql/
   scenario_model_v2.test          # materialized mode, branching, scenario_list
   scenario_diff_v2.test           # streaming diff engine (2- and 3-arg)
   scenario_migrate.test           # legacy v0.1 -> v2 migration
+  attach_insert_constraint_order.test # base PK probe vs constraint declaration order (#22)
+test/cpp/                         # Catch tests linked into unittest (see test/README.md)
+  test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
 ```
 
 ### Configuration Files
