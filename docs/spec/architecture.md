@@ -82,9 +82,29 @@ Without a PK or declared `key_columns` there is nothing to match on, so the delt
 **bag changelog**: no PK, plus a trailing `_count BIGINT` multiplicity, with readers aggregating
 inserts and deletes per distinct value.
 
-This supports `INSERT`/`UPDATE`/`DELETE` with bag semantics, but cannot support `scenario_diff`,
-`MERGE INTO`, or `ON CONFLICT` — all three need row identity. Those are rejected with an error
-pointing at `key_columns :=`.
+This supports `INSERT`/`UPDATE`/`DELETE` with bag semantics, but cannot support `MERGE INTO` or
+`ON CONFLICT`, because both need row identity. Those are rejected with an error pointing at
+`key_columns :=`.
+
+`scenario_diff` on a keyless table is a **bag diff**:
+
+- Every column is the identity, and there is no `modified`: a changed row shows as `removed`
+  (old) plus `added` (new).
+- The 2-arg form nets the delta's `I`/`D` counts per distinct row (`GROUP BY` is NULL-safe,
+  like `MakeKey`). It emits one row per copy, so an insert later deleted again shows nothing.
+- The 3-arg form builds each side's merged bag as origin `UNION ALL` inserted copies
+  `EXCEPT ALL` deleted copies, and diffs the two with `EXCEPT ALL` in both directions.
+- `scenario_diff_summary` reports the netted counts.
+
+A bag delta cannot carry a mirrored `UNIQUE` index, because `D` rows hold real payloads.
+Secondary `UNIQUE` constraints of a keyless table are therefore *counted* on the merged
+relation instead (`ScenarioBaseUniqueProbe::ProbeKeyless`):
+
+- A non-NULL tuple *v* is held `base_has(v) + Σ_I _count − Σ_D _count` times.
+- `base_has(v)` is 0 or 1, read from the base's unique index.
+- The sums run over the delta rows holding *v*, plus this statement's pending deletes. An
+  `UPDATE` is `D(old) + I(new)`, so an unchanged value nets out.
+- A new row is rejected if its tuple is already held once.
 
 ---
 
@@ -111,6 +131,24 @@ run*, and keeps `scenario_diff` honest: a row updated five times reports one mod
 state, so a scenario insert colliding with an untouched base row is caught. Conflicts with base
 rows and conflicts with scenario rows raise distinct messages.
 
+The merged relation is *delta `I`/`U` rows* plus *base rows without a delta row for their key*,
+so uniqueness splits into three checks:
+
+- **Among scenario rows:** the delta's mirrored `UNIQUE` indexes. Tombstones carry NULL
+  payloads and never collide.
+- **Among untouched base rows:** the base's own indexes.
+- **Scenario row vs. base row:** `ScenarioBaseUniqueProbe` (`scenario_unique.cpp`) probes the
+  base ART indexes.
+  - A collision counts only if the owning base row is still live.
+  - Base rows the scenario *replaced* (`D` or `U` for their key, including this statement's
+    unflushed changes) are masked through a delete index holding their (values, rowid). This is
+    the mechanism core uses for a transaction's own deletes.
+  - So a value freed by a scenario delete or update can be reused, and swaps work within one
+    statement.
+  - The mask is built only after the fast, unmasked probe reports a collision.
+  - Merge-back registers every deleted base row in the transaction's delete indexes before it
+    appends, so the base accepts the reused values too.
+
 `ScenarioCatalog::MarkHostWrite` is the chokepoint enforcing the single-writer rule and the
 frozen flag.
 
@@ -131,9 +169,13 @@ __anofox_scenario.s<id>_mat_<table>     base copies, for mode := 'materialized' 
                                         resolve inside this schema, and merge-back enforces them)
 ```
 
-`<table>` is the logical name: bare for `main`, otherwise `<schema>.<table>`. Since `.` is the
-naming-contract separator, table and schema names containing a dot are rejected up front at
-`scenario_create`.
+`<table>` is the logical name: bare for `main`, otherwise `<schema>.<table>`. `.` is the separator,
+so a part that contains a dot (or starts with `"`) is double-quoted SQL-style, with inner quotes
+doubled (`ScenarioDelta::EncodeLogicalName` / `SplitLogicalName`). `"a.b"` is the `main` table
+`a.b`, while `a.b` is table `b` in schema `a`. Every other name is written exactly as before, so
+existing databases keep their internal table names. The registry stores no table list: the
+internal names *are* the record of which tables a scenario tracks. User-facing table names
+(`scenario_diff`, `key_columns`, `table_name` outputs) use the same spelling.
 
 The registry is manipulated in the **caller's** transaction, so a rolled-back `scenario_create`
 leaves nothing behind.

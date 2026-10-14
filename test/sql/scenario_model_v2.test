@@ -149,3 +149,35 @@ CALL scenario_drop('what_if');
 
 statement ok
 CALL scenario_drop('baseline');
+
+# --- listing a materialized scenario that holds a keyless table --------------------
+# (mirroring a keyless table looks up its delta in the internal schema; doing
+# that inside the internal schema's scan deadlocked)
+
+statement ok
+CREATE TABLE keyless_events (event VARCHAR);
+
+statement ok
+INSERT INTO keyless_events VALUES ('a'), ('a');
+
+statement ok
+CALL scenario_create('mat_keyless', mode := 'materialized');
+
+statement ok
+ATTACH 'mat_keyless' AS mk (TYPE scenario);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'mk' AND table_name = 'keyless_events';
+----
+1
+
+query I
+SELECT count(*) FROM mk.keyless_events;
+----
+2
+
+statement ok
+DETACH mk;
+
+statement ok
+CALL scenario_drop('mat_keyless');

@@ -33,6 +33,7 @@
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/append_state.hpp"
 #include "duckdb/storage/table/delete_state.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
@@ -398,6 +399,37 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 	con.Commit();
 }
 
+//! Register base rows a merge deletes in the transaction's delete indexes
+//! (the old values are fetched first), so the merge's appends may reuse their
+//! UNIQUE values - a scenario can hand a deleted row's value to another row
+static void RegisterDeletedBaseRows(ClientContext &context, DuckTableEntry &base_duck,
+                                    const vector<unique_ptr<BoundConstraint>> &base_constraints,
+                                    const vector<row_t> &row_ids) {
+	auto &base_storage = base_duck.GetStorage();
+	auto &transaction = DuckTransaction::Get(context, base_duck.catalog);
+	vector<StorageIndex> all_cols;
+	for (idx_t i = 0; i < base_duck.GetColumns().LogicalColumnCount(); i++) {
+		all_cols.emplace_back(i);
+	}
+	idx_t offset = 0;
+	while (offset < row_ids.size()) {
+		idx_t batch = MinValue<idx_t>(row_ids.size() - offset, STANDARD_VECTOR_SIZE);
+		DataChunk deleted_chunk;
+		deleted_chunk.Initialize(Allocator::Get(context), base_storage.GetTypes());
+		Vector fetch_row_ids(LogicalType::ROW_TYPE, batch);
+		for (idx_t i = 0; i < batch; i++) {
+			fetch_row_ids.SetValue(i, Value::BIGINT(row_ids[offset + i]));
+		}
+		ColumnFetchState fetch_state;
+		base_storage.Fetch(transaction, deleted_chunk, all_cols, fetch_row_ids, batch, fetch_state);
+		LocalAppendState append_state;
+		base_storage.InitializeLocalAppend(append_state, base_duck, context, base_constraints);
+		append_state.storage->AppendToDeleteIndexes(fetch_row_ids, deleted_chunk);
+		base_storage.FinalizeLocalAppend(append_state);
+		offset += batch;
+	}
+}
+
 void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<MergeState>();
 	if (state.done) {
@@ -633,7 +665,6 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 
 			// classify, resolve conflicts, and apply
 			vector<row_t> base_rows_to_delete;      // rows replaced or deleted
-			vector<row_t> replaced_rows;            // subset re-inserted (delete-index registration)
 			vector<idx_t> append_rows;              // indexes into `rows` to append
 			idx_t table_conflicts = 0;
 			for (idx_t row_idx = 0; row_idx < rows.size(); row_idx++) {
@@ -675,7 +706,6 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				case 'I':
 					if (in_base) {
 						base_rows_to_delete.push_back(base_hit->second);
-						replaced_rows.push_back(base_hit->second);
 					}
 					append_rows.push_back(row_idx);
 					rows_applied++;
@@ -683,7 +713,6 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				case 'U':
 					if (in_base) {
 						base_rows_to_delete.push_back(base_hit->second);
-						replaced_rows.push_back(base_hit->second);
 					}
 					append_rows.push_back(row_idx);
 					rows_applied++;
@@ -705,22 +734,11 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			auto &base_storage = base_duck.GetStorage();
 			auto &transaction = DuckTransaction::Get(context, base_duck.catalog);
 
-			// fetch the replaced rows first (delete-index registration needs
-			// their old values)
-			DataChunk replaced_chunk;
-			if (!replaced_rows.empty()) {
-				vector<StorageIndex> all_cols;
-				for (idx_t i = 0; i < base_entry->GetColumns().LogicalColumnCount(); i++) {
-					all_cols.emplace_back(i);
-				}
-				replaced_chunk.Initialize(Allocator::Get(context), base_storage.GetTypes());
-				Vector fetch_row_ids(LogicalType::ROW_TYPE, replaced_rows.size());
-				for (idx_t i = 0; i < replaced_rows.size(); i++) {
-					fetch_row_ids.SetValue(i, Value::BIGINT(replaced_rows[i]));
-				}
-				ColumnFetchState fetch_state;
-				base_storage.Fetch(transaction, replaced_chunk, all_cols, fetch_row_ids, replaced_rows.size(),
-				                   fetch_state);
+			// every deleted base row - replaced or plainly deleted - so the
+			// appends may reuse its UNIQUE values (before deleting: the
+			// registration fetches the old values)
+			if (!append_rows.empty()) {
+				RegisterDeletedBaseRows(context, base_duck, base_constraints, base_rows_to_delete);
 			}
 
 			// deletes
@@ -738,21 +756,17 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				}
 			}
 
-			// appends (with replaced-row registration in the delete indexes)
+			// appends
 			if (!append_rows.empty()) {
 				DataChunk append_chunk;
 				append_chunk.Initialize(Allocator::Get(context), base_storage.GetTypes());
 				idx_t count = 0;
-				bool registered = false;
 				auto flush = [&]() {
 					if (count == 0) {
 						return;
 					}
 					append_chunk.SetCardinality(count);
-					ScenarioDeltaAppendChunk(context, base_duck, base_constraints, append_chunk,
-					                         registered ? vector<row_t>() : replaced_rows,
-					                         replaced_rows.empty() ? nullptr : &replaced_chunk);
-					registered = true;
+					base_storage.LocalAppend(base_duck, context, append_chunk, base_constraints);
 					append_chunk.Reset();
 					count = 0;
 				};
@@ -832,6 +846,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			auto base_constraints = binder->BindConstraints(base_duck);
 			if (!base_rows_to_delete.empty()) {
 				auto &base_storage = base_duck.GetStorage();
+				// the appends below may reuse the deleted rows' UNIQUE values
+				RegisterDeletedBaseRows(context, base_duck, base_constraints, base_rows_to_delete);
 				auto delete_state = base_storage.InitializeDelete(base_duck, context, base_constraints);
 				idx_t offset = 0;
 				while (offset < base_rows_to_delete.size()) {

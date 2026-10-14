@@ -2,8 +2,8 @@
 // Transparent INSERT into scenario tables: rows land in the delta table with
 // _op = 'I' ('U' when re-inserting over a tombstone). PK collisions are
 // checked against the *merged* relation: the delta key map, and the base's
-// own constraint machinery (DataTable::VerifyAppendConstraints -- the same
-// path a real base INSERT takes), with distinct error messages.
+// unique indexes (ScenarioBaseUniqueProbe: base rows the scenario replaced
+// do not count), with distinct error messages.
 //===----------------------------------------------------------------------===//
 
 #include "catalog/scenario_catalog.hpp"
@@ -18,7 +18,6 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/constraints/bound_check_constraint.hpp"
-#include "duckdb/planner/constraints/bound_foreign_key_constraint.hpp"
 #include "duckdb/planner/constraints/bound_not_null_constraint.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -121,9 +120,8 @@ public:
 	vector<unique_ptr<BoundConstraint>> delta_constraints;
 	ScenarioDeltaKeyMap delta_keys;
 	vector<idx_t> pk_columns;
-	//! Base-side unique/PK verification (same machinery as a real base INSERT)
-	vector<unique_ptr<BoundConstraint>> base_constraints;
-	unique_ptr<ConstraintState> base_constraint_state;
+	//! Base-side PK / secondary UNIQUE verification
+	ScenarioBaseUniqueProbe base_probe;
 	//! RETURNING: collected result rows
 	unique_ptr<ColumnDataCollection> return_collection;
 	idx_t insert_count = 0;
@@ -202,35 +200,10 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		gstate.delta_table = &delta;
 		auto binder = Binder::CreateBinder(client);
 		gstate.delta_constraints = binder->BindConstraints(delta);
-		if (entry.base_entry.IsDuckTable()) {
-			auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
-			auto all_base_constraints = binder->BindConstraints(base_duck);
-			// Base probe = unique/PK collisions ONLY. NOT NULL/CHECK are
-			// evaluated by the sink itself, and FK constraints must NOT be
-			// checked against the base alone: a referenced parent row may
-			// exist only in the scenario (FKs are enforced at merge-back).
-			// DataTable::VerifyAppendConstraints pairs bound_constraints[i]
-			// with the base table's constraints[i], so the list must keep the
-			// base table's length and order: dropping entries would pair e.g.
-			// a BoundUniqueConstraint with a NotNullConstraint and throw
-			// "bound constraint type mismatch". Instead, FK entries are
-			// replaced by a non-append (referenced-side) copy, which the
-			// verifier skips; NOT NULL/CHECK entries are kept (they already
-			// passed in the sink).
-			for (auto &constraint : all_base_constraints) {
-				if (constraint->type == ConstraintType::FOREIGN_KEY) {
-					auto &fk = constraint->Cast<BoundForeignKeyConstraint>();
-					auto info = fk.info;
-					info.type = ForeignKeyType::FK_TYPE_PRIMARY_KEY_TABLE;
-					gstate.base_constraints.push_back(
-					    make_uniq<BoundForeignKeyConstraint>(std::move(info), fk.pk_key_set, fk.fk_key_set));
-				} else {
-					gstate.base_constraints.push_back(std::move(constraint));
-				}
-			}
-			gstate.base_constraint_state =
-			    base_duck.GetStorage().InitializeConstraintState(base_duck, gstate.base_constraints);
-		}
+		// Base probes = unique collisions only: NOT NULL/CHECK are evaluated
+		// by the sink itself, and FKs are enforced at merge-back (a referenced
+		// parent row may exist only in the scenario)
+		gstate.base_probe.Initialize(entry, gstate.pk_columns);
 		if (!gstate.pk_columns.empty()) {
 			gstate.delta_keys.Load(client, delta, gstate.pk_columns);
 		}
@@ -288,19 +261,29 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 			row_keys[i] = std::move(key);
 		}
 
-		// Probe the base through its own constraint machinery (duck bases
-		// only; foreign bases like DuckLake have no PK indexes to violate)
-		if (base_verify_count > 0 && gstate.base_constraint_state) {
+		// New keys must not collide with a base row (duck bases only;
+		// foreign bases like DuckLake have no PK indexes to violate)
+		if (base_verify_count > 0) {
 			gstate.verify_chunk.Reset();
 			gstate.verify_chunk.Reference(chunk);
 			gstate.verify_chunk.Slice(base_verify_sel, base_verify_count);
-			auto &base_duck = entry.base_entry.Cast<DuckTableEntry>();
 			try {
-				base_duck.GetStorage().VerifyAppendConstraints(*gstate.base_constraint_state, client,
-				                                               gstate.verify_chunk, nullptr, nullptr);
+				gstate.base_probe.ProbePrimaryKey(gstate.verify_chunk);
 			} catch (ConstraintException &) {
 				throw ConstraintException(
 				    "Duplicate key violates primary key constraint on scenario table \"%s\": the key exists in "
+				    "the base table",
+				    entry.name);
+			}
+		}
+		// Secondary UNIQUE values of every row - re-inserts over a tombstone
+		// included - against the base rows still live in the scenario
+		if (gstate.base_probe.HasSecondary()) {
+			try {
+				gstate.base_probe.ProbeSecondary(client, delta_table, chunk, {});
+			} catch (ConstraintException &) {
+				throw ConstraintException(
+				    "Duplicate value violates a UNIQUE constraint on scenario table \"%s\": the value exists in "
 				    "the base table",
 				    entry.name);
 			}
@@ -316,6 +299,10 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 			}
 			delta_storage.Delete(*delete_state, client, row_ids, tombstones_to_remove.size());
 		}
+	} else if (gstate.base_probe.HasSecondary()) {
+		// keyless bag delta: no mirrored UNIQUE index, so secondary UNIQUEs
+		// are counted on the merged relation
+		gstate.base_probe.ProbeKeyless(client, delta_table, chunk, {});
 	}
 
 	// Build the delta chunk: _op, _ts, payload
@@ -344,9 +331,15 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	} else {
 		// Register the removed tombstones in the delete indexes so the delta
 		// PK index accepts the replacement rows within this statement
+		// (a tombstone is the key plus NULLs: every column must be set, the
+		// delta's secondary UNIQUE indexes read theirs too)
 		DataChunk deleted_chunk;
-		deleted_chunk.Initialize(Allocator::Get(client), delta_table.GetStorage().GetTypes());
+		auto delta_types = delta_table.GetStorage().GetTypes();
+		deleted_chunk.Initialize(Allocator::Get(client), delta_types);
 		for (idx_t i = 0; i < tombstone_source_rows.size(); i++) {
+			for (idx_t col = 0; col < delta_types.size(); col++) {
+				deleted_chunk.SetValue(col, i, Value(delta_types[col]));
+			}
 			for (auto pk_col : gstate.pk_columns) {
 				deleted_chunk.SetValue(ScenarioDelta::PAYLOAD_START + pk_col, i,
 				                       chunk.GetValue(pk_col, tombstone_source_rows[i]));

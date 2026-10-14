@@ -43,6 +43,15 @@ public:
 	//! gives correct staleness (fresh per transaction) and lifetime (alive
 	//! for as long as the transaction can reference them).
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> table_entries;
+	//! Guards table_entries: one query can enumerate the catalog from several
+	//! pipelines at once (e.g. SHOW ALL TABLES). Entries are never replaced
+	//! once published - a reference handed out must stay valid.
+	mutex table_entries_lock;
+	//! The cached entry for name, if any
+	optional_ptr<CatalogEntry> FindEntry(const string &name);
+	//! Publish entry under name unless another thread got there first; returns
+	//! whichever entry is cached
+	CatalogEntry &PublishEntry(const string &name, unique_ptr<CatalogEntry> entry);
 	//! Process-unique id of this transaction; feeds ScenarioCatalog::GetCatalogVersion
 	idx_t serial;
 };
@@ -146,7 +155,8 @@ private:
 	                                      const string &logical_name);
 	//! Mirror a base view so its SQL rebinds against the scenario's tables
 	CatalogEntry &GetOrCreateViewEntry(ClientContext &context, ViewCatalogEntry &base_view);
-	//! The delta/mat naming key: plain for main, '<schema>.<table>' otherwise
+	//! The delta/mat naming key (ScenarioDelta::LogicalName): plain for main,
+	//! '<schema>.<table>' otherwise, parts with a '.' double-quoted
 	string QualifiedName(const string &table_name) const;
 	ScenarioCatalog &GetScenarioCatalog();
 };

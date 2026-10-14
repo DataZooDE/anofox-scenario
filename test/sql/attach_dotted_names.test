@@ -1,0 +1,225 @@
+# name: test/sql/attach_dotted_names.test
+# description: Table and schema names containing '.' work in scenarios (quote-aware logical names)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+load __TEST_DIR__/attach_dotted_names.db
+
+# The logical name of a table is bare for main and <schema>.<table> otherwise.
+# A part containing '.' (or starting with '"') is written SQL-style in double
+# quotes, so '"a.b"' (main table a.b) and 'a.b' (schema a, table b) stay
+# distinct - in internal table names and wherever a table name is a string:
+# scenario_diff's table argument, key_columns keys, and table_name outputs.
+
+statement ok
+CREATE TABLE "a.b" (id INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+CREATE SCHEMA a;
+
+statement ok
+CREATE TABLE a.b (id INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+CREATE SCHEMA "my.schema";
+
+statement ok
+CREATE TABLE "my.schema"."t.1" (id INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+CREATE TABLE "log.lines" (msg VARCHAR);
+
+statement ok
+INSERT INTO "a.b" VALUES (1, 'main-dot');
+
+statement ok
+INSERT INTO a.b VALUES (1, 'schema-a');
+
+statement ok
+INSERT INTO "my.schema"."t.1" VALUES (1, 'both');
+
+statement ok
+INSERT INTO "log.lines" VALUES ('x'), ('y');
+
+statement ok
+CALL scenario_create('d', key_columns := MAP {'"log.lines"': ['msg']});
+
+statement ok
+ATTACH 'd' AS d (TYPE scenario);
+
+query TTT
+SELECT (SELECT v FROM d."a.b"), (SELECT v FROM d.a.b), (SELECT v FROM d."my.schema"."t.1");
+----
+main-dot	schema-a	both
+
+# writes land in the right table each
+statement ok
+UPDATE d."a.b" SET v = 'main-dot*';
+
+statement ok
+INSERT INTO d.a.b VALUES (2, 'new');
+
+statement ok
+DELETE FROM d."my.schema"."t.1";
+
+# declared key on a keyless dotted table: the key moves
+statement ok
+UPDATE d."log.lines" SET msg = 'z' WHERE msg = 'x';
+
+query TII
+SELECT (SELECT string_agg(v, ',' ORDER BY id) FROM d."a.b"), (SELECT count(*) FROM d.a.b),
+       (SELECT count(*) FROM d."my.schema"."t.1");
+----
+main-dot*	2	0
+
+# the base is untouched
+query TII
+SELECT (SELECT v FROM "a.b"), (SELECT count(*) FROM a.b), (SELECT count(*) FROM "my.schema"."t.1");
+----
+main-dot	1	1
+
+query IT
+SELECT id, change_type FROM scenario_diff('d', '"a.b"');
+----
+1	modified
+
+query IT
+SELECT id, change_type FROM scenario_diff('d', 'a.b');
+----
+2	added
+
+query IT
+SELECT id, change_type FROM scenario_diff('d', '"my.schema"."t.1"');
+----
+1	removed
+
+query TT rowsort
+SELECT msg, change_type FROM scenario_diff('d', '"log.lines"');
+----
+x	removed
+z	added
+
+query IT
+SELECT id, change_type FROM scenario_diff('main', 'd', '"a.b"');
+----
+1	modified
+
+query TIII rowsort
+SELECT * FROM scenario_diff_summary('d');
+----
+"a.b"	0	1	0
+"log.lines"	1	0	1
+"my.schema"."t.1"	0	0	1
+a.b	1	0	0
+
+query T rowsort
+SELECT DISTINCT table_name FROM scenario_merge_preview('d');
+----
+"a.b"
+"log.lines"
+"my.schema"."t.1"
+a.b
+
+# an unknown name is still a clean error
+statement error
+SELECT * FROM scenario_diff('d', '"a.c"');
+----
+<REGEX>:.*not found.*
+
+# --- branching ---------------------------------------------------------------------
+
+statement ok
+DETACH d;
+
+statement ok
+CALL scenario_create('br', from_scenario := 'd');
+
+statement ok
+ATTACH 'br' AS br (TYPE scenario);
+
+statement ok
+UPDATE br."my.schema"."t.1" SET v = 'never';
+
+query TII
+SELECT (SELECT v FROM br."a.b"), (SELECT count(*) FROM br.a.b), (SELECT count(*) FROM br."my.schema"."t.1");
+----
+main-dot*	2	0
+
+statement ok
+DETACH br;
+
+statement ok
+CALL scenario_drop('br');
+
+# --- materialized: copies enumerate and resolve under their logical names -------------
+
+statement ok
+CALL scenario_create('m', mode := 'materialized');
+
+statement ok
+ATTACH 'm' AS m (TYPE scenario);
+
+query TT
+SELECT schema_name, table_name FROM duckdb_tables() WHERE database_name = 'm' ORDER BY ALL;
+----
+a	b
+main	a.b
+main	log.lines
+my.schema	t.1
+
+query TTI
+SELECT (SELECT v FROM m."a.b"), (SELECT v FROM m.a.b), (SELECT count(*) FROM m."log.lines");
+----
+main-dot	schema-a	2
+
+statement ok
+INSERT INTO m."my.schema"."t.1" VALUES (7, 'mat');
+
+query IT
+SELECT id, change_type FROM scenario_diff('m', '"my.schema"."t.1"');
+----
+7	added
+
+statement ok
+DETACH m;
+
+# --- merge-back --------------------------------------------------------------------
+
+query II
+SELECT tables_changed, rows_applied FROM scenario_merge('d');
+----
+4	5
+
+query TTII
+SELECT (SELECT v FROM "a.b"), (SELECT string_agg(v, ',' ORDER BY id) FROM a.b),
+       (SELECT count(*) FROM "my.schema"."t.1"), (SELECT count(*) FROM "log.lines" WHERE msg = 'z');
+----
+main-dot*	schema-a,new	0	1
+
+# --- durable across a restart ----------------------------------------------------------
+
+restart
+
+statement ok
+ATTACH 'm' AS m (TYPE scenario);
+
+query TTI
+SELECT (SELECT v FROM m."a.b"), (SELECT v FROM m.a.b), (SELECT count(*) FROM m."my.schema"."t.1");
+----
+main-dot	schema-a	2
+
+statement ok
+DETACH m;
+
+statement ok
+CALL scenario_drop('m');
+
+statement ok
+CALL scenario_drop('d');
+
+# no internal table is left behind
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's%\_%' ESCAPE '\';
+----
+0

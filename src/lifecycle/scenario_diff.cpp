@@ -48,7 +48,27 @@ struct DiffTarget {
 	string base_name;  // host.main.<t> or host.__anofox_scenario.s<mat>_mat_<t>
 	vector<string> pk_columns;
 	vector<string> payload_columns;
+	//! Keyless table (bag delta with _count): every column is the identity
+	//! (pk_columns), payload_columns is empty, and changes are net I/D counts
+	bool keyless = false;
 };
+
+//! SQL list of quoted columns with an optional alias prefix ("d.")
+string ColumnList(const vector<string> &columns, const string &prefix = "") {
+	string list;
+	for (auto &col : columns) {
+		list += (list.empty() ? "" : ", ") + prefix + Q(col);
+	}
+	return list;
+}
+
+//! One row per copy of a keyless delta's rows with the given op (_count
+//! multiplicity expanded)
+string ExpandedDeltaRows(const DiffTarget &target, const char *op) {
+	auto cols = ColumnList(target.pk_columns);
+	return "SELECT " + cols + " FROM (SELECT " + cols + ", unnest(range(_count)) AS __anofox_copy FROM " +
+	       target.delta_name + " WHERE _op = '" + op + "')";
+}
 
 DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name, const string &table_name) {
 	auto &host_catalog = GetHostCatalogForDiff(context);
@@ -112,12 +132,18 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	auto pk_columns =
 	    ScenarioDelta::GetKeyColumns(context, host_catalog, entry->scenario_id, table_name, *base_entry);
 	if (pk_columns.empty()) {
-		throw NotImplementedException("scenario_diff requires a PRIMARY KEY on the base table or key_columns "
-		                              "declared at scenario_create (v1 limitation)");
+		// keyless: a bag diff over whole rows, netting the delta's I/D counts
+		if (!ScenarioDelta::CountColumnIndex(*delta).IsValid()) {
+			throw NotImplementedException(
+			    "scenario_diff on keyless table '%s' requires a scenario created with v0.4.1+ (its delta lacks "
+			    "the _count column). Recreate the scenario, or declare key_columns at scenario_create",
+			    table_name);
+		}
+		target.keyless = true;
 	}
 	unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
 	for (auto &col : base_entry->GetColumns().Logical()) {
-		if (pk_set.find(col.Logical().index) != pk_set.end()) {
+		if (target.keyless || pk_set.find(col.Logical().index) != pk_set.end()) {
 			target.pk_columns.push_back(col.Name());
 		} else {
 			target.payload_columns.push_back(col.Name());
@@ -135,9 +161,18 @@ string MergedRelationSQL(ClientContext &context, const string &side, const strin
 	if (side == "main") {
 		string schema_name, plain_name;
 		ScenarioDelta::SplitLogicalName(table_name, schema_name, plain_name);
+		if (shape.keyless) {
+			return "(SELECT " + ColumnList(shape.pk_columns) + " FROM " + host_prefix + Q(schema_name) + "." +
+			       Q(plain_name) + ")";
+		}
 		return "(SELECT * FROM " + host_prefix + Q(schema_name) + "." + Q(plain_name) + ")";
 	}
 	auto target = ResolveDiffTarget(context, side, table_name);
+	if (shape.keyless) {
+		// bag: origin plus inserted copies, minus deleted copies
+		return "((SELECT " + ColumnList(target.pk_columns) + " FROM " + target.base_name + " UNION ALL " +
+		       ExpandedDeltaRows(target, "I") + ") EXCEPT ALL (" + ExpandedDeltaRows(target, "D") + "))";
+	}
 	string pk_match;
 	for (auto &pk : shape.pk_columns) {
 		if (!pk_match.empty()) {
@@ -185,6 +220,18 @@ unique_ptr<TableRef> ScenarioDiffGenericBindReplace(ClientContext &context, Tabl
 	auto shape = ResolveDiffTarget(context, side_a == "main" ? side_b : side_a, table_name);
 	auto rel_a = MergedRelationSQL(context, side_a, table_name, shape);
 	auto rel_b = MergedRelationSQL(context, side_b, table_name, shape);
+	if (shape.keyless) {
+		// bag difference both ways; EXCEPT ALL matches whole rows NULL-safely
+		auto cols = ColumnList(shape.pk_columns);
+		string sql = "SELECT " + cols +
+		             ", CAST('added' AS VARCHAR) AS change_type, CAST(NULL AS VARCHAR) AS column_name, CAST(NULL "
+		             "AS VARCHAR) AS old_value, CAST(NULL AS VARCHAR) AS new_value FROM (" +
+		             rel_b + " EXCEPT ALL " + rel_a + ")";
+		sql += " UNION ALL SELECT " + cols +
+		       ", 'removed', CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR) FROM (" + rel_a +
+		       " EXCEPT ALL " + rel_b + ")";
+		return SQLToSubquery(context, sql);
+	}
 
 	string pk_join, pk_list_a, pk_list_b, a_pk_null, b_pk_null;
 	for (auto &pk : shape.pk_columns) {
@@ -223,6 +270,19 @@ unique_ptr<TableRef> ScenarioDiffBindReplace(ClientContext &context, TableFuncti
 	auto scenario_name = input.inputs[0].GetValue<string>();
 	auto table_name = input.inputs[1].GetValue<string>();
 	auto target = ResolveDiffTarget(context, scenario_name, table_name);
+	if (target.keyless) {
+		// net I/D count per distinct row, one output row per copy; GROUP BY
+		// treats NULLs as equal (the delta's NULL-safe whole-row identity)
+		auto cols = ColumnList(target.pk_columns);
+		string sql = "SELECT " + cols +
+		             ", CAST(CASE WHEN __anofox_net > 0 THEN 'added' ELSE 'removed' END AS VARCHAR) AS change_type, "
+		             "CAST(NULL AS VARCHAR) AS column_name, CAST(NULL AS VARCHAR) AS old_value, CAST(NULL AS "
+		             "VARCHAR) AS new_value FROM (SELECT " +
+		             cols + ", __anofox_net, unnest(range(abs(__anofox_net))) AS __anofox_copy FROM (SELECT " + cols +
+		             ", CAST(sum(CASE WHEN _op = 'I' THEN _count ELSE -_count END) AS BIGINT) AS __anofox_net FROM " +
+		             target.delta_name + " GROUP BY ALL) WHERE __anofox_net <> 0)";
+		return SQLToSubquery(context, sql);
+	}
 
 	string pk_list_d;
 	string join_cond;
@@ -267,22 +327,45 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 	// Enumerate the scenario's delta tables
 	string prefix = "s" + to_string(entry->scenario_id) + "_delta_";
 	vector<string> tables;
+	//! keyless (bag) deltas: their payload columns; empty for keyed deltas
+	vector<vector<string>> bag_columns;
 	auto schema = host_catalog.GetSchema(context, ScenarioRegistry::SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
 	if (schema) {
 		schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
 			if (table_entry.type == CatalogType::TABLE_ENTRY && StringUtil::StartsWith(table_entry.name, prefix)) {
 				tables.push_back(table_entry.name);
+				auto &table = table_entry.Cast<TableCatalogEntry>();
+				vector<string> columns;
+				auto count_column = ScenarioDelta::CountColumnIndex(table);
+				if (count_column.IsValid()) {
+					for (idx_t col = ScenarioDelta::PAYLOAD_START; col < count_column.GetIndex(); col++) {
+						columns.push_back(table.GetColumn(LogicalIndex(col)).Name());
+					}
+				}
+				bag_columns.push_back(std::move(columns));
 			}
 		});
 	}
 
 	string sql;
 	auto host_prefix = Q(host_catalog.GetName()) + "." + Q(ScenarioRegistry::SCHEMA_NAME) + ".";
-	for (auto &delta_table : tables) {
+	for (idx_t t = 0; t < tables.size(); t++) {
+		auto &delta_table = tables[t];
 		if (!sql.empty()) {
 			sql += " UNION ALL ";
 		}
 		auto logical = delta_table.substr(prefix.size());
+		if (!bag_columns[t].empty()) {
+			// keyless: net I/D counts per distinct row (no "modified" without
+			// identity: an update is a removed + an added row)
+			sql += "SELECT CAST(" + QL(logical) +
+			       " AS VARCHAR) AS table_name, CAST(coalesce(sum(__anofox_net) FILTER (__anofox_net > 0), 0) AS "
+			       "BIGINT) AS rows_added, CAST(0 AS BIGINT) AS rows_modified, CAST(coalesce(-sum(__anofox_net) "
+			       "FILTER (__anofox_net < 0), 0) AS BIGINT) AS rows_removed FROM (SELECT sum(CASE WHEN _op = 'I' "
+			       "THEN _count ELSE -_count END) AS __anofox_net FROM " +
+			       host_prefix + Q(delta_table) + " GROUP BY " + ColumnList(bag_columns[t]) + ")";
+			continue;
+		}
 		sql += "SELECT CAST(" + QL(logical) +
 		       " AS VARCHAR) AS table_name, count(*) FILTER (_op = 'I') AS rows_added, count(*) FILTER (_op = "
 		       "'U') AS rows_modified, count(*) FILTER (_op = 'D') AS rows_removed FROM " +
@@ -314,8 +397,8 @@ void ScenarioDiff::RegisterFunctions(ExtensionLoader &loader) {
 		CreateTableFunctionInfo info(std::move(diff_set));
 		FunctionDescription two_sided;
 		two_sided.description =
-		    "Diff a scenario against its origin, returning the primary key columns plus change_type "
-		    "('added', 'removed' or 'modified'), column_name, old_value and new_value.";
+		    "Diff a scenario against its origin, returning the key columns (every column for keyless "
+		    "tables) plus change_type ('added', 'removed' or 'modified'), column_name, old_value and new_value.";
 		two_sided.examples = {"SELECT * FROM scenario_diff('price_increase', 'products');"};
 		two_sided.parameter_names = {"scenario", "table_name"};
 		two_sided.parameter_types = {LogicalType::VARCHAR, LogicalType::VARCHAR};
