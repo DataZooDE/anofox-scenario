@@ -41,9 +41,14 @@ public:
 	//! Materialized base copy: __anofox_scenario.s<id>_mat_<table> (Phase 2)
 	static string MatTableName(int64_t scenario_id, const string &table_name);
 	//! Logical name of a base table within a scenario: plain for the main
-	//! schema, '<schema>.<table>' otherwise. This is the key of the delta/mat
-	//! naming contract for multi-schema bases.
+	//! schema, '<schema>.<table>' otherwise. A part containing '.' (or
+	//! starting with '"') is double-quoted SQL-style ('"a.b"' = main table
+	//! a.b, 'a.b' = schema a, table b); every other name is spelled as is, so
+	//! existing databases keep their names. This is the key of the delta/mat
+	//! naming contract, and the table name users pass to scenario_diff and
+	//! key_columns.
 	static string LogicalName(const TableCatalogEntry &table);
+	static string EncodeLogicalName(const string &schema_name, const string &table_name);
 	//! Split a logical name back into (schema, table)
 	static void SplitLogicalName(const string &logical_name, string &schema_name, string &table_name);
 	//! The delta table for a scenario table, if any writes happened yet

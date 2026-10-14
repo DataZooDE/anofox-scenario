@@ -38,30 +38,73 @@ string ScenarioDelta::MatTableName(int64_t scenario_id, const string &table_name
 	return "s" + to_string(scenario_id) + "_mat_" + table_name;
 }
 
-string ScenarioDelta::LogicalName(const TableCatalogEntry &table) {
-	auto &schema_name = table.ParentSchema().name;
-	// '.' is the (schema, table) separator of the naming contract; names
-	// containing it would re-parse wrong in diff/preview/merge
-	if (table.name.find('.') != string::npos || schema_name.find('.') != string::npos) {
-		throw NotImplementedException(
-		    "Table or schema names containing '.' are not supported in scenarios (table '%s', schema '%s')",
-		    table.name, schema_name);
+//! A name part as written in a logical name: double-quoted (inner quotes
+//! doubled) only when it contains the '.' separator or starts with a quote,
+//! so every other name is spelled exactly as before
+static string EncodeNamePart(const string &part) {
+	if (part.find('.') == string::npos && (part.empty() || part[0] != '"')) {
+		return part;
 	}
+	return "\"" + StringUtil::Replace(part, "\"", "\"\"") + "\"";
+}
+
+//! Read one name part starting at pos: a quoted part up to its closing quote,
+//! else up to the next '.' (or the end when stop_at_dot is false). pos ends
+//! on the character after the part.
+static string DecodeNamePart(const string &name, idx_t &pos, bool stop_at_dot) {
+	string part;
+	if (pos < name.size() && name[pos] == '"') {
+		idx_t i = pos + 1;
+		while (i < name.size()) {
+			if (name[i] == '"') {
+				if (i + 1 < name.size() && name[i + 1] == '"') {
+					part += '"';
+					i += 2;
+					continue;
+				}
+				// closing quote: a well-formed part ends here
+				if (i + 1 == name.size() || (stop_at_dot && name[i + 1] == '.')) {
+					pos = i + 1;
+					return part;
+				}
+				break;
+			}
+			part += name[i++];
+		}
+		// not a well-formed quoted part: take it literally
+		part.clear();
+	}
+	auto end = stop_at_dot ? name.find('.', pos) : string::npos;
+	if (end == string::npos) {
+		end = name.size();
+	}
+	part = name.substr(pos, end - pos);
+	pos = end;
+	return part;
+}
+
+string ScenarioDelta::EncodeLogicalName(const string &schema_name, const string &table_name) {
 	if (schema_name == DEFAULT_SCHEMA) {
-		return table.name;
+		return EncodeNamePart(table_name);
 	}
-	return schema_name + "." + table.name;
+	return EncodeNamePart(schema_name) + "." + EncodeNamePart(table_name);
+}
+
+string ScenarioDelta::LogicalName(const TableCatalogEntry &table) {
+	return EncodeLogicalName(table.ParentSchema().name, table.name);
 }
 
 void ScenarioDelta::SplitLogicalName(const string &logical_name, string &schema_name, string &table_name) {
-	auto dot = logical_name.find('.');
-	if (dot == string::npos) {
+	idx_t pos = 0;
+	auto first = DecodeNamePart(logical_name, pos, true);
+	if (pos >= logical_name.size()) {
 		schema_name = DEFAULT_SCHEMA;
-		table_name = logical_name;
-	} else {
-		schema_name = logical_name.substr(0, dot);
-		table_name = logical_name.substr(dot + 1);
+		table_name = first;
+		return;
 	}
+	pos++; // the separating '.'
+	schema_name = first;
+	table_name = DecodeNamePart(logical_name, pos, false);
 }
 
 //! Internal: look up a table in the internal schema by exact name

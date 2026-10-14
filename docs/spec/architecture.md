@@ -169,9 +169,13 @@ __anofox_scenario.s<id>_mat_<table>     base copies, for mode := 'materialized' 
                                         resolve inside this schema, and merge-back enforces them)
 ```
 
-`<table>` is the logical name: bare for `main`, otherwise `<schema>.<table>`. Since `.` is the
-naming-contract separator, table and schema names containing a dot are rejected up front at
-`scenario_create`.
+`<table>` is the logical name: bare for `main`, otherwise `<schema>.<table>`. `.` is the separator,
+so a part that contains a dot (or starts with `"`) is double-quoted SQL-style, with inner quotes
+doubled (`ScenarioDelta::EncodeLogicalName` / `SplitLogicalName`). `"a.b"` is the `main` table
+`a.b`, while `a.b` is table `b` in schema `a`. Every other name is written exactly as before, so
+existing databases keep their internal table names. The registry stores no table list: the
+internal names *are* the record of which tables a scenario tracks. User-facing table names
+(`scenario_diff`, `key_columns`, `table_name` outputs) use the same spelling.
 
 The registry is manipulated in the **caller's** transaction, so a rolled-back `scenario_create`
 leaves nothing behind.

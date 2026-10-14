@@ -285,6 +285,7 @@ test/sql/
   scenario_migrate.test           # legacy v0.1 -> v2 migration
   attach_keyless_unique.test      # UNIQUE on keyless (bag) tables vs the merged relation (#27)
   scenario_diff_keyless.test      # bag diff/summary on keyless tables (#27)
+  attach_dotted_names.test        # table/schema names containing . (quote-aware logical names, #27)
   attach_insert_constraint_order.test # base PK probe vs constraint declaration order (#22)
   scenario_materialized_fk.test   # materialized copies over FK schemas; merge-back enforces FKs (#24)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
@@ -449,7 +450,8 @@ __anofox_scenario.registry(
     description VARCHAR)
 
 -- One delta table per (scenario, base table); the changelog contract.
--- <table> is the logical name: plain for main, '<schema>.<table>' otherwise.
+-- <table> is the logical name: plain for main, '<schema>.<table>' otherwise; a part
+-- containing '.' is double-quoted ('"a.b"' = main table a.b).
 __anofox_scenario.s<id>_delta_<table>(_op VARCHAR, _ts TIMESTAMP, <base columns>,
                                       PRIMARY KEY (<base pk or declared key_columns>))
 -- Keyless tables (no PK, no declared key): bag changelog instead - no PK,

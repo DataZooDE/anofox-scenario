@@ -58,11 +58,8 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateViewEntry(ClientContext &context, 
 }
 
 string ScenarioSchemaEntry::QualifiedName(const string &table_name) const {
-	// the delta/mat naming contract: plain for main, '<schema>.<table>' else
-	if (name == DEFAULT_SCHEMA) {
-		return table_name;
-	}
-	return name + "." + table_name;
+	// the delta/mat naming contract (ScenarioDelta::LogicalName)
+	return ScenarioDelta::EncodeLogicalName(name, table_name);
 }
 
 CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table) {
@@ -129,19 +126,24 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			return;
 		}
 		string prefix = "s" + to_string(scenario_catalog.mat_base_scenario_id) + "_mat_";
-		if (name != DEFAULT_SCHEMA) {
-			prefix += name + ".";
-		}
+		// Collect first, mirror afterwards: mirroring a keyless table looks up
+		// its delta in this same internal schema, which must not happen while
+		// the schema's scan holds its catalog lock (deadlock)
+		vector<pair<reference<TableCatalogEntry>, string>> mat_tables;
 		internal_schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &mat_entry) {
 			if (mat_entry.type != CatalogType::TABLE_ENTRY || !StringUtil::StartsWith(mat_entry.name, prefix)) {
 				return;
 			}
-			auto table_name = mat_entry.name.substr(prefix.size());
-			if (name == DEFAULT_SCHEMA && table_name.find('.') != string::npos) {
-				return; // belongs to a mirrored non-main schema
+			string schema_name, table_name;
+			ScenarioDelta::SplitLogicalName(mat_entry.name.substr(prefix.size()), schema_name, table_name);
+			if (schema_name != name) {
+				return; // belongs to another mirrored schema
 			}
-			callback(GetOrCreateTableEntryAs(context, mat_entry.Cast<TableCatalogEntry>(), table_name));
+			mat_tables.emplace_back(mat_entry.Cast<TableCatalogEntry>(), std::move(table_name));
 		});
+		for (auto &mat_table : mat_tables) {
+			callback(GetOrCreateTableEntryAs(context, mat_table.first.get(), mat_table.second));
+		}
 		return;
 	}
 	auto &base_catalog = scenario_catalog.GetBaseCatalog(context);

@@ -68,7 +68,6 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | `MERGE INTO` / `ON CONFLICT` on keyless tables (no PK, no `key_columns`) | UPDATE/DELETE work (bag semantics); declare `key_columns :=` for keyed matching |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
 | Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |
-| Table or schema names containing `.` | rejected at `scenario_create` (naming-contract separator) |
 
 ## Function Reference
 
@@ -103,7 +102,11 @@ __anofox_scenario.s<id>_mat_<table>     -- materialized base copies (mode = 'mat
 ```
 
 Non-main schemas use `<schema>.<table>` as the `<table>` part of the naming contract
-(`s3_delta_analytics.events`); `key_columns :=` accepts the same qualified names.
+(`s3_delta_analytics.events`). A name part that contains a `.` is written in SQL double quotes:
+`'"a.b"'` is the `main` table `a.b`, `'a.b'` is table `b` in schema `a`, and
+`'"my.schema"."t.1"'` quotes both parts. The same spelling is used everywhere a table name is a
+string: the `scenario_diff` table argument, `key_columns :=` keys, and the `table_name` column of
+`scenario_diff_summary` / `scenario_merge_preview`. Names without a dot are written as is.
 
 The delta table is a stable changelog contract: `scenario_diff` reads it, branching copies it,
 and merge-back (v0.5) will replay it.

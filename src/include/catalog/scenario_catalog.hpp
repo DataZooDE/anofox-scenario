@@ -146,7 +146,8 @@ private:
 	                                      const string &logical_name);
 	//! Mirror a base view so its SQL rebinds against the scenario's tables
 	CatalogEntry &GetOrCreateViewEntry(ClientContext &context, ViewCatalogEntry &base_view);
-	//! The delta/mat naming key: plain for main, '<schema>.<table>' otherwise
+	//! The delta/mat naming key (ScenarioDelta::LogicalName): plain for main,
+	//! '<schema>.<table>' otherwise, parts with a '.' double-quoted
 	string QualifiedName(const string &table_name) const;
 	ScenarioCatalog &GetScenarioCatalog();
 };
