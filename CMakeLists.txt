@@ -116,3 +116,23 @@ install(
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+
+# C++ regression tests (test/cpp) for paths the sqllogictest runner cannot
+# reach, e.g. statements prepared through the client API and executed in a
+# later transaction. DuckDB has no hook for extension C++ tests, so the sources
+# are appended to the core `unittest` target once it exists: the call is
+# deferred to the end of the top-level directory, after duckdb/test has defined
+# it. Test cases are named "test/cpp/...", so `make test` picks them up.
+if(NOT EMSCRIPTEN AND NOT CMAKE_VERSION VERSION_LESS "3.19")
+    # Deferred-call arguments are expanded at call time (top-level scope), so
+    # the source list travels through a global property.
+    file(GLOB ANOFOX_SCENARIO_CPP_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/*.cpp)
+    set_property(GLOBAL PROPERTY ANOFOX_SCENARIO_CPP_TESTS ${ANOFOX_SCENARIO_CPP_TESTS})
+    function(anofox_scenario_add_cpp_tests)
+        get_property(sources GLOBAL PROPERTY ANOFOX_SCENARIO_CPP_TESTS)
+        if(TARGET unittest AND sources)
+            target_sources(unittest PRIVATE ${sources})
+        endif()
+    endfunction()
+    cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR} CALL anofox_scenario_add_cpp_tests)
+endif()

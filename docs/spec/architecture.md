@@ -51,6 +51,11 @@ real catalog. Most of the design follows from that one choice:
 - **Ordinary SQL works.** `SELECT`, `INSERT`, `UPDATE`, `DELETE`, joins, CTEs, and prepared
   statements route through DuckDB's normal planner. There is no SQL rewriting and no optimizer
   pass intercepting writes.
+- **Entries are per transaction.** Scenario table entries are projections of the base built for
+  the current transaction (owned by `ScenarioTransaction`), and physical plans hold references
+  to them. `ScenarioCatalog::GetCatalogVersion` therefore folds a per-transaction serial into the
+  host catalog's version: a prepared statement is re-bound in each new transaction and reused
+  within one. That re-bind also re-runs plan-time checks such as the frozen flag.
 - **Constraints, types, and binder errors are DuckDB's**, not reimplementations.
 - **Transactions ride the host's.** Scenario DML runs in the caller's transaction, so `ROLLBACK`
   undoes scenario writes for free and ACID is inherited rather than rebuilt.

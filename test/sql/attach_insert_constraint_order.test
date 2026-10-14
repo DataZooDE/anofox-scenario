@@ -139,3 +139,75 @@ SELECT qty, parent_id, id FROM w2.child ORDER BY id;
 ----
 1	1	1
 3	1	2
+
+# FKs are still NOT checked against the base alone: an orphan is accepted in
+# the scenario (merge-back enforces it, see scenario_refresh.test)
+statement ok
+INSERT INTO w2.child VALUES (4, 999, 4);
+
+# a key that exists in the base still collides (FK/CHECK precede the PK)
+statement error
+INSERT INTO w2.child VALUES (5, 1, 1);
+----
+<REGEX>:.*key exists in the base table.*
+
+# secondary UNIQUE after a NOT NULL -> [NOT NULL(email), UNIQUE(email), PK(id)]
+statement ok
+CREATE TABLE users (email VARCHAR NOT NULL UNIQUE, id INTEGER PRIMARY KEY);
+
+statement ok
+INSERT INTO users VALUES ('ada@corp.com', 1);
+
+statement ok
+CALL scenario_create('w4', 'w4');
+
+statement ok
+ATTACH 'w4' AS w4 (TYPE scenario);
+
+statement ok
+INSERT INTO w4.users VALUES ('grace@corp.com', 2);
+
+# a secondary UNIQUE value owned by a base row
+statement error
+INSERT INTO w4.users VALUES ('ada@corp.com', 3);
+----
+<REGEX>:.*(unique|Duplicate|constraint|key).*
+
+# PREPARE re-used across autocommit and explicit transactions
+statement ok
+PREPARE ins_user AS INSERT INTO w4.users VALUES ($1, $2);
+
+statement ok
+EXECUTE ins_user('edsger@corp.com', 10);
+
+statement ok
+BEGIN;
+
+statement ok
+EXECUTE ins_user('barbara@corp.com', 11);
+
+statement ok
+EXECUTE ins_user('tony@corp.com', 12);
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM w4.users;
+----
+5
+
+# a statement prepared before the freeze must not write afterwards (the
+# frozen check runs at plan time; the plan is re-bound in the new transaction)
+statement ok
+CALL scenario_freeze('w4');
+
+statement error
+EXECUTE ins_user('late@corp.com', 13);
+----
+<REGEX>:.*frozen.*
+
+query I
+SELECT count(*) FROM w4.users;
+----
+5
