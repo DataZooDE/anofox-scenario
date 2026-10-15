@@ -291,6 +291,7 @@ test/sql/
   attach_insert_constraint_order.test # base PK probe vs constraint declaration order (#22)
   scenario_materialized_fk.test   # materialized copies over FK schemas; merge-back enforces FKs (#24)
   scenario_keyless_upgrade.test   # pre-v0.4.1 keyless deltas (no _count) upgraded in place (#31)
+  scenario_ducklake_keyless_merge.test # keyless bag merge-back into DuckLake bases: exact copies, drift (#31)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
 ```

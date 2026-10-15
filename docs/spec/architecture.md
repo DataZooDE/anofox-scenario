@@ -287,6 +287,19 @@ Conflict detection depends on whether the scenario has a creation snapshot:
 caller's transaction. DuckLake bases apply atomically on the lake side in their own transaction,
 because there is no cross-catalog 2PC — hence the autocommit requirement.
 
+Keyless (bag) tables merge by net multiplicity per distinct row: the delta's `I`/`D` rows are
+summed (`_count`) per whole-row value. A net of `-n` deletes exactly `n` base copies, a net of `+n`
+appends `n` copies. Host bases pick the copies by scanning rowids. DuckLake bases do the same in
+SQL on the lake connection: DuckLake exposes stable `rowid`s, so the apply is
+`DELETE ... WHERE rowid IN (...)` over `row_number() OVER (PARTITION BY <all columns> ORDER BY rowid)`
+joined NULL-safely (`IS NOT DISTINCT FROM`) to the per-value plan, followed by an `INSERT` of the
+net-positive copies. Drift for a keyless DuckLake row: the scenario deletes copies of a value whose
+current lake count differs from its count at the snapshot (copies were added or removed
+underneath — a removed copy may be the one the scenario removed, so the outcome is ambiguous).
+`abort` refuses, `theirs` leaves that value's lake copies alone, and `ours` sets the lake's count to the
+scenario's (`snapshot count + net`), deleting or re-adding copies as needed. Net inserts never
+conflict. All counts are captured in temp tables before the lake is touched.
+
 On success the scenario ends frozen, with `merged_at` set and an empty delta.
 
 ---
