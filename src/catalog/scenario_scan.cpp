@@ -410,10 +410,15 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			// Bag changelog: aggregate I/D multiplicities per value, then emit
 			// the positive nets as scenario rows and turn the negative nets
 			// into a base-side suppression budget
-			auto count_pos = delta_column_ids.size();
-			delta_column_ids.emplace_back(ScenarioDelta::PAYLOAD_START +
-			                              bind_data.entry.GetColumns().LogicalColumnCount());
-			delta_types.push_back(LogicalType::BIGINT);
+			// (a pre-v0.4.1 delta that could not be upgraded has no _count:
+			// each of its rows is one inserted copy)
+			auto delta_count_column = ScenarioDelta::CountColumnIndex(delta_table);
+			optional_idx count_pos;
+			if (delta_count_column.IsValid()) {
+				count_pos = delta_column_ids.size();
+				delta_column_ids.emplace_back(delta_count_column.GetIndex());
+				delta_types.push_back(LogicalType::BIGINT);
+			}
 			struct BagEntry {
 				int64_t net = 0;
 				vector<Value> row_values; // delta scan layout, for emission
@@ -423,7 +428,8 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			ScenarioDelta::ScanTableRows(
 			    context, delta_table, std::move(delta_column_ids), delta_types, [&](DataChunk &chunk, idx_t row) {
 				    auto op = chunk.GetValue(0, row).GetValue<string>()[0];
-				    auto count = chunk.GetValue(count_pos, row).GetValue<int64_t>();
+				    int64_t count =
+				        count_pos.IsValid() ? chunk.GetValue(count_pos.GetIndex(), row).GetValue<int64_t>() : 1;
 				    auto key = ScenarioDelta::MakeKey(chunk, row, delta_key_positions);
 				    auto &bag_entry = bag[key];
 				    bag_entry.net += (op == 'I') ? count : -count;

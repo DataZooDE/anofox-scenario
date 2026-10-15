@@ -941,7 +941,8 @@ PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vec
 //===----------------------------------------------------------------------===//
 
 //! Keyless tables get bag-mode UPDATE/DELETE/MERGE when their delta carries
-//! the _count column (scenarios created before v0.4.1 lack it)
+//! the _count column. Pre-v0.4.1 deltas lack it until ATTACH upgrades them,
+//! which is skipped when the attaching transaction could not write the host
 void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry) {
 	if (!entry.key_columns.empty()) {
 		return;
@@ -950,9 +951,17 @@ void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry
 	auto delta = ScenarioDelta::TryGetDeltaTable(context, scenario_catalog.GetHostCatalog(context),
 	                                             scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
 	if (!delta || !ScenarioDelta::CountColumnIndex(*delta).IsValid()) {
+		auto &host_db = scenario_catalog.GetHostCatalog(context).GetAttached();
+		if (host_db.IsReadOnly()) {
+			// the real obstacle: nothing could be written here anyway
+			throw InvalidInputException(
+			    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode",
+			    scenario_catalog.scenario_name, host_db.GetName());
+		}
 		throw NotImplementedException(
-		    "UPDATE/DELETE/MERGE on keyless table '%s' requires a scenario created with v0.4.1+ (its delta lacks the "
-		    "_count column). Recreate the scenario, or declare key_columns at scenario_create",
+		    "UPDATE/DELETE/MERGE on keyless table '%s' needs its pre-v0.4.1 delta upgraded (it lacks the _count "
+		    "column), which happens at ATTACH. DETACH and re-ATTACH the scenario outside an explicit "
+		    "transaction, with its host database writable",
 		    entry.name);
 	}
 }

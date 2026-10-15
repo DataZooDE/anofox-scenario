@@ -85,7 +85,6 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | --- | --- |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
-| Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |
 
 ## Function Reference
 
@@ -114,7 +113,9 @@ __anofox_scenario.registry              -- scenario_id, name, mode, frozen, pare
 __anofox_scenario.registry_seq          -- id sequence
 __anofox_scenario.s<id>_delta_<table>   -- (_op 'I'|'U'|'D', _ts, <base columns>) PK = base PK
                                         --   or the declared key_columns; keyless tables append
-                                        --   _count BIGINT (bag changelog, no PK) instead
+                                        --   _count BIGINT (bag changelog, no PK) instead;
+                                        --   pre-v0.4.1 keyless deltas (no _count) are
+                                        --   upgraded in place on ATTACH / branching
 __anofox_scenario.s<id>_mat_<table>     -- materialized base copies (mode = 'materialized');
                                         --   FOREIGN KEY constraints are not copied
 ```

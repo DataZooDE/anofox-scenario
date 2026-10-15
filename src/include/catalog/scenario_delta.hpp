@@ -37,6 +37,23 @@ public:
 	//! Position of the trailing _count column, if this delta has one
 	static optional_idx CountColumnIndex(const TableCatalogEntry &delta_table);
 
+	//! A keyless delta written before v0.4.1: no PRIMARY KEY and no trailing
+	//! _count. Such deltas only ever held 'I' rows (keyless UPDATE/DELETE was
+	//! gated), so readers treat them as an implicit _count of 1.
+	static bool IsLegacyKeylessDelta(const TableCatalogEntry &delta_table);
+	//! True when the scenario owns at least one legacy keyless delta
+	static bool HasLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+	//! Rebuild every legacy keyless delta of a scenario into the current bag
+	//! layout (trailing _count BIGINT NOT NULL = 1 per old row, mirrored
+	//! UNIQUE indexes dropped), in the caller's transaction. The caller must
+	//! have registered the host write. Returns the number of upgraded tables.
+	static idx_t UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+	//! Upgrade at a hook that may or may not be able to write the host
+	//! (ATTACH): registers the host write and upgrades only when that is
+	//! legal - writable host, read-write transaction, and no other database
+	//! already written in it. Returns false when legacy deltas remain.
+	static bool TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+
 	static string DeltaTableName(int64_t scenario_id, const string &table_name);
 	//! Materialized base copy: __anofox_scenario.s<id>_mat_<table> (Phase 2)
 	static string MatTableName(int64_t scenario_id, const string &table_name);

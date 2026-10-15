@@ -120,6 +120,28 @@ below).
   `EXCEPT ALL` deleted copies, and diffs the two with `EXCEPT ALL` in both directions.
 - `scenario_diff_summary` reports the netted counts.
 
+**Pre-v0.4.1 deltas.** Before v0.4.1, keyless tables were insert-only: their delta was
+`(_op, _ts, <base columns>)` with no PK, no `_count`, the base's secondary `UNIQUE`s mirrored,
+and only `I` rows (UPDATE/DELETE were gated). Each old row is therefore exactly one inserted
+copy, i.e. `_count = 1`. `ScenarioDelta::UpgradeLegacyKeylessDeltas` rebuilds such a delta
+(no PK and no trailing `_count`) into the current layout: rows are buffered, the old table
+(and its mirrored `UNIQUE` indexes) is dropped, the table is recreated with `_count BIGINT NOT
+NULL` as the trailing column, and the rows are re-appended with `_count = 1`, timestamps kept.
+It runs in the caller's transaction at two hooks where a host write is safe:
+
+- `ATTACH ... (TYPE scenario)`, before any statement binds against the scenario. It is skipped
+  when it cannot write the host: a read-only host database, a `READ ONLY` transaction, or an
+  explicit transaction that already wrote another database (single-writer rule). Freezing does
+  not block it - the logical content is unchanged.
+- `scenario_create(..., from_scenario := p)`, which copies the parent's delta verbatim and so
+  upgrades the parent first (the create already writes the host).
+
+Scan-time and DML-time upgrades are deliberately avoided: bound plans hold the delta table
+entry, and a SELECT must not turn into a host write. Readers instead accept the legacy layout
+as an implicit `_count = 1` (scan, `scenario_diff`, `scenario_diff_summary`, merge-back), so a
+legacy scenario on a read-only host reads correctly. Keyless UPDATE/DELETE on a delta that could
+not be upgraded is rejected with guidance to re-`ATTACH` from a writable connection.
+
 A bag delta cannot carry a mirrored `UNIQUE` index, because `D` rows hold real payloads.
 Secondary `UNIQUE` constraints of a keyless table are therefore *counted* on the merged
 relation instead (`ScenarioBaseUniqueProbe::ProbeKeyless`):

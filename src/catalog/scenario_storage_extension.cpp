@@ -1,6 +1,7 @@
 #include "catalog/scenario_storage_extension.hpp"
 
 #include "catalog/scenario_catalog.hpp"
+#include "catalog/scenario_delta.hpp"
 #include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/attached_database.hpp"
@@ -30,6 +31,14 @@ static unique_ptr<Catalog> ScenarioAttach(optional_ptr<StorageExtensionInfo> sto
 		    "Scenario '%s' not found in database '%s'. Create it first with CALL scenario_create('%s')",
 		    scenario_name, host_catalog_name, scenario_name);
 	}
+	// Keyless deltas written before v0.4.1 lack _count: upgrade them in place
+	// now, before any statement binds against this scenario (bound plans hold
+	// the delta entry, so a later swap would leave them dangling). Skipped
+	// when this transaction cannot write the host; readers then treat the
+	// legacy layout as _count = 1. Freezing does not block it: the logical
+	// content is unchanged.
+	ScenarioDelta::TryUpgradeLegacyKeylessDeltas(context, host_catalog, entry->scenario_id);
+
 	// BaseSource resolution: the nearest materialized scenario in the parent
 	// chain (including self) provides the base tables; otherwise the live host.
 	int64_t mat_base_scenario_id = -1;
