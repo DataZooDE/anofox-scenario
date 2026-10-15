@@ -274,6 +274,7 @@ test/sql/
   attach_constraints.test         # NOT NULL/CHECK/PK vs merged state; no-PK limits
   attach_ddl.test                 # canonical DDL rejection
   attach_txn.test                 # caller-transaction semantics (ROLLBACK/COMMIT)
+  attach_mixed_txn.test           # host + scenario writes in one transaction (#31)
   attach_freeze.test              # freeze/unfreeze enforcement
   attach_hardening.test           # re-attach, double attach, introspection
   attach_persistence.test         # durability across restart

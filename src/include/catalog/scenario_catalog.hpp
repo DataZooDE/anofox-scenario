@@ -97,6 +97,9 @@ public:
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
 	DataTable &GetStorage() override;
+	//! Reports the entry as persistent (temporary = false) for introspection
+	//! and ToSQL; see the constructor for why the flag itself is set
+	unique_ptr<CreateInfo> GetInfo() const override;
 
 	//! Adds __scenario_origin and __scenario_key_<k> (PK-based row identity)
 	virtual_column_map_t GetVirtualColumns() const override;

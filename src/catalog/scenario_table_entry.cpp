@@ -13,6 +13,26 @@ namespace duckdb {
 ScenarioTableEntry::ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                        TableCatalogEntry &base_entry_p)
     : TableCatalogEntry(catalog, schema, info), base_entry(base_entry_p) {
+	// Write attribution (#31). The binder registers DML against a non-temporary
+	// table as a modification of the table's catalog (bind_insert/update/delete/
+	// merge_into: RegisterDBModify), and MetaTransaction::ModifyDatabase allows
+	// one modified database per transaction. A scenario catalog owns no storage:
+	// every row it writes lands in the HOST database's delta tables. Registering
+	// the scenario database as the write target would therefore forbid host
+	// writes (and writes to other scenarios) in the same transaction, although
+	// physically only the host is ever modified. Flagging the entry temporary
+	// makes the binder skip that registration (INSERT registers a read instead,
+	// keeping prepared-statement rebinding intact); the sinks then register the
+	// host via ScenarioCatalog::MarkHostWrite before their first physical write.
+	// The flag has no other effect here: it only matters for entries stored in
+	// a CatalogSet / the WAL, and scenario entries live in neither.
+	temporary = true;
+}
+
+unique_ptr<CreateInfo> ScenarioTableEntry::GetInfo() const {
+	auto info = TableCatalogEntry::GetInfo();
+	info->temporary = false;
+	return info;
 }
 
 ScenarioCatalog &ScenarioTableEntry::GetScenarioCatalog() {

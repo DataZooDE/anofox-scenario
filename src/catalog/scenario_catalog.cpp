@@ -178,14 +178,28 @@ ScenarioTransaction &ScenarioCatalog::GetScenarioTransaction(ClientContext &cont
 }
 
 void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModificationType type) {
+	// The single point where a scenario write is attributed to a database.
+	// Scenario table entries are flagged temporary (see ScenarioTableEntry), so
+	// the binder does not register the scenario catalog as the statement's
+	// write target; the sinks call this before their first physical write and
+	// register the HOST database - where the rows actually land. Host DML and
+	// scenario DML (of any number of scenarios on this host) thus modify one
+	// database and may share a transaction; a write to a genuinely different
+	// database still trips MetaTransaction's single-writer check. Because the
+	// binder-time checks no longer cover the scenario catalog, the read-only
+	// checks of ClientContext::CheckIfPreparedStatementIsExecutable are
+	// mirrored here.
 	auto &host_db = GetHostCatalog(context).GetAttached();
 	auto &meta = MetaTransaction::Get(context);
 	if (meta.IsReadOnly()) {
 		throw TransactionException("Cannot write to scenario \"%s\" - transaction is launched in read-only mode",
 		                           scenario_name);
 	}
+	if (GetAttached().IsReadOnly()) {
+		throw InvalidInputException("Cannot write to scenario '%s': it is attached in read-only mode (as '%s')",
+		                            scenario_name, GetAttached().GetName());
+	}
 	if (host_db.IsReadOnly()) {
-		// Mirror the check MetaTransaction::ModifyDatabase's callers perform:
 		// scenario writes physically land in the host database
 		throw InvalidInputException(
 		    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode", scenario_name,
@@ -193,11 +207,10 @@ void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModification
 	}
 	auto modified = meta.ModifiedDatabase();
 	if (modified && modified.get() == &GetAttached()) {
-		// DML targeting this scenario: the binder already registered the
-		// scenario catalog as the transaction's single write target. The
-		// physical rows land in the host database within the same
-		// meta-transaction; mark its transaction read-write so commit
-		// flushes it, without violating the single-writer rule.
+		// Defensive: a code path that registered the scenario catalog itself
+		// as the write target (none of the DML binders do, see above). Keep
+		// it as the single writer and only flag the host transaction
+		// read-write so commit flushes it.
 		auto &host_transaction = meta.GetTransaction(host_db);
 		if (host_transaction.IsReadOnly()) {
 			host_transaction.SetReadWrite();

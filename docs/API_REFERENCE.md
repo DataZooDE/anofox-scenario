@@ -67,7 +67,14 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   - One difference from a plain table: if several source rows match the *same* target copy,
     the statement fails with `modified the same row twice` (plain DuckDB silently applies one
     of the matches). This is the same rule keyed scenario tables follow.
-- **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it.
+- **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it. Host
+  writes and scenario writes may share one explicit transaction, in any order and across any
+  number of scenarios on the same host: every scenario row physically lands in the host
+  database, so `BEGIN; INSERT INTO main.orders ...; UPDATE s.orders ...; COMMIT;` commits (or
+  rolls back) both sides atomically. Writing to a genuinely different attached database in the
+  same transaction is still refused by DuckDB's single-writer rule. Side effect: scenario
+  tables report `temporary = true` in `duckdb_tables()` (their `sql` stays a plain
+  `CREATE TABLE`).
 - **DDL:** not permitted inside scenarios (one canonical error).
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time.
@@ -76,7 +83,6 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 
 | Limitation | Notes |
 | --- | --- |
-| Host writes and scenario writes in the *same explicit transaction* | single-writer rule; documented restriction |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
 | Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |

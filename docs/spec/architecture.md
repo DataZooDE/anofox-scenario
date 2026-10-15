@@ -58,7 +58,9 @@ real catalog. Most of the design follows from that one choice:
   within one. That re-bind also re-runs plan-time checks such as the frozen flag.
 - **Constraints, types, and binder errors are DuckDB's**, not reimplementations.
 - **Transactions ride the host's.** Scenario DML runs in the caller's transaction, so `ROLLBACK`
-  undoes scenario writes for free and ACID is inherited rather than rebuilt.
+  undoes scenario writes for free and ACID is inherited rather than rebuilt. Writes are
+  attributed to the host database, not to the scenario catalog (see *Write attribution*
+  below), so host DML and scenario DML can share one transaction.
 
 The cost is that the catalog must present a *synthetic* schema mirroring the base, and must
 reject the operations that make no sense on a branch — which is why all DDL is refused.
@@ -173,6 +175,29 @@ so uniqueness splits into three checks:
 
 `ScenarioCatalog::MarkHostWrite` is the chokepoint enforcing the single-writer rule and the
 frozen flag.
+
+### Write attribution
+
+DuckDB allows one modified attached database per transaction
+(`MetaTransaction::ModifyDatabase`, duckdb `src/transaction/meta_transaction.cpp`). The DML
+binders register the target table's catalog as modified (`StatementProperties::RegisterDBModify`
+in `bind_insert/update/delete/merge_into.cpp`) unless the table entry is `temporary`, and
+`ClientContext::CheckIfPreparedStatementIsExecutable` turns that registration into a
+`ModifyDatabase` call before execution. Left alone, a scenario statement would make the
+*scenario* database the transaction's writer, and a host write (or a write to a second scenario)
+in the same transaction would fail, although only the host is ever physically modified.
+
+`ScenarioTableEntry` therefore sets `temporary = true`. The binder then skips the
+registration (INSERT registers a read instead, so prepared statements still re-bind on catalog
+changes), and every sink calls `MarkHostWrite` before its first physical write, which calls
+`ModifyDatabase(host)`. Host and scenario writes thus name the same writer; a write to an
+unrelated database still trips DuckDB's check. Because the binder-time checks no longer see the
+scenario catalog, `MarkHostWrite` mirrors them: read-only transaction, scenario attached
+`READ_ONLY`, host attached read-only. The flag has no other effect on scenario entries -
+`temporary` only matters for entries stored in a `CatalogSet` and logged to the WAL, and
+scenario entries live in neither - except that `duckdb_tables()` reports it (`GetInfo` resets
+it, so the `sql` column stays a plain `CREATE TABLE`). Commit, WAL, checkpoint and
+write-write conflict detection are the host `DuckTransaction`'s, unchanged.
 
 ---
 

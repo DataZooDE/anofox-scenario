@@ -341,7 +341,6 @@ isolation tiers, and a map of the source tree — see
 
 ## Limitations
 
-- **Single-writer**: host writes and scenario writes cannot share one explicit transaction
 - **DDL restrictions**: schema modifications are not permitted inside scenarios
 - **Keyless tables**: tables with no PRIMARY KEY use bag semantics for UPDATE/DELETE/MERGE
   INTO and `scenario_diff`. `ON CONFLICT` needs a `UNIQUE` conflict target. Declare
