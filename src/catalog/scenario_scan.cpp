@@ -59,6 +59,8 @@ struct ScenarioScanOutputMapping {
 	//! Position in the scanned chunk; DConstants::INVALID_INDEX means the
 	//! column is the __scenario_origin constant (0 for base rows)
 	idx_t scan_pos = DConstants::INVALID_INDEX;
+	//! __scenario_rowno (keyless tables): a per-scan unique row number
+	bool is_rowno = false;
 };
 
 //! Merge-on-read scan. The (small) visible delta streams through a parallel
@@ -93,6 +95,12 @@ struct ScenarioScanGlobalState : public GlobalTableFunctionState {
 	//! Keyless bag mode: how many base copies of each value to suppress
 	//! (consumed while scanning - the scan runs single-threaded then)
 	unordered_map<string, idx_t> suppress_budget;
+	//! Next __scenario_rowno to hand out (delta rows take the first numbers
+	//! at init, base chunks reserve ranges while scanning)
+	atomic<int64_t> next_rowno {0};
+	//! Pushed filters on __scenario_rowno, over the output layout; applied to
+	//! emitted base chunks (the base scan never sees the synthesized column)
+	unique_ptr<Expression> rowno_filter;
 
 	idx_t max_threads = 1;
 	idx_t MaxThreads() const override {
@@ -109,6 +117,7 @@ struct ScenarioScanLocalState : public LocalTableFunctionState {
 	// delta side
 	ColumnDataLocalScanState delta_local_state;
 	bool delta_done = false;
+	unique_ptr<ExpressionExecutor> rowno_filter_executor;
 };
 
 unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
@@ -134,6 +143,9 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 		ScenarioScanOutputMapping mapping;
 		if (id == SCENARIO_ORIGIN_COLUMN_ID) {
 			// constant on the base side
+		} else if (id == SCENARIO_ROWNO_COLUMN_ID) {
+			// synthesized per emitted row
+			mapping.is_rowno = true;
 		} else if (id >= SCENARIO_KEY_COLUMN_START && id < SCENARIO_KEY_COLUMN_START + bind_data.pk_columns.size()) {
 			auto k = id - SCENARIO_KEY_COLUMN_START;
 			mapping.scan_pos = find_or_add_scan_column(ColumnIndex(bind_data.pk_columns[k]));
@@ -163,6 +175,21 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 				throw InternalException("anofox_scenario: pushed filter references an unprojected column");
 			}
 			auto scan_pos = result->out_map[out_pos].scan_pos;
+			if (result->out_map[out_pos].is_rowno) {
+				// synthesized after the base scan: evaluated on the emitted
+				// output instead (the delta side applies every filter anyway)
+				auto column_ref = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, out_pos);
+				auto filter_expr = filter_entry.second->ToExpression(*column_ref);
+				if (result->rowno_filter) {
+					auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+					conjunction->children.push_back(std::move(result->rowno_filter));
+					conjunction->children.push_back(std::move(filter_expr));
+					result->rowno_filter = std::move(conjunction);
+				} else {
+					result->rowno_filter = std::move(filter_expr);
+				}
+				continue;
+			}
 			if (scan_pos == DConstants::INVALID_INDEX) {
 				// __scenario_origin: constant 0 for every base row. The filter
 				// either rejects all base rows (skip the base side) or none.
@@ -240,6 +267,8 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 				output_types.push_back(LogicalType::ROW_TYPE);
 			} else if (id == SCENARIO_ORIGIN_COLUMN_ID) {
 				output_types.push_back(LogicalType::TINYINT);
+			} else if (id == SCENARIO_ROWNO_COLUMN_ID) {
+				output_types.push_back(LogicalType::BIGINT);
 			} else if (id >= SCENARIO_KEY_COLUMN_START) {
 				auto k = id - SCENARIO_KEY_COLUMN_START;
 				output_types.push_back(
@@ -298,6 +327,8 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 		// INVALID-1 = origin constant 1
 		constexpr idx_t DELTA_OUT_NULL = DConstants::INVALID_INDEX;
 		const idx_t DELTA_OUT_ORIGIN = DConstants::INVALID_INDEX - 1;
+		const idx_t DELTA_OUT_ROWNO = DConstants::INVALID_INDEX - 2;
+		int64_t delta_rowno = 0;
 		vector<idx_t> delta_pos_for_output;
 		for (auto &col : input.column_indexes) {
 			auto id = col.GetPrimaryIndex();
@@ -305,6 +336,8 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 				delta_pos_for_output.push_back(DELTA_OUT_NULL); // delta rows: NULL rowid
 			} else if (id == SCENARIO_ORIGIN_COLUMN_ID) {
 				delta_pos_for_output.push_back(DELTA_OUT_ORIGIN);
+			} else if (id == SCENARIO_ROWNO_COLUMN_ID) {
+				delta_pos_for_output.push_back(DELTA_OUT_ROWNO);
 			} else if (id >= SCENARIO_KEY_COLUMN_START) {
 				auto k = id - SCENARIO_KEY_COLUMN_START;
 				delta_pos_for_output.push_back(find_or_add_delta(bind_data.pk_columns[k]));
@@ -346,6 +379,8 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 					append_chunk.SetValue(out_idx, append_count, Value(LogicalType::ROW_TYPE));
 				} else if (pos == DELTA_OUT_ORIGIN) {
 					append_chunk.SetValue(out_idx, append_count, Value::TINYINT(1));
+				} else if (pos == DELTA_OUT_ROWNO) {
+					append_chunk.SetValue(out_idx, append_count, Value::BIGINT(delta_rowno++));
 				} else {
 					append_chunk.SetValue(out_idx, append_count, chunk.GetValue(pos, row));
 				}
@@ -417,6 +452,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			}
 		}
 		flush();
+		result->next_rowno = delta_rowno;
 		if (result->visible_delta->Count() > 0) {
 			result->visible_delta->InitializeScan(result->delta_parallel_state);
 			result->has_visible_delta = true;
@@ -447,6 +483,9 @@ unique_ptr<LocalTableFunctionState> ScenarioScanInitLocal(ExecutionContext &cont
 		result->scan_chunk.Initialize(Allocator::Get(context.client), gstate.scan_types);
 	}
 	result->delta_done = !gstate.has_visible_delta;
+	if (gstate.rowno_filter) {
+		result->rowno_filter_executor = make_uniq<ExpressionExecutor>(context.client, *gstate.rowno_filter);
+	}
 	return std::move(result);
 }
 
@@ -566,7 +605,10 @@ bool EmitBaseChunk(ScenarioScanGlobalState &gstate, ScenarioScanLocalState &lsta
 	if (gstate.needs_projection) {
 		for (idx_t out_idx = 0; out_idx < gstate.out_map.size(); out_idx++) {
 			auto &mapping = gstate.out_map[out_idx];
-			if (mapping.scan_pos == DConstants::INVALID_INDEX) {
+			if (mapping.is_rowno) {
+				auto start = gstate.next_rowno.fetch_add(NumericCast<int64_t>(count));
+				output.data[out_idx].Sequence(start, 1, count);
+			} else if (mapping.scan_pos == DConstants::INVALID_INDEX) {
 				// __scenario_origin: base rows are origin 0
 				output.data[out_idx].Reference(Value::TINYINT(0));
 			} else {
@@ -574,6 +616,17 @@ bool EmitBaseChunk(ScenarioScanGlobalState &gstate, ScenarioScanLocalState &lsta
 			}
 		}
 		output.SetCardinality(count);
+		if (lstate.rowno_filter_executor) {
+			SelectionVector sel(count);
+			idx_t kept = lstate.rowno_filter_executor->SelectExpression(output, sel);
+			if (kept == 0) {
+				output.Reset();
+				return false;
+			}
+			if (kept < count) {
+				output.Slice(sel, kept);
+			}
+		}
 	}
 	return true;
 }

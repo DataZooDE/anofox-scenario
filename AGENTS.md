@@ -284,6 +284,7 @@ test/sql/
   scenario_diff_v2.test           # streaming diff engine (2- and 3-arg)
   scenario_migrate.test           # legacy v0.1 -> v2 migration
   attach_keyless_unique.test      # UNIQUE on keyless (bag) tables vs the merged relation (#27)
+  attach_keyless_merge.test       # MERGE INTO / ON CONFLICT on keyless tables vs a plain-table oracle (#31)
   scenario_diff_keyless.test      # bag diff/summary on keyless tables (#27)
   attach_dotted_names.test        # table/schema names containing . (quote-aware logical names, #27)
   attach_insert_constraint_order.test # base PK probe vs constraint declaration order (#22)

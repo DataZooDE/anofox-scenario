@@ -54,6 +54,19 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   may exist only in the scenario. `scenario_merge` enforces them against the base and rolls back
   atomically on a violation. Materialized copies don't carry the FKs, so introspection through a
   materialized scenario doesn't list them. Overlay scenarios mirror the base's FKs.
+- **Keyless tables** (no PK, no `key_columns`) have bag semantics for every DML form,
+  matching DuckDB on a plain table:
+  - `UPDATE` / `DELETE` / `MERGE INTO` act on *every* matching visible copy of a row. A
+    `MERGE` matched update writes `D(old) + I(new)` per copy, a matched delete `D(old)`, and
+    `WHEN NOT MATCHED [BY SOURCE]` works as usual.
+  - `INSERT ... ON CONFLICT (cols) DO NOTHING / DO UPDATE` and `INSERT OR REPLACE` need a
+    `UNIQUE` constraint on the conflict target. Conflicts are checked against the merged state:
+    base rows the scenario deleted or changed don't conflict, scenario rows do, and NULLs never
+    do. Without a `UNIQUE` constraint to target you get DuckDB's own binder error (`There are
+    no UNIQUE/PRIMARY KEY constraints ...`).
+  - One difference from a plain table: if several source rows match the *same* target copy,
+    the statement fails with `modified the same row twice` (plain DuckDB silently applies one
+    of the matches). This is the same rule keyed scenario tables follow.
 - **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it.
 - **DDL:** not permitted inside scenarios (one canonical error).
 - **Host database:** the scenario registry lives in the session's *default* database at
@@ -65,7 +78,6 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | --- | --- |
 | Host writes and scenario writes in the *same explicit transaction* | single-writer rule; documented restriction |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
-| `MERGE INTO` / `ON CONFLICT` on keyless tables (no PK, no `key_columns`) | UPDATE/DELETE work (bag semantics); declare `key_columns :=` for keyed matching |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
 | Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |
 

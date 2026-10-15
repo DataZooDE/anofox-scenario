@@ -82,9 +82,31 @@ Without a PK or declared `key_columns` there is nothing to match on, so the delt
 **bag changelog**: no PK, plus a trailing `_count BIGINT` multiplicity, with readers aggregating
 inserts and deletes per distinct value.
 
-This supports `INSERT`/`UPDATE`/`DELETE` with bag semantics, but cannot support `MERGE INTO` or
-`ON CONFLICT`, because both need row identity. Those are rejected with an error pointing at
-`key_columns :=`.
+This supports `INSERT`/`UPDATE`/`DELETE`/`MERGE INTO` with bag semantics. Keyless row identity
+is the whole row: `GetRowIdColumns()` is `__scenario_origin`, one `__scenario_key_<k>` per
+column, and `__scenario_rowno`. An update sink writes `D(old row) + I(new row)` per affected
+copy, and a delete sink writes `D(old row)`.
+
+`MERGE INTO` (and `INSERT ... ON CONFLICT`, which the binder lowers to `MERGE` for extension
+catalogs) runs through the same sinks. Every matching visible copy is affected, as in core.
+The catch is that a join can emit one copy several times, once per matching source row, and
+the whole-row identity can't tell that apart from several identical copies. So keyless scans
+synthesize **`__scenario_rowno`**, a per-scan unique `BIGINT`:
+
+- Visible delta rows take `0..n-1` when the scan initializes.
+- Base chunks reserve ranges from an atomic counter as they stream.
+- Filters on it stay above the scan (`supports_pushdown_type`).
+
+The update and delete sinks reject a second touch of the same row number with the keyed path's
+`modified the same row twice` error. `PlanMergeInto` hands all of a `MERGE`'s action sinks one
+shared touched-row set, so a copy matched once by a `DELETE` action and again by an `UPDATE`
+action is caught too.
+
+`ON CONFLICT` targets need a `UNIQUE` constraint, just like core. The binder derives the join
+from the table's unique indexes and raises core's own errors when there is none. The scenario
+scan supplies the merged state, so a value whose base row the scenario deleted doesn't match,
+and the insert and update sinks count the result against the merged relation (`ProbeKeyless`,
+below).
 
 `scenario_diff` on a keyless table is a **bag diff**:
 

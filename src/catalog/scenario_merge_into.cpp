@@ -4,6 +4,14 @@
 // DuckCatalog::PlanMergeInto, plugging in the scenario sinks. This also
 // powers INSERT ... ON CONFLICT / INSERT OR REPLACE, which the v1.5 binder
 // lowers through the MERGE machinery for non-duck catalogs.
+//
+// Keyless tables (no PK, no key_columns) match with bag semantics: every
+// matching visible copy is updated (D(old) + I(new)) or deleted (D(old)),
+// exactly like core on a plain table. The whole-row identity cannot tell two
+// identical copies apart from one copy the join emits twice (several source
+// rows match it), so the scan adds __scenario_rowno and the action sinks share
+// one touched-row set: a second touch of the same copy is rejected, like the
+// keyed path's double-touch check.
 //===----------------------------------------------------------------------===//
 
 #include "catalog/scenario_catalog.hpp"
@@ -20,7 +28,8 @@ namespace {
 
 unique_ptr<MergeIntoOperator> PlanScenarioMergeAction(ClientContext &context, LogicalMergeInto &op,
                                                       PhysicalPlanGenerator &planner, ScenarioTableEntry &entry,
-                                                      BoundMergeIntoAction &action) {
+                                                      BoundMergeIntoAction &action,
+                                                      const shared_ptr<ScenarioTouchedRows> &touched) {
 	auto result = make_uniq<MergeIntoOperator>();
 	result->action_type = action.action_type;
 	result->condition = std::move(action.condition);
@@ -44,12 +53,12 @@ unique_ptr<MergeIntoOperator> PlanScenarioMergeAction(ClientContext &context, Lo
 		result->op = &MakeScenarioUpdateOperator(planner, std::move(return_types), entry, std::move(action.columns),
 		                                         std::move(action.expressions), std::move(defaults),
 		                                         std::move(bound_constraints), cardinality, op.return_chunk,
-		                                         op.row_id_start);
+		                                         op.row_id_start, touched);
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
 		result->op = &MakeScenarioDeleteOperator(planner, std::move(return_types), entry, op.row_id_start, cardinality,
-		                                         op.return_chunk);
+		                                         op.return_chunk, touched);
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
@@ -90,20 +99,21 @@ PhysicalOperator &ScenarioCatalog::PlanMergeInto(ClientContext &context, Physica
                                                  LogicalMergeInto &op, PhysicalOperator &plan) {
 	ThrowIfFrozen(context, "MERGE INTO");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
-	if (entry.key_columns.empty()) {
-		throw NotImplementedException("MERGE INTO / ON CONFLICT in scenarios requires a PRIMARY KEY on the base "
-		                              "table or key_columns declared at scenario_create (v1 limitation)");
-	}
+	ThrowIfKeylessUnsupported(context, entry);
 	if (op.return_chunk && !entry.base_entry.IsDuckTable()) {
 		throw NotImplementedException("RETURNING on MERGE INTO scenarios over non-DuckDB bases (e.g. DuckLake) is "
 		                              "not supported yet");
 	}
 
+	shared_ptr<ScenarioTouchedRows> touched;
+	if (entry.key_columns.empty()) {
+		touched = make_shared_ptr<ScenarioTouchedRows>();
+	}
 	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
 	for (auto &action_entry : op.actions) {
 		vector<unique_ptr<MergeIntoOperator>> planned_actions;
 		for (auto &action : action_entry.second) {
-			planned_actions.push_back(PlanScenarioMergeAction(context, op, planner, entry, *action));
+			planned_actions.push_back(PlanScenarioMergeAction(context, op, planner, entry, *action, touched));
 		}
 		actions.emplace(action_entry.first, std::move(planned_actions));
 	}

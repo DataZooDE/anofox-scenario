@@ -63,6 +63,9 @@ virtual_column_map_t ScenarioTableEntry::GetVirtualColumns() const {
 		result.insert(make_pair(SCENARIO_KEY_COLUMN_START + k,
 		                        TableColumn("__scenario_key_" + to_string(k), column.Type())));
 	}
+	if (key_columns.empty()) {
+		result.insert(make_pair(SCENARIO_ROWNO_COLUMN_ID, TableColumn("__scenario_rowno", LogicalType::BIGINT)));
+	}
 	return result;
 }
 
@@ -78,6 +81,11 @@ vector<column_t> ScenarioTableEntry::GetRowIdColumns() const {
 		// the doomed base rows by rowid (delta rows carry NULL here). Keyless
 		// tables carry their whole row in the identity columns instead.
 		result.push_back(COLUMN_IDENTIFIER_ROW_ID);
+	}
+	if (key_columns.empty()) {
+		// keyless: the per-scan row number tells one copy matched twice by a
+		// join apart from two identical copies (double-touch detection)
+		result.push_back(SCENARIO_ROWNO_COLUMN_ID);
 	}
 	return result;
 }
