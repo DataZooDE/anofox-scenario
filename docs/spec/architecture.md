@@ -194,6 +194,12 @@ Overlay is the default because it is cheapest and fits the common case: a short-
 against a base nobody is concurrently editing. The leak-through is documented rather than
 prevented, because preventing it means paying for one of the other two tiers.
 
+Every reader of a `snapshot` scenario applies the same pin: the scan (a `BoundAtClause` on the
+foreign scan), merge-back and its preview (the 3-way drift reference), and `scenario_diff`. The diff
+reads the base `AT (TIMESTAMP => created_at)` for `old_value` and for the merged relation, and its
+`'main'` side is the scenario's origin in its base catalog, pinned for DuckLake and live for
+unversioned bases.
+
 ---
 
 ## Merge-back

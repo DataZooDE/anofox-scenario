@@ -99,6 +99,39 @@ SELECT id, change_type, new_value FROM scenario_diff('lakescen', 'forecast') ORD
 2	removed	NULL
 10	added	NULL
 
+# --- diffs read the pinned snapshot too (#28) -----------------------------------------
+# old values come from the creation snapshot (100), not the moved lake (999)
+query ITTT
+SELECT id, change_type, old_value, new_value FROM scenario_diff('lakescen', 'forecast') ORDER BY id;
+----
+1	modified	100	111
+2	removed	NULL	NULL
+10	added	NULL	NULL
+
+# 'main' is the scenario's base at its snapshot: the same changes as above
+query ITTT
+SELECT id, change_type, old_value, new_value FROM scenario_diff('main', 'lakescen', 'forecast') ORDER BY id;
+----
+1	modified	100	111
+2	removed	NULL	NULL
+10	added	NULL	NULL
+
+# a scenario created after the churn is pinned to a later snapshot
+statement ok
+CALL scenario_create('lakelater', base := 'lake', key_columns := MAP {'forecast': ['id']});
+
+query ITTT
+SELECT id, change_type, old_value, new_value FROM scenario_diff('lakescen', 'lakelater', 'forecast') ORDER BY id;
+----
+1	modified	111	999
+2	added	NULL	NULL
+3	removed	NULL	NULL
+4	added	NULL	NULL
+10	removed	NULL	NULL
+
+statement ok
+CALL scenario_drop('lakelater');
+
 # --- merge-back into the lake ---------------------------------------------------------
 # Cross-catalog merges cannot ride the caller's transaction (single-writer
 # rule, no 2PC): the lake apply commits atomically on its own, then the host
@@ -174,16 +207,25 @@ SELECT count(*) FROM lb.rawlog;
 ----
 1
 
+# lake rows added after the snapshot stay out of the keyless diff (#28)
+statement ok
+INSERT INTO lake.rawlog VALUES ('c');
+
+query TT
+SELECT line, change_type FROM scenario_diff('main', 'lakebag', 'rawlog');
+----
+a	removed
+
 statement error
 SELECT * FROM scenario_merge('lakebag');
 ----
 <REGEX>:.*keyless.*key_columns.*
 
-# the lake was not touched by the refused merge
+# the lake was not touched by the refused merge (a, b + the later c)
 query I
 SELECT count(*) FROM lake.rawlog;
 ----
-2
+3
 
 statement ok
 DETACH lb;
