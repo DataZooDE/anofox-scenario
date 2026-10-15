@@ -46,12 +46,25 @@ Catalog &GetHostCatalogForDiff(ClientContext &context) {
 struct DiffTarget {
 	string delta_name; // host.__anofox_scenario.s<id>_delta_<t>
 	string base_name;  // host.main.<t> or host.__anofox_scenario.s<mat>_mat_<t>
+	//! " AT (TIMESTAMP => ...)" pinning a versioned (DuckLake) base to the
+	//! scenario's creation time, like the scan and merge-back; else empty
+	string base_at;
+	//! The scenario's origin table in its base catalog (not a mat copy):
+	//! what the 3-arg diff's 'main' side reads, pinned by origin_at
+	string origin_name;
+	string origin_at;
+	string base_catalog_name; // the scenario's base := catalog (empty = host)
 	vector<string> pk_columns;
 	vector<string> payload_columns;
 	//! Keyless table (bag delta with _count): every column is the identity
 	//! (pk_columns), payload_columns is empty, and changes are net I/D counts
 	bool keyless = false;
 };
+
+//! FROM-clause reference to the base side under an alias (AT follows the alias)
+string BaseFrom(const DiffTarget &target, const string &alias) {
+	return target.base_name + " AS " + alias + target.base_at;
+}
 
 //! SQL list of quoted columns with an optional alias prefix ("d.")
 string ColumnList(const vector<string> &columns, const string &prefix = "") {
@@ -100,6 +113,28 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	target.delta_name = host_prefix + Q(ScenarioRegistry::SCHEMA_NAME) + "." +
 	                    Q(ScenarioDelta::DeltaTableName(entry->scenario_id, table_name));
 
+	// Origin: the base catalog the scenario reads, pinned when versioned. A
+	// materialized side reads its copy instead, so it needs the catalog only
+	// for a 'main' side (origin_name stays empty when it is not attached)
+	optional_ptr<Catalog> base_catalog = &host_catalog;
+	if (!entry->base_catalog.empty()) {
+		base_catalog = Catalog::GetCatalogEntry(context, entry->base_catalog);
+		if (!base_catalog && mat_base_id < 0) {
+			throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached - ATTACH it first",
+			                            scenario_name, entry->base_catalog);
+		}
+	}
+	target.base_catalog_name = entry->base_catalog;
+	string schema_name, plain_name;
+	ScenarioDelta::SplitLogicalName(table_name, schema_name, plain_name);
+	auto &origin_at = target.origin_at;
+	if (base_catalog) {
+		target.origin_name = Q(base_catalog->GetName()) + "." + Q(schema_name) + "." + Q(plain_name);
+		if (base_catalog->GetCatalogType() == "ducklake") {
+			origin_at = " AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry->created_at) + "')";
+		}
+	}
+
 	optional_ptr<TableCatalogEntry> base_entry;
 	if (mat_base_id >= 0) {
 		auto mat = ScenarioDelta::TryGetMatTable(context, host_catalog, mat_base_id, table_name);
@@ -110,23 +145,13 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 		target.base_name = host_prefix + Q(ScenarioRegistry::SCHEMA_NAME) + "." + Q(mat->name);
 	} else {
 		// Phase 4: the base may live in another attached catalog
-		optional_ptr<Catalog> base_catalog = &host_catalog;
-		if (!entry->base_catalog.empty()) {
-			base_catalog = Catalog::GetCatalogEntry(context, entry->base_catalog);
-			if (!base_catalog) {
-				throw InvalidInputException(
-				    "Scenario '%s': base catalog '%s' is not attached - ATTACH it first", scenario_name,
-				    entry->base_catalog);
-			}
-		}
-		string schema_name, plain_name;
-		ScenarioDelta::SplitLogicalName(table_name, schema_name, plain_name);
 		base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, schema_name, plain_name,
 		                                                       OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			throw InvalidInputException("Table '%s' not found in the base schema", table_name);
 		}
-		target.base_name = Q(base_catalog->GetName()) + "." + Q(schema_name) + "." + Q(plain_name);
+		target.base_name = target.origin_name;
+		target.base_at = origin_at;
 	}
 
 	auto pk_columns =
@@ -152,25 +177,26 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	return target;
 }
 
-//! SQL of the merged relation of one diff side: 'main' = the live base;
-//! otherwise the scenario's merged state (base source + its delta overlay)
+//! SQL of the merged relation of one diff side: 'main' = the scenario
+//! side's origin table (pinned to its snapshot for versioned bases, live
+//! otherwise); else the scenario's merged state (base source + delta overlay)
 string MergedRelationSQL(ClientContext &context, const string &side, const string &table_name,
                          const DiffTarget &shape) {
-	auto &host_catalog = GetHostCatalogForDiff(context);
-	auto host_prefix = Q(host_catalog.GetName()) + ".";
 	if (side == "main") {
-		string schema_name, plain_name;
-		ScenarioDelta::SplitLogicalName(table_name, schema_name, plain_name);
-		if (shape.keyless) {
-			return "(SELECT " + ColumnList(shape.pk_columns) + " FROM " + host_prefix + Q(schema_name) + "." +
-			       Q(plain_name) + ")";
+		if (shape.origin_name.empty()) {
+			throw InvalidInputException("Base catalog '%s' is not attached - ATTACH it first",
+			                            shape.base_catalog_name);
 		}
-		return "(SELECT * FROM " + host_prefix + Q(schema_name) + "." + Q(plain_name) + ")";
+		auto origin = shape.origin_name + " AS o" + shape.origin_at;
+		if (shape.keyless) {
+			return "(SELECT " + ColumnList(shape.pk_columns) + " FROM " + origin + ")";
+		}
+		return "(SELECT * FROM " + origin + ")";
 	}
 	auto target = ResolveDiffTarget(context, side, table_name);
 	if (shape.keyless) {
 		// bag: origin plus inserted copies, minus deleted copies
-		return "((SELECT " + ColumnList(target.pk_columns) + " FROM " + target.base_name + " UNION ALL " +
+		return "((SELECT " + ColumnList(target.pk_columns) + " FROM " + BaseFrom(target, "b") + " UNION ALL " +
 		       ExpandedDeltaRows(target, "I") + ") EXCEPT ALL (" + ExpandedDeltaRows(target, "D") + "))";
 	}
 	string pk_match;
@@ -190,7 +216,7 @@ string MergedRelationSQL(ClientContext &context, const string &side, const strin
 		cols_b += ", b." + Q(col);
 	}
 	return "(SELECT " + cols_d + " FROM " + target.delta_name + " d WHERE d._op IN ('I', 'U') UNION ALL SELECT " +
-	       cols_b + " FROM " + target.base_name + " b WHERE NOT EXISTS (SELECT 1 FROM " + target.delta_name +
+	       cols_b + " FROM " + BaseFrom(target, "b") + " WHERE NOT EXISTS (SELECT 1 FROM " + target.delta_name +
 	       " d WHERE " + pk_match + " AND d._op IN ('U', 'D')))";
 }
 
@@ -306,7 +332,7 @@ unique_ptr<TableRef> ScenarioDiffBindReplace(ClientContext &context, TableFuncti
 	for (auto &col : target.payload_columns) {
 		sql += " UNION ALL SELECT " + pk_list_d + ", 'modified', CAST(" + QL(col) +
 		       " AS VARCHAR), CAST(b." + Q(col) + " AS VARCHAR), CAST(d." + Q(col) + " AS VARCHAR) FROM " +
-		       target.delta_name + " d JOIN " + target.base_name + " b ON (" + join_cond + ") WHERE d._op = 'U' AND (d." +
+		       target.delta_name + " d JOIN " + BaseFrom(target, "b") + " ON (" + join_cond + ") WHERE d._op = 'U' AND (d." +
 		       Q(col) + " IS DISTINCT FROM b." + Q(col) + ")";
 	}
 	return SQLToSubquery(context, sql);
