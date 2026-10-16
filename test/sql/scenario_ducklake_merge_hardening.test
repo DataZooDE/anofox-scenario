@@ -1,0 +1,337 @@
+# name: test/sql/scenario_ducklake_merge_hardening.test
+# description: DuckLake merge-back hardening: legacy keyless deltas, base columns named rowid, net-plan preview, idempotent re-merge after a failed host step (#39)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+require parquet
+
+# needs the ducklake extension installed for the running duckdb version;
+# run with DUCKLAKE_TESTS=1 (release build)
+require-env DUCKLAKE_TESTS
+
+load __TEST_DIR__/merge_hardening_host.db
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/merge_hardening.ducklake' AS lake (DATA_PATH '__TEST_DIR__/merge_hardening_data');
+
+# --- legacy keyless delta (no _count) merges without a re-ATTACH ------------------------
+
+statement ok
+CREATE TABLE lake.page_views (page VARCHAR, visitor VARCHAR);
+
+statement ok
+INSERT INTO lake.page_views VALUES ('/home', 'v1'), ('/home', 'v1'), ('/docs', 'v2');
+
+statement ok
+CALL scenario_create('legacy_lake', base := 'lake');
+
+query I
+SELECT scenario_id FROM scenario_list() WHERE name = 'legacy_lake';
+----
+1
+
+# a pre-v0.4.1 keyless delta: no _count, insert rows only (each one copy).
+# It is never re-ATTACHed, so the ATTACH-time upgrade does not run.
+statement ok
+DROP TABLE __anofox_scenario.s1_delta_page_views;
+
+statement ok
+CREATE TABLE __anofox_scenario.s1_delta_page_views (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    page VARCHAR, visitor VARCHAR);
+
+statement ok
+INSERT INTO __anofox_scenario.s1_delta_page_views VALUES
+    ('I', TIMESTAMP '2026-07-01 08:00:00', '/home', 'v1'),
+    ('I', TIMESTAMP '2026-07-01 08:00:00', '/pricing', NULL),
+    ('I', TIMESTAMP '2026-07-01 08:00:00', '/pricing', NULL);
+
+query TTT rowsort
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('legacy_lake');
+----
+(/home, v1)	insert	false
+(/pricing, NULL)	insert	false
+(/pricing, NULL)	insert	false
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('legacy_lake');
+----
+1	3	0
+
+query TTI rowsort
+SELECT page, visitor, count(*) FROM lake.page_views GROUP BY ALL;
+----
+/docs	v2	1
+/home	v1	3
+/pricing	NULL	2
+
+# --- a base column named rowid must not steer the keyless apply -------------------------
+
+statement ok
+CREATE TABLE lake.ledger ("rowid" INTEGER, memo VARCHAR);
+
+# the user column holds duplicate and colliding values on purpose
+statement ok
+INSERT INTO lake.ledger VALUES (100, 'a'), (100, 'a'), (0, 'b'), (1, 'c'), (2, 'd'), (5, 'e'), (5, 'f');
+
+statement ok
+CALL scenario_create('rowid_col', base := 'lake');
+
+statement ok
+ATTACH 'rowid_col' AS rc (TYPE scenario);
+
+# (100, 'a'): 2 -> 1 copies; (5, 'e') deleted; (5, 'f') kept; one new row
+statement ok
+DELETE FROM rc.ledger WHERE memo IN ('a', 'e');
+
+statement ok
+INSERT INTO rc.ledger VALUES (100, 'a'), (7, 'g');
+
+statement ok
+CREATE TABLE expected_ledger AS SELECT * FROM rc.ledger;
+
+statement ok
+DETACH rc;
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('rowid_col');
+----
+1	3	0
+
+query IT rowsort
+SELECT "rowid", memo FROM lake.ledger;
+----
+0	b
+1	c
+100	a
+2	d
+5	f
+7	g
+
+query I
+SELECT count(*) FROM (SELECT * FROM lake.ledger EXCEPT ALL SELECT * FROM expected_ledger
+    UNION ALL SELECT * FROM expected_ledger EXCEPT ALL SELECT * FROM lake.ledger);
+----
+0
+
+# --- keyless preview shows the per-value net plan the merge applies ---------------------
+
+statement ok
+CREATE TABLE lake.shipments (sku VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO lake.shipments VALUES ('A', 1), ('A', 1), ('A', 1), ('B', 2), ('C', 3);
+
+statement ok
+CALL scenario_create('net_plan', base := 'lake');
+
+statement ok
+ATTACH 'net_plan' AS np (TYPE scenario);
+
+# ('A', 1): delete all 3 copies, re-add 2 (net -1); ('B', 2) -> ('B', 20)
+statement ok
+DELETE FROM np.shipments WHERE sku = 'A';
+
+statement ok
+INSERT INTO np.shipments VALUES ('A', 1), ('A', 1);
+
+statement ok
+UPDATE np.shipments SET qty = 20 WHERE sku = 'B';
+
+# a value whose inserts and deletes cancel out is not in the plan
+statement ok
+INSERT INTO np.shipments VALUES ('Z', 9);
+
+statement ok
+DELETE FROM np.shipments WHERE sku = 'Z';
+
+statement ok
+DETACH np;
+
+# one row per copy the merge deletes or inserts, keyed by the row's values
+query TTTT rowsort
+SELECT table_name, key, action, conflict::VARCHAR FROM scenario_merge_preview('net_plan');
+----
+shipments	(A, 1)	delete	false
+shipments	(B, 2)	delete	false
+shipments	(B, 20)	insert	false
+
+# the lake loses one copy of ('A', 1) underneath the scenario: only that
+# value's planned delete conflicts
+statement ok
+DELETE FROM lake.shipments WHERE rowid = (SELECT min(rowid) FROM lake.shipments WHERE sku = 'A');
+
+query TTT rowsort
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('net_plan');
+----
+(A, 1)	delete	true
+(B, 2)	delete	false
+(B, 20)	insert	false
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('net_plan', on_conflict := 'theirs');
+----
+1	2	1
+
+query TII rowsort
+SELECT sku, qty, count(*) FROM lake.shipments GROUP BY ALL;
+----
+A	1	2
+B	20	1
+C	3	1
+
+# --- re-merge after the host bookkeeping failed is idempotent ---------------------------
+
+statement ok
+CREATE TABLE lake.orders (customer VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO lake.orders VALUES ('acme', 10), ('acme', 10), ('globex', 20);
+
+statement ok
+CALL scenario_create('retry', base := 'lake');
+
+statement ok
+ATTACH 'retry' AS rt (TYPE scenario);
+
+# insert-only plus a partial bag delete
+statement ok
+INSERT INTO rt.orders VALUES ('initech', 30), ('initech', 30), ('hooli', 40);
+
+statement ok
+DELETE FROM rt.orders WHERE customer = 'acme';
+
+statement ok
+INSERT INTO rt.orders VALUES ('acme', 10);
+
+statement ok
+CREATE TABLE expected_orders AS SELECT * FROM rt.orders;
+
+statement ok
+DETACH rt;
+
+# another connection holds an uncommitted update of the scenario's registry
+# row, so the merge's host bookkeeping hits a write-write conflict after the
+# lake transaction has already committed
+statement ok con2
+BEGIN;
+
+statement ok con2
+UPDATE __anofox_scenario.registry SET frozen = true WHERE name = 'retry';
+
+statement error
+SELECT * FROM scenario_merge('retry');
+----
+<REGEX>:.*[Cc]onflict.*
+
+# the lake apply committed; the host still has the delta and an unmerged scenario
+query TII rowsort
+SELECT customer, amount, count(*) FROM lake.orders GROUP BY ALL;
+----
+acme	10	1
+globex	20	1
+hooli	40	1
+initech	30	2
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NULL)::VARCHAR FROM __anofox_scenario.registry WHERE name = 'retry';
+----
+false	true
+
+statement ok con2
+ROLLBACK;
+
+# the preview still lists the planned copies (it does not consult the tag)
+query I
+SELECT count(*) FROM scenario_merge_preview('retry');
+----
+4
+
+# the retry finds the lake commit tagged with this merge and only finishes the
+# host bookkeeping: no duplicated copies, the original counts are reported
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('retry');
+----
+1	4	0
+
+query TII rowsort
+SELECT customer, amount, count(*) FROM lake.orders GROUP BY ALL;
+----
+acme	10	1
+globex	20	1
+hooli	40	1
+initech	30	2
+
+query I
+SELECT count(*) FROM (SELECT * FROM lake.orders EXCEPT ALL SELECT * FROM expected_orders
+    UNION ALL SELECT * FROM expected_orders EXCEPT ALL SELECT * FROM lake.orders);
+----
+0
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NOT NULL)::VARCHAR FROM __anofox_scenario.registry WHERE name = 'retry';
+----
+true	true
+
+query I
+SELECT count(*) FROM __anofox_scenario.s4_delta_orders;
+----
+0
+
+# the lake commit carries the merge tag
+query I
+SELECT count(*) FROM lake.snapshots() WHERE commit_extra_info LIKE 'anofox_scenario.merge/v1 %';
+----
+4
+
+# --- a delta written after the failed bookkeeping is refused, not silently dropped -----
+
+statement ok
+CREATE TABLE lake.notes (body VARCHAR);
+
+statement ok
+INSERT INTO lake.notes VALUES ('n1');
+
+statement ok
+CALL scenario_create('changed_after', base := 'lake');
+
+statement ok
+ATTACH 'changed_after' AS ca (TYPE scenario);
+
+statement ok
+INSERT INTO ca.notes VALUES ('n2');
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+UPDATE __anofox_scenario.registry SET frozen = true WHERE name = 'changed_after';
+
+statement error
+SELECT * FROM scenario_merge('changed_after');
+----
+<REGEX>:.*[Cc]onflict.*
+
+statement ok con2
+ROLLBACK;
+
+# the scenario is still writable (unmerged): a new write lands in the delta
+statement ok
+INSERT INTO ca.notes VALUES ('n3');
+
+statement ok
+DETACH ca;
+
+statement error
+SELECT * FROM scenario_merge('changed_after');
+----
+<REGEX>:.*already applied to base catalog 'lake'.*changed since.*
+
+query T rowsort
+SELECT body FROM lake.notes;
+----
+n1
+n2

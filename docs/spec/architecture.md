@@ -388,23 +388,62 @@ Conflict detection depends on whether the scenario has a creation snapshot:
   has vanished from it.
 - **Materialized / DuckLake** — additionally detects three-way *drift*: a base row that changed
   since the snapshot, on a key the scenario also touched.
+  Keyless tables of both tiers get the copy-count form of drift (below).
 
 `on_conflict` selects `abort` (default), `ours`, or `theirs`. Host bases apply atomically in the
 caller's transaction. DuckLake bases apply atomically on the lake side in their own transaction,
 because there is no cross-catalog 2PC — hence the autocommit requirement.
 
 Keyless (bag) tables merge by net multiplicity per distinct row: the delta's `I`/`D` rows are
-summed (`_count`) per whole-row value. A net of `-n` deletes exactly `n` base copies, a net of `+n`
+summed (`_count`, or an implicit `1` per row for a legacy pre-v0.4.1 delta that was never
+upgraded) per whole-row value. A net of `-n` deletes exactly `n` base copies, a net of `+n`
 appends `n` copies. Host bases pick the copies by scanning rowids. DuckLake bases do the same in
 SQL on the lake connection: DuckLake exposes stable `rowid`s, so the apply is
 `DELETE ... WHERE rowid IN (...)` over `row_number() OVER (PARTITION BY <all columns> ORDER BY rowid)`
 joined NULL-safely (`IS NOT DISTINCT FROM`) to the per-value plan, followed by an `INSERT` of the
-net-positive copies. Drift for a keyless DuckLake row: the scenario deletes copies of a value whose
-current lake count differs from its count at the snapshot (copies were added or removed
+net-positive copies. A lake table with a user column named `rowid` (any case) shadows the
+pseudo-column, so for such tables the apply deletes *every* copy of each affected value and
+re-inserts the `now - del` survivors - the same multiset, since copies are indistinguishable.
+Either way the deleted count is checked against the plan (`sum(__anofox_del)`); a mismatch rolls
+the lake transaction back.
+
+Drift for a keyless row of a snapshot scenario (DuckLake, or materialized on the host, where the
+`s<id>_mat_<table>` copy supplies the snapshot count): the scenario deletes copies of a value
+whose current base count differs from its count at the snapshot (copies were added or removed
 underneath — a removed copy may be the one the scenario removed, so the outcome is ambiguous).
-`abort` refuses, `theirs` leaves that value's lake copies alone, and `ours` sets the lake's count to the
-scenario's (`snapshot count + net`), deleting or re-adding copies as needed. Net inserts never
-conflict. All counts are captured in temp tables before the lake is touched.
+`abort` refuses, `theirs` leaves that value's base copies alone, and `ours` sets the base's count
+to the scenario's (`snapshot count + net`), deleting or re-adding copies as needed. Net inserts
+never conflict. On DuckLake all counts are captured in temp tables before the lake is touched;
+on the host they come from one scan of the base and one of the mat copy, before any write.
+
+`scenario_merge_preview` lists the same per-value net plan for keyless tables: one row per copy
+the merge deletes or inserts, `key` = the row's values rendered as text (`CAST(row(...) AS
+VARCHAR)`), `conflict` per value from the same count comparison. Values whose inserts and deletes
+cancel out are not listed.
+
+### Merge-back into DuckLake: the two-commit window
+
+The lake apply commits on its own connection before the caller's transaction does the host
+bookkeeping (empty the delta, `merged_at`, `frozen`). If that bookkeeping fails — a crash, or a
+host write-write conflict on the registry row — the lake holds the changes while the scenario
+still looks unmerged. A plain re-merge is not safe: keyed rows and keyless deletes surface as
+conflicts, but keyless net inserts never conflict and would be appended a second time.
+
+So the lake commit is tagged: just before committing, the merge calls
+`<lake>.set_commit_message('anofox_scenario', ..., extra_info => tag)` with
+`tag = 'anofox_scenario.merge/v1 scenario=<id> created=<created_at µs> delta=<md5> tables_changed=..
+rows_applied=.. conflicts_resolved=..'`. `delta` fingerprints every delta table
+(`count(*)` and `sum(hash(row))`, per table, sorted by name). Every DuckLake merge first looks for
+its `scenario=/created=` prefix in `ducklake_snapshots(<lake>)`:
+
+- **No tag** — normal apply.
+- **Tag with a matching fingerprint** — the apply already happened. The lake is left alone, the
+  host bookkeeping runs, and the counts from the tag are reported.
+- **Tag with a different fingerprint** — the scenario was written to after the failed bookkeeping.
+  The merge refuses rather than discard those writes; they must be merged by hand.
+
+The tag lives in the lake's own snapshot metadata, so it commits atomically with the apply and needs
+no extra table. Non-DuckLake cross-catalog bases have no commit metadata and are not tagged.
 
 On success the scenario ends frozen, with `merged_at` set and an empty delta.
 
