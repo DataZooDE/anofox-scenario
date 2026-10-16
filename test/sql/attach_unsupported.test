@@ -40,6 +40,54 @@ SELECT count(*) FROM s.forecast;
 ----
 3
 
+# --- a keyless table created in the base after the scenario (#39) ---------------
+# It has no delta at all: every write names the real cause, not a delta upgrade
+# that re-attaching cannot perform.
+
+statement ok
+CREATE TABLE late_events (sku VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO late_events VALUES ('A1', 1), ('B2', 2);
+
+query TI
+SELECT * FROM s.late_events ORDER BY sku;
+----
+A1	1
+B2	2
+
+statement error
+INSERT INTO s.late_events VALUES ('C3', 3);
+----
+<REGEX>:.*created in the base after scenario 'u'.*
+
+statement error
+UPDATE s.late_events SET qty = 9 WHERE sku = 'A1';
+----
+<REGEX>:.*created in the base after scenario 'u'.*
+
+statement error
+DELETE FROM s.late_events WHERE sku = 'A1';
+----
+<REGEX>:.*created in the base after scenario 'u'.*
+
+statement error
+MERGE INTO s.late_events t USING (SELECT 'A1' AS sku) v ON t.sku = v.sku WHEN MATCHED THEN DELETE;
+----
+<REGEX>:.*created in the base after scenario 'u'.*
+
+# re-attaching does not change that (it is not an upgrade problem)
+statement ok
+DETACH s;
+
+statement ok
+ATTACH 'u' AS s (TYPE scenario);
+
+statement error
+UPDATE s.late_events SET qty = 9 WHERE sku = 'A1';
+----
+<REGEX>:.*created in the base after scenario 'u'.*
+
 statement ok
 DETACH s;
 

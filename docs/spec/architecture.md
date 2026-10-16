@@ -55,7 +55,7 @@ real catalog. Most of the design follows from that one choice:
   the current transaction (owned by `ScenarioTransaction`), and physical plans hold references
   to them. `ScenarioCatalog::GetCatalogVersion` therefore folds a per-transaction serial into the
   host catalog's version: a prepared statement is re-bound in each new transaction and reused
-  within one. That re-bind also re-runs plan-time checks such as the frozen flag.
+  within one. Write checks (read-only, frozen) run at execution instead, see *Write attribution*.
 - **Constraints, types, and binder errors are DuckDB's**, not reimplementations.
 - **Transactions ride the host's.** Scenario DML runs in the caller's transaction, so `ROLLBACK`
   undoes scenario writes for free and ACID is inherited rather than rebuilt. Writes are
@@ -78,18 +78,53 @@ reject the operations that make no sense on a branch — which is why all DDL is
 Delta-first ordering is what makes a scenario row win over the base row with the same key — so an
 `UPDATE` reads back as a modification rather than a duplicate.
 
-For keyed deltas, the claimed set is never materialized (#36). Step 1 emits the `I`/`U` rows
-chunk-wise. In step 2, each base chunk probes the delta's `PRIMARY KEY` index
-(`ScenarioDeltaIndexProbe`, `scenario_delta.cpp`) and drops the rows whose key has a `U` or `D` row.
-A point query therefore pays for the rows it reads, not for the whole delta: a 100k-row delta no
-longer costs every single-row `UPDATE`/`DELETE` a full key-set build. Deltas without a bound PK
-index, and keyless bag deltas, keep the materialized claim set.
+For keyed deltas, the claimed set is never materialized as strings (#36, #39). Step 1 emits the
+`I`/`U` rows chunk-wise and, for every `U`/`D` row, inserts the vectorized hash of its key into an
+open-addressing hash set (`KeyHashSet`, `scenario_scan.cpp`). In step 2, each base chunk hashes its
+keys the same way. A row whose hash misses is kept without further work. Only the hits are
+confirmed exactly, through the delta's `PRIMARY KEY` index (`ScenarioDeltaIndexProbe`,
+`scenario_delta.cpp`), because a 64-bit hash can collide. The set is read-only after init, so
+parallel base scans never serialize on the index lock; the index is touched about once per
+suppressed row. Past `anofox_scenario_suppression_hash_limit` `U`/`D` keys (default 4,194,304,
+about 16 bytes each) the set is dropped and every base row probes the index instead: bounded
+memory, but serialized per index.
+
+**Point lookups (#39).** When the pushed filters pin every key column to a finite set of values
+(`key = c`, `key IN (...)`, or such a filter inside an `AND` or an optional filter; at most 2048
+keys after the cross product), init skips the delta scan. It looks those keys up through the index,
+fetches the visible `I`/`U` rows by row id (`ScenarioDeltaIndexProbe::FetchRow`), and seeds the hash
+set with the `U`/`D` keys. A single-row `SELECT`/`UPDATE`/`DELETE` therefore costs O(log delta)
+instead of O(delta).
+
+**Snapshot visibility of the probe (#39).** Every delta change deletes a row and appends its
+replacement. When a transaction commits such a change while older transactions are still running,
+DuckDB moves the old row id from the main PK ART into `IndexEntry::deleted_rows_in_use`. Rows
+appended during a checkpoint go to `added_data_during_checkpoint`. So the probe does what core's
+index scan (`TableScanFunction`) does: under `IndexEntry::lock` it runs read-only `ARTOperator`
+lookups in all three ARTs, collects every row id stored under the key (nested leaves included),
+and keeps the one that `DataTable::CanFetch` says the transaction can see. It then repeats this
+for the transaction's own `append_indexes`, whose hits supersede the committed ones. An older
+snapshot thus keeps finding its own version of a key that another connection has since changed.
+Without this, the base row would resurface next to the delta row, and the write sinks would
+misclassify the key.
+
+Deltas without a bound PK index keep the materialized string claim set. Keyless bag deltas use a
+per-value suppression budget instead (below).
 
 ### Keyless tables
 
 Without a PK or declared `key_columns` there is nothing to match on, so the delta becomes a
-**bag changelog**: no PK, plus a trailing `_count BIGINT` multiplicity, with readers aggregating
-inserts and deletes per distinct value.
+**bag changelog**: no PK, plus a trailing `_count BIGINT NOT NULL` multiplicity, with readers
+aggregating inserts and deletes per distinct value.
+
+Readers find the multiplicity column structurally, never by name: `ScenarioDelta::CountColumnIndex`
+accepts a delta with no PK whose last column is a `BIGINT` carrying a `NOT NULL` constraint. A
+delta never mirrors the base's `NOT NULL`s, so no payload column - and no column of a pre-v0.4.1
+delta - matches. Every reader (scan, insert/update/delete sinks, UNIQUE probe, `scenario_diff`,
+`scenario_diff_summary`, merge-back) goes through that helper, and SQL that names the column uses
+`CountColumnName`. The column is called `_count` unless a base column already is: then
+`NewCountColumnName` prefixes underscores until the name is free (`__count`), so a keyless table
+with its own `_count` column works.
 
 This supports `INSERT`/`UPDATE`/`DELETE`/`MERGE INTO` with bag semantics. Keyless row identity
 is the whole row: `GetRowIdColumns()` is `__scenario_origin`, one `__scenario_key_<k>` per
@@ -106,10 +141,31 @@ synthesize **`__scenario_rowno`**, a per-scan unique `BIGINT`:
 - Base chunks reserve ranges from an atomic counter as they stream.
 - Filters on it stay above the scan (`supports_pushdown_type`).
 
-The update and delete sinks reject a second touch of the same row number with the keyed path's
-`modified the same row twice` error. `PlanMergeInto` hands all of a `MERGE`'s action sinks one
-shared touched-row set, so a copy matched once by a `DELETE` action and again by an `UPDATE`
-action is caught too.
+The suppression budget swallows the *first* base copies of a value that reach it. A filter
+pushed into the base scan on the physical `rowid` would therefore change which copy is
+swallowed: with three copies at rowids 0-2 and one deleted, `WHERE rowid = 1` would consume the
+budget on rowid 1 rather than 0. Whenever the budget is non-empty, keyless `rowid` filters
+(including dynamic join filters) are therefore held back from storage and evaluated on the
+emitted chunk after suppression. They use the same post-filter that `__scenario_rowno` filters
+use (#39). Without a budget they are pushed down as usual.
+
+The row number is only meaningful within one scan; the API reference documents it (with
+`__scenario_origin` / `__scenario_key_<k>`) as an internal, unstable column. A user `WHERE`
+clause may reference any of these virtual columns: the binder then reuses the already projected
+column for the DML row-id list (`Binder::BindRowIdColumns`), so a `DELETE`'s row-id columns need
+not be contiguous. `PlanDelete` therefore records each row-id column's own position from
+`LogicalDelete::expressions`; `UPDATE` and `MERGE` project them contiguously.
+
+**Double touch.** `ScenarioTouchedRows` records the rows a statement modified - the serialized
+key on keyed tables, the row number (two growable bitmaps: touched, deleted) on keyless ones.
+A repeated touch by a delete of a row a delete already removed is skipped (no second tombstone,
+count or `RETURNING` row: the outcome is the same whichever match wins, as in core). Any other
+repeat throws `modified the same row twice`. `PlanMergeInto` hands all of a `MERGE`'s action
+sinks one shared set, keyed and keyless alike, so a row matched by an `UPDATE` action and a
+`DELETE` action is caught there instead of surfacing as a raw delta PK violation. Tracking costs
+memory per touched row, so `UPDATE`/`DELETE` enable it only when the child plan can repeat a
+row (`ScenarioChildCanRepeatRows`: anything but scan/filter/projection, i.e. joins) or when a
+keyed `UPDATE` sets a key column (a key move must see the keys the statement touched).
 
 `ON CONFLICT` targets need a `UNIQUE` constraint, just like core. The binder derives the join
 from the table's unique indexes and raises core's own errors when there is none. The scenario
@@ -131,17 +187,29 @@ below).
 `(_op, _ts, <base columns>)` with no PK, no `_count`, the base's secondary `UNIQUE`s mirrored,
 and only `I` rows (UPDATE/DELETE were gated). Each old row is therefore exactly one inserted
 copy, i.e. `_count = 1`. `ScenarioDelta::UpgradeLegacyKeylessDeltas` rebuilds such a delta
-(no PK and no trailing `_count`) into the current layout: rows are buffered, the old table
-(and its mirrored `UNIQUE` indexes) is dropped, the table is recreated with `_count BIGINT NOT
-NULL` as the trailing column, and the rows are re-appended with `_count = 1`, timestamps kept.
-It runs in the caller's transaction at two hooks where a host write is safe:
+(no PK and no trailing multiplicity column) into the current layout: rows are buffered, the old
+table (and its mirrored `UNIQUE` indexes) is dropped, the table is recreated with `_count BIGINT
+NOT NULL` (or the collision-free name above) as the trailing column, and the rows are re-appended
+with `_count = 1`, timestamps kept. Dropping the table is not a logical write, but it does
+conflict with other transactions using the delta, so it only runs at `ATTACH ... (TYPE
+scenario)`, before any statement binds against the scenario, and only when
+`TryUpgradeLegacyKeylessDeltas` finds it safe. It is skipped, leaving the legacy layout, when:
 
-- `ATTACH ... (TYPE scenario)`, before any statement binds against the scenario. It is skipped
-  when it cannot write the host: a read-only host database, a `READ ONLY` transaction, or an
-  explicit transaction that already wrote another database (single-writer rule). Freezing does
-  not block it - the logical content is unchanged.
-- `scenario_create(..., from_scenario := p)`, which copies the parent's delta verbatim and so
-  upgrades the parent first (the create already writes the host).
+- the host database is read-only, the transaction is `READ ONLY`, or the attach itself is
+  `READ_ONLY` (it promises not to write the host);
+- the ATTACH runs inside an explicit transaction that does not already write the host. The
+  upgrade would otherwise make the host the transaction's single writer behind the user's back,
+  and a later write to another database would fail. A transaction that already writes the host
+  upgrades along the way;
+- an older transaction is active on the host (`DuckTransactionManager::LowestActiveStart()`
+  is before ours): it may hold uncommitted writes to the legacy delta, whose commit would fail
+  once the table is dropped;
+- the drop hits a catalog conflict (`TransactionException`): caught, so ATTACH never fails on
+  account of the upgrade.
+
+Freezing does not block it - the logical content is unchanged. `scenario_create(...,
+from_scenario := p)` never rewrites the parent: `CopyTableData` copies a legacy parent delta into
+the child's bag delta with `_count = 1` per row.
 
 Scan-time and DML-time upgrades are deliberately avoided: bound plans hold the delta table
 entry, and a SELECT must not turn into a host write. Readers instead accept the legacy layout
@@ -211,8 +279,8 @@ so uniqueness splits into three checks:
   - Merge-back registers every deleted base row in the transaction's delete indexes before it
     appends, so the base accepts the reused values too.
 
-`ScenarioCatalog::MarkHostWrite` is the chokepoint enforcing the single-writer rule and the
-frozen flag.
+`ScenarioCatalog::BeginWrite` is the chokepoint enforcing the single-writer rule, the read-only
+checks and the frozen flag.
 
 ### Write attribution
 
@@ -227,24 +295,30 @@ in the same transaction would fail, although only the host is ever physically mo
 
 `ScenarioTableEntry` therefore sets `temporary = true` on the entry the binder resolves. The
 binder then skips the registration (INSERT registers a read instead, so prepared statements still
-re-bind on catalog changes), and every sink calls `MarkHostWrite` before its first physical
-write, which calls `ModifyDatabase(host)`. Host and scenario writes thus name the same writer; a
-write to an unrelated database still trips DuckDB's check. The flag has no storage effect on
+re-bind on catalog changes), and every sink calls `BeginWrite` from `GetGlobalSinkState`, which
+ends in `MarkHostWrite` -> `ModifyDatabase(host)`. Host and scenario writes thus name the same
+writer. A transaction that already modified an unrelated database is refused by `MarkHostWrite`
+itself, naming the scenario (DuckDB's own check would only name the host). Sink global states
+are created by `PipelineInitializeTask`s, which can run on worker threads in parallel (e.g. the
+UNION of INSERTs `COPY FROM DATABASE` plans), and `ModifyDatabase` / `SetModifications` are not
+synchronized, so `BeginWrite` serializes behind a process-wide mutex; it runs once per sink, not
+per chunk. The flag has no storage effect on
 scenario entries - `temporary` only matters for entries stored in a `CatalogSet` and logged to
 the WAL, and scenario entries live in neither.
 
-Because the binder-time checks no longer see the scenario catalog, the plan hooks (`PlanInsert`,
-`PlanUpdate`, `PlanDelete`, `PlanMergeInto`) restore them in `ThrowIfNotWritable`, next to the
-frozen check and with DuckDB's own wording: read-only transaction, scenario attached `READ_ONLY`,
-host attached read-only. They run before execution, so zero-row writes fail too, and prepared
-statements re-plan per transaction (see *Entries are per transaction*). `MarkHostWrite` repeats
-them as a backstop.
+Because the binder-time checks no longer see the scenario catalog, `BeginWrite` restores them in
+`ThrowIfNotWritable`, next to the frozen check and with DuckDB's own wording: read-only
+transaction, scenario attached `READ_ONLY`, host attached read-only. They run when the sink is
+initialized - before any row flows, so zero-row writes fail too, but at `EXECUTE` rather than
+at physical planning, which `PREPARE` performs: a write prepared in a read-only transaction
+stays executable later, as in core. `MarkHostWrite` repeats the read-only checks as a backstop.
 
 Introspection reads the flag as well (`duckdb_tables().temporary`, and from it
 `information_schema.tables.table_type` / `commit_action` and `SHOW [ALL] TABLES`). So each
 transaction caches *two* entries per table in `ScenarioTransaction`: the binder's, from
 `LookupEntry`, flagged temporary; and the enumeration one, from `ScenarioSchemaEntry::Scan`,
-which is a plain `BASE TABLE` (cache key prefixed with `\x01`). This split holds because DuckDB
+which is a plain `BASE TABLE` (kept in a separate map, `enumeration_entries`, so no table name
+can collide with it). This split holds because DuckDB
 resolves DML targets only through `Catalog::GetEntry` -> `SchemaCatalogEntry::LookupEntry`
 (`bind_insert.cpp:538`, `bind_basetableref.cpp:163/229` for UPDATE/DELETE/MERGE). `Scan` feeds
 only enumeration: `duckdb_tables.cpp:83`, `duckdb_columns.cpp:91`, `duckdb_constraints`, and
@@ -314,23 +388,62 @@ Conflict detection depends on whether the scenario has a creation snapshot:
   has vanished from it.
 - **Materialized / DuckLake** — additionally detects three-way *drift*: a base row that changed
   since the snapshot, on a key the scenario also touched.
+  Keyless tables of both tiers get the copy-count form of drift (below).
 
 `on_conflict` selects `abort` (default), `ours`, or `theirs`. Host bases apply atomically in the
 caller's transaction. DuckLake bases apply atomically on the lake side in their own transaction,
 because there is no cross-catalog 2PC — hence the autocommit requirement.
 
 Keyless (bag) tables merge by net multiplicity per distinct row: the delta's `I`/`D` rows are
-summed (`_count`) per whole-row value. A net of `-n` deletes exactly `n` base copies, a net of `+n`
+summed (`_count`, or an implicit `1` per row for a legacy pre-v0.4.1 delta that was never
+upgraded) per whole-row value. A net of `-n` deletes exactly `n` base copies, a net of `+n`
 appends `n` copies. Host bases pick the copies by scanning rowids. DuckLake bases do the same in
 SQL on the lake connection: DuckLake exposes stable `rowid`s, so the apply is
 `DELETE ... WHERE rowid IN (...)` over `row_number() OVER (PARTITION BY <all columns> ORDER BY rowid)`
 joined NULL-safely (`IS NOT DISTINCT FROM`) to the per-value plan, followed by an `INSERT` of the
-net-positive copies. Drift for a keyless DuckLake row: the scenario deletes copies of a value whose
-current lake count differs from its count at the snapshot (copies were added or removed
+net-positive copies. A lake table with a user column named `rowid` (any case) shadows the
+pseudo-column, so for such tables the apply deletes *every* copy of each affected value and
+re-inserts the `now - del` survivors - the same multiset, since copies are indistinguishable.
+Either way the deleted count is checked against the plan (`sum(__anofox_del)`); a mismatch rolls
+the lake transaction back.
+
+Drift for a keyless row of a snapshot scenario (DuckLake, or materialized on the host, where the
+`s<id>_mat_<table>` copy supplies the snapshot count): the scenario deletes copies of a value
+whose current base count differs from its count at the snapshot (copies were added or removed
 underneath — a removed copy may be the one the scenario removed, so the outcome is ambiguous).
-`abort` refuses, `theirs` leaves that value's lake copies alone, and `ours` sets the lake's count to the
-scenario's (`snapshot count + net`), deleting or re-adding copies as needed. Net inserts never
-conflict. All counts are captured in temp tables before the lake is touched.
+`abort` refuses, `theirs` leaves that value's base copies alone, and `ours` sets the base's count
+to the scenario's (`snapshot count + net`), deleting or re-adding copies as needed. Net inserts
+never conflict. On DuckLake all counts are captured in temp tables before the lake is touched;
+on the host they come from one scan of the base and one of the mat copy, before any write.
+
+`scenario_merge_preview` lists the same per-value net plan for keyless tables: one row per copy
+the merge deletes or inserts, `key` = the row's values rendered as text (`CAST(row(...) AS
+VARCHAR)`), `conflict` per value from the same count comparison. Values whose inserts and deletes
+cancel out are not listed.
+
+### Merge-back into DuckLake: the two-commit window
+
+The lake apply commits on its own connection before the caller's transaction does the host
+bookkeeping (empty the delta, `merged_at`, `frozen`). If that bookkeeping fails — a crash, or a
+host write-write conflict on the registry row — the lake holds the changes while the scenario
+still looks unmerged. A plain re-merge is not safe: keyed rows and keyless deletes surface as
+conflicts, but keyless net inserts never conflict and would be appended a second time.
+
+So the lake commit is tagged: just before committing, the merge calls
+`<lake>.set_commit_message('anofox_scenario', ..., extra_info => tag)` with
+`tag = 'anofox_scenario.merge/v1 scenario=<id> created=<created_at µs> delta=<md5> tables_changed=..
+rows_applied=.. conflicts_resolved=..'`. `delta` fingerprints every delta table
+(`count(*)` and `sum(hash(row))`, per table, sorted by name). Every DuckLake merge first looks for
+its `scenario=/created=` prefix in `ducklake_snapshots(<lake>)`:
+
+- **No tag** — normal apply.
+- **Tag with a matching fingerprint** — the apply already happened. The lake is left alone, the
+  host bookkeeping runs, and the counts from the tag are reported.
+- **Tag with a different fingerprint** — the scenario was written to after the failed bookkeeping.
+  The merge refuses rather than discard those writes; they must be merged by hand.
+
+The tag lives in the lake's own snapshot metadata, so it commits atomically with the apply and needs
+no extra table. Non-DuckLake cross-catalog bases have no commit metadata and are not tagged.
 
 On success the scenario ends frozen, with `merged_at` set and an empty delta.
 
@@ -342,7 +455,7 @@ On success the scenario ends frozen, with `merged_at` set and an empty delta.
 |------|----------------|
 | `anofox_scenario_extension.cpp` | Entry point, function registration |
 | `catalog/scenario_storage_extension.cpp` | `ATTACH (TYPE scenario)`, base source resolution |
-| `catalog/scenario_catalog.cpp` | Catalog impl, `MarkHostWrite`, freeze chokepoint |
+| `catalog/scenario_catalog.cpp` | Catalog impl, `BeginWrite`/`MarkHostWrite` write chokepoint |
 | `catalog/scenario_schema_entry.cpp` | Synthetic `main` schema, DDL rejection |
 | `catalog/scenario_table_entry.cpp` | Base mirror, virtual identity columns |
 | `catalog/scenario_scan.cpp` | Merge-on-read scan |

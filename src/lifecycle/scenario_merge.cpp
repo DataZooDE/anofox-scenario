@@ -107,29 +107,12 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 		}
 		auto pk_columns =
 		    ScenarioDelta::GetKeyColumns(context, host, entry->scenario_id, logical_name, *base_entry);
-		string key_expr, pk_match;
-		if (pk_columns.empty()) {
-			key_expr = "CAST('(row)' AS VARCHAR)";
-		} else {
-			for (auto pk_col : pk_columns) {
-				auto &name = base_entry->GetColumn(LogicalIndex(pk_col)).Name();
-				if (!key_expr.empty()) {
-					key_expr += " || '|' || ";
-					pk_match += " AND ";
-				}
-				key_expr += "CAST(d." + QM(name) + " AS VARCHAR)";
-				pk_match += "b." + QM(name) + " = d." + QM(name);
-			}
-		}
 		auto base_name = QM(preview_base->GetName()) + "." + QM(schema_name) + "." + QM(table_name);
-		string exists_clause = pk_columns.empty()
-		                           ? string("false")
-		                           : "EXISTS (SELECT 1 FROM " + base_name + " b WHERE " + pk_match + ")";
+		auto delta_ref = internal_prefix + QM(delta_pair.first);
 
 		// Scenarios with a creation snapshot (materialized: the mat copy;
 		// cross-catalog/DuckLake: the AT-pinned base) get 3-way conflicts:
 		// base drift on a touched key mirrors scenario_merge's check
-		string drift_clause = "false";
 		string snapshot_ref; // includes the "m" alias (AT clauses follow the alias)
 		if (entry->mode == "materialized") {
 			snapshot_ref =
@@ -138,7 +121,62 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 			snapshot_ref =
 			    base_name + " AS m AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry->created_at) + "')";
 		}
-		if (!snapshot_ref.empty() && !pk_columns.empty()) {
+
+		if (pk_columns.empty()) {
+			// keyless bag: the merge applies per-value nets, so the preview
+			// lists that plan - one row per copy the merge deletes or inserts,
+			// keyed by the row's values. A deleted value (negative net) of a
+			// snapshot scenario conflicts when its base count differs from
+			// its snapshot count - mirrors scenario_merge's bag check.
+			auto delta_entry = ScenarioDelta::TryGetDeltaTable(context, host, entry->scenario_id, logical_name);
+			string count_expr = delta_entry && !ScenarioDelta::CountColumnName(*delta_entry).empty()
+			                        ? "d." + QM(ScenarioDelta::CountColumnName(*delta_entry))
+			                        : string("1"); // legacy delta: one copy per row
+			string payload_cols, n_cols, match_b, match_m;
+			for (auto &col : base_entry->GetColumns().Logical()) {
+				auto name = QM(col.Name());
+				if (!payload_cols.empty()) {
+					payload_cols += ", ";
+					n_cols += ", ";
+					match_b += " AND ";
+					match_m += " AND ";
+				}
+				payload_cols += "d." + name;
+				n_cols += "n." + name;
+				match_b += "b." + name + " IS NOT DISTINCT FROM n." + name;
+				match_m += "m." + name + " IS NOT DISTINCT FROM n." + name;
+			}
+			string bag_conflict = "false";
+			if (!snapshot_ref.empty()) {
+				bag_conflict = "n.__anofox_net < 0 AND (SELECT count(*) FROM " + base_name + " b WHERE " + match_b +
+				               ") <> (SELECT count(*) FROM " + snapshot_ref + " WHERE " + match_m + ")";
+			}
+			if (!sql.empty()) {
+				sql += " UNION ALL ";
+			}
+			sql += "SELECT CAST(" + QML(logical_name) +
+			       " AS VARCHAR) AS table_name, __anofox_key AS key, __anofox_action AS action, __anofox_conflict AS "
+			       "conflict FROM (SELECT CAST(row(" + n_cols + ") AS VARCHAR) AS __anofox_key, CASE WHEN "
+			       "n.__anofox_net > 0 THEN 'insert' ELSE 'delete' END AS __anofox_action, (" + bag_conflict +
+			       ") AS __anofox_conflict, unnest(range(abs(n.__anofox_net))) AS __anofox_copy FROM (SELECT " +
+			       payload_cols + ", CAST(sum(CASE WHEN d._op = 'I' THEN " + count_expr + " ELSE -" + count_expr +
+			       " END) AS BIGINT) AS __anofox_net FROM " + delta_ref + " d GROUP BY ALL) n WHERE n.__anofox_net <> 0)";
+			continue;
+		}
+
+		string key_expr, pk_match;
+		for (auto pk_col : pk_columns) {
+			auto &name = base_entry->GetColumn(LogicalIndex(pk_col)).Name();
+			if (!key_expr.empty()) {
+				key_expr += " || '|' || ";
+				pk_match += " AND ";
+			}
+			key_expr += "CAST(d." + QM(name) + " AS VARCHAR)";
+			pk_match += "b." + QM(name) + " = d." + QM(name);
+		}
+		string exists_clause = "EXISTS (SELECT 1 FROM " + base_name + " b WHERE " + pk_match + ")";
+		string drift_clause = "false";
+		if (!snapshot_ref.empty()) {
 			string mat_match, drift_columns;
 			unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
 			for (auto pk_col : pk_columns) {
@@ -163,27 +201,6 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 				               " AND " + mat_match + " AND (" + drift_columns + "))";
 			}
 		}
-		if (!entry->base_catalog.empty() && pk_columns.empty()) {
-			// keyless lake table: a deleted value (negative net) drifted when
-			// its lake count differs from its snapshot count - mirrors
-			// scenario_merge's bag conflict check
-			string match_d2, match_b, match_m;
-			for (auto &col : base_entry->GetColumns().Logical()) {
-				auto name = QM(col.Name());
-				if (!match_b.empty()) {
-					match_d2 += " AND ";
-					match_b += " AND ";
-					match_m += " AND ";
-				}
-				match_d2 += "d2." + name + " IS NOT DISTINCT FROM d." + name;
-				match_b += "b." + name + " IS NOT DISTINCT FROM d." + name;
-				match_m += "m." + name + " IS NOT DISTINCT FROM d." + name;
-			}
-			drift_clause = "((SELECT sum(CASE WHEN d2._op = 'I' THEN d2._count ELSE -d2._count END) FROM " +
-			               internal_prefix + QM(delta_pair.first) + " d2 WHERE " + match_d2 +
-			               ") < 0 AND (SELECT count(*) FROM " + base_name + " b WHERE " + match_b +
-			               ") <> (SELECT count(*) FROM " + snapshot_ref + " WHERE " + match_m + "))";
-		}
 		if (!sql.empty()) {
 			sql += " UNION ALL ";
 		}
@@ -191,7 +208,7 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 		       " AS key, CASE d._op WHEN 'I' THEN 'insert' WHEN 'U' THEN 'update' ELSE 'delete' END AS action, "
 		       "CASE WHEN d._op = 'I' THEN " +
 		       exists_clause + " WHEN d._op = 'U' THEN (NOT " + exists_clause + " OR " + drift_clause +
-		       ") ELSE " + drift_clause + " END AS conflict FROM " + internal_prefix + QM(delta_pair.first) + " d";
+		       ") ELSE " + drift_clause + " END AS conflict FROM " + delta_ref + " d";
 	}
 	if (sql.empty()) {
 		sql = "SELECT CAST(NULL AS VARCHAR) AS table_name, CAST(NULL AS VARCHAR) AS key, CAST(NULL AS VARCHAR) AS "
@@ -261,9 +278,15 @@ struct MergeRow {
 //! write a single attached database (no 2PC), so the lake apply runs
 //! atomically in its OWN transaction on a second connection (lake = sole
 //! writer, host deltas only read), after which the caller's transaction does
-//! the host bookkeeping. Requires autocommit; if the process dies between
-//! the two, the delta is still present and a re-merge surfaces the overlap
-//! as conflicts (documented).
+//! the host bookkeeping. Requires autocommit.
+//!
+//! If the host bookkeeping fails after the lake committed (crash, host
+//! write-write conflict), the delta and the registry are left unmerged. A
+//! keyless net insert never conflicts, so a plain re-merge would append its
+//! copies a second time. DuckLake bases therefore get the lake commit tagged
+//! (commit_extra_info) with the scenario's identity, a fingerprint of the
+//! delta, and the counts; a later merge that finds its tag in the lake's
+//! snapshots skips the lake apply and only finishes the host bookkeeping.
 void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioRegistryEntry &entry,
                           MergeConflictPolicy policy, idx_t &tables_changed, idx_t &rows_applied,
                           idx_t &conflicts_resolved) {
@@ -297,7 +320,57 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 
 	auto host_prefix = QM(host.GetName()) + ".";
 	auto internal_prefix = host_prefix + QM(ScenarioRegistry::SCHEMA_NAME) + ".";
-	for (auto &delta_pair : ListDeltaTables(context, host, entry.scenario_id)) {
+	auto delta_tables = ListDeltaTables(context, host, entry.scenario_id);
+	std::sort(delta_tables.begin(), delta_tables.end());
+
+	// merge tag (DuckLake only: other catalogs have no commit metadata).
+	// The fingerprint covers every delta row, so a delta written after a
+	// tagged apply is detected instead of being silently discarded.
+	bool tag_commit = base_catalog->GetCatalogType() == "ducklake";
+	string tag_prefix, fingerprint;
+	if (tag_commit) {
+		tag_prefix = "anofox_scenario.merge/v1 scenario=" + to_string(entry.scenario_id) +
+		             " created=" + to_string(Timestamp::GetEpochMicroSeconds(entry.created_at));
+		string parts;
+		for (auto &delta_pair : delta_tables) {
+			auto result = run("SELECT CAST(count(*) AS VARCHAR) || ':' || CAST(coalesce(sum(hash(d)), 0) AS VARCHAR) "
+			                  "FROM " + internal_prefix + QM(delta_pair.first) + " d");
+			parts += delta_pair.second + "=" + result->Fetch()->GetValue(0, 0).ToString() + ";";
+		}
+		fingerprint = run("SELECT md5(" + QML(parts) + ")")->Fetch()->GetValue(0, 0).ToString();
+		auto prior = run("SELECT snapshot_id, commit_extra_info FROM ducklake_snapshots(" +
+		                 QML(base_catalog->GetName()) + ") WHERE starts_with(commit_extra_info, " +
+		                 QML(tag_prefix + " ") + ") ORDER BY snapshot_id DESC LIMIT 1");
+		auto prior_chunk = prior->Fetch();
+		if (prior_chunk && prior_chunk->size() > 0) {
+			auto snapshot_id = prior_chunk->GetValue(0, 0).ToString();
+			auto info = prior_chunk->GetValue(1, 0).ToString();
+			// "<prefix> delta=<md5> tables_changed=<n> rows_applied=<n> conflicts_resolved=<n>"
+			auto fields = StringUtil::Split(info.substr(tag_prefix.size() + 1), ' ');
+			unordered_map<string, string> kv;
+			for (auto &field : fields) {
+				auto eq = field.find('=');
+				if (eq != string::npos) {
+					kv[field.substr(0, eq)] = field.substr(eq + 1);
+				}
+			}
+			con.Rollback();
+			if (kv["delta"] != fingerprint) {
+				throw InvalidInputException(
+				    "Cannot merge scenario '%s': it was already applied to base catalog '%s' (snapshot %s), but its "
+				    "delta changed since, after the merge's host bookkeeping failed. Inspect the lake and the scenario, "
+				    "then merge the remaining changes by hand",
+				    entry.name, entry.base_catalog, snapshot_id);
+			}
+			// already applied: report the original counts, finish the host side
+			tables_changed += std::stoull(kv["tables_changed"]);
+			rows_applied += std::stoull(kv["rows_applied"]);
+			conflicts_resolved += std::stoull(kv["conflicts_resolved"]);
+			return;
+		}
+	}
+
+	for (auto &delta_pair : delta_tables) {
 		auto &logical_name = delta_pair.second;
 		string schema_name, table_name;
 		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
@@ -329,8 +402,19 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 			// DuckLake rowid), positive nets insert copies. A deleted value
 			// whose lake count differs from its snapshot count drifted
 			// (3-way conflict, like a changed row under a touched key).
+			// legacy (pre-v0.4.1) deltas lack _count: one copy per row
+			auto delta_entry = ScenarioDelta::TryGetDeltaTable(context, host, entry.scenario_id, logical_name);
+			string count_expr = delta_entry && !ScenarioDelta::CountColumnName(*delta_entry).empty()
+			                        ? "d." + QM(ScenarioDelta::CountColumnName(*delta_entry))
+			                        : string("1");
+			// a user column named rowid shadows DuckLake's row-id pseudo
+			// column, so copies cannot be picked by rowid on such tables
+			bool rowid_shadowed = false;
 			string cols, b_cols, n_cols, match_b, match_m;
 			for (auto &col : base_entry->GetColumns().Logical()) {
+				if (StringUtil::CIEquals(col.Name(), "rowid")) {
+					rowid_shadowed = true;
+				}
 				auto name = QM(col.Name());
 				if (!cols.empty()) {
 					cols += ", ";
@@ -348,7 +432,7 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 			// per-value nets + lake/snapshot counts, captured before the lake
 			// is touched
 			run("CREATE OR REPLACE TEMP TABLE __anofox_merge_bag AS WITH net AS (SELECT " + payload_cols +
-			    ", CAST(sum(CASE WHEN d._op = 'I' THEN d._count ELSE -d._count END) AS BIGINT) AS __anofox_net FROM " + delta_ref +
+			    ", CAST(sum(CASE WHEN d._op = 'I' THEN " + count_expr + " ELSE -" + count_expr + " END) AS BIGINT) AS __anofox_net FROM " + delta_ref +
 			    " d GROUP BY ALL) SELECT " + n_cols + ", n.__anofox_net, CASE WHEN n.__anofox_net < 0 THEN (SELECT "
 			    "count(*) FROM " + base_ref + " b WHERE " + match_b + ") END AS __anofox_now, CASE WHEN "
 			    "n.__anofox_net < 0 THEN (SELECT count(*) FROM " + snapshot_ref + " WHERE " + match_m +
@@ -382,13 +466,40 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 				add_expr = "greatest(n.__anofox_net, 0)";
 			}
 			run("CREATE OR REPLACE TEMP TABLE __anofox_merge_bag_plan AS SELECT " + n_cols + ", " + del_expr +
-			    " AS __anofox_del, " + add_expr + " AS __anofox_add FROM __anofox_merge_bag n");
-			// delete exactly __anofox_del copies of each value (lowest rowids)
-			auto deleted = count_of(
-			    "DELETE FROM " + base_ref + " WHERE rowid IN (SELECT __anofox_rid FROM (SELECT b.rowid AS "
-			    "__anofox_rid, n.__anofox_del, row_number() OVER (PARTITION BY " + b_cols +
-			    " ORDER BY b.rowid) AS __anofox_rn FROM " + base_ref + " b JOIN __anofox_merge_bag_plan n ON " +
-			    match_b + " WHERE n.__anofox_del > 0) WHERE __anofox_rn <= __anofox_del)");
+			    " AS __anofox_del, " + add_expr + " AS __anofox_add, n.__anofox_now FROM __anofox_merge_bag n");
+			auto planned_del = count_of("SELECT coalesce(sum(n.__anofox_del), 0) FROM __anofox_merge_bag_plan n");
+			idx_t deleted = 0;
+			if (planned_del > 0 && !rowid_shadowed) {
+				// delete exactly __anofox_del copies of each value (lowest rowids)
+				deleted = count_of(
+				    "DELETE FROM " + base_ref + " WHERE rowid IN (SELECT __anofox_rid FROM (SELECT b.rowid AS "
+				    "__anofox_rid, n.__anofox_del, row_number() OVER (PARTITION BY " + b_cols +
+				    " ORDER BY b.rowid) AS __anofox_rn FROM " + base_ref + " b JOIN __anofox_merge_bag_plan n ON " +
+				    match_b + " WHERE n.__anofox_del > 0) WHERE __anofox_rn <= __anofox_del)");
+			} else if (planned_del > 0) {
+				// rowid is a user column: replace every copy of each affected
+				// value and re-add the copies that survive (copies of a value
+				// are indistinguishable, so the outcome is the same multiset)
+				auto expected = count_of("SELECT coalesce(sum(n.__anofox_now), 0) FROM __anofox_merge_bag_plan n "
+				                         "WHERE n.__anofox_del > 0");
+				auto removed = count_of("DELETE FROM " + base_ref + " b WHERE EXISTS (SELECT 1 FROM "
+				                        "__anofox_merge_bag_plan n WHERE n.__anofox_del > 0 AND " + match_b + ")");
+				if (removed != expected) {
+					con.Rollback();
+					throw InternalException("anofox_scenario: keyless merge of '%s' removed %llu copies, expected %llu",
+					                        logical_name, removed, expected);
+				}
+				count_of("INSERT INTO " + base_ref + " SELECT " + cols + " FROM (SELECT " + n_cols +
+				         ", unnest(range(n.__anofox_now - n.__anofox_del)) FROM __anofox_merge_bag_plan n WHERE "
+				         "n.__anofox_del > 0 AND n.__anofox_now > n.__anofox_del)");
+				deleted = planned_del;
+			}
+			if (deleted != planned_del) {
+				// never over- or under-delete a bag: roll the lake back
+				con.Rollback();
+				throw InternalException("anofox_scenario: keyless merge of '%s' deleted %llu copies, planned %llu",
+				                        logical_name, deleted, planned_del);
+			}
 			auto inserted = count_of("INSERT INTO " + base_ref + " SELECT " + cols + " FROM (SELECT " + n_cols +
 			                         ", unnest(range(n.__anofox_add)) FROM __anofox_merge_bag_plan n WHERE "
 			                         "n.__anofox_add > 0)");
@@ -471,6 +582,13 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 		if (inserted + deleted > 0) {
 			tables_changed++;
 		}
+	}
+	if (tag_commit) {
+		run("CALL " + QM(base_catalog->GetName()) + ".set_commit_message('anofox_scenario', " +
+		    QML("merge scenario '" + entry.name + "'") + ", extra_info => " +
+		    QML(tag_prefix + " delta=" + fingerprint + " tables_changed=" + to_string(tables_changed) +
+		        " rows_applied=" + to_string(rows_applied) + " conflicts_resolved=" + to_string(conflicts_resolved)) +
+		    ")");
 	}
 	con.Commit();
 }
@@ -878,6 +996,9 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			struct BagNet {
 				int64_t net = 0;
 				const vector<Value> *payload = nullptr;
+				vector<row_t> base_rows; // negative nets: every matching base copy
+				idx_t snap = 0;          // materialized: copies in the creation snapshot
+				idx_t add = 0;           // copies to append
 			};
 			unordered_map<string, BagNet> nets;
 			for (auto &row : rows) {
@@ -887,21 +1008,19 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 					net.payload = &row.payload;
 				}
 			}
-			// negative nets: collect up to |net| base rowids per value
-			unordered_map<string, idx_t> delete_budget;
+			bool any_negative = false;
 			for (auto &net_pair : nets) {
-				if (net_pair.second.net < 0) {
-					delete_budget[net_pair.first] = NumericCast<idx_t>(-net_pair.second.net);
-				}
+				any_negative = any_negative || net_pair.second.net < 0;
 			}
-			vector<row_t> base_rows_to_delete;
-			if (!delete_budget.empty()) {
+			auto column_count = base_entry->GetColumns().LogicalColumnCount();
+			if (any_negative) {
+				// negative nets: collect the base copies of each deleted value
 				vector<StorageIndex> base_cols;
 				vector<LogicalType> base_scan_types;
 				base_cols.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
 				base_scan_types.push_back(LogicalType::ROW_TYPE);
 				vector<idx_t> value_positions;
-				for (idx_t col = 0; col < base_entry->GetColumns().LogicalColumnCount(); col++) {
+				for (idx_t col = 0; col < column_count; col++) {
 					value_positions.push_back(base_cols.size());
 					base_cols.emplace_back(col);
 					base_scan_types.push_back(base_entry->GetColumn(LogicalIndex(col)).Type());
@@ -909,14 +1028,74 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				ScenarioDelta::ScanTableRows(context, base_duck, std::move(base_cols), base_scan_types,
 				                             [&](DataChunk &chunk, idx_t row) {
 					                             auto key = ScenarioDelta::MakeKey(chunk, row, value_positions);
-					                             auto budget = delete_budget.find(key);
-					                             if (budget != delete_budget.end() && budget->second > 0) {
-						                             budget->second--;
-						                             base_rows_to_delete.push_back(
+					                             auto net = nets.find(key);
+					                             if (net != nets.end() && net->second.net < 0) {
+						                             net->second.base_rows.push_back(
 						                                 chunk.GetValue(0, row).GetValue<row_t>());
 					                             }
 					                             return true;
 				                             });
+				// materialized: the creation snapshot's copy counts (3-way drift)
+				if (is_materialized) {
+					auto mat_entry = ScenarioDelta::TryGetMatTable(context, host, entry->scenario_id, logical_name);
+					if (mat_entry) {
+						vector<StorageIndex> mat_cols;
+						vector<LogicalType> mat_types;
+						vector<idx_t> mat_positions;
+						for (idx_t col = 0; col < column_count; col++) {
+							mat_positions.push_back(col);
+							mat_cols.emplace_back(col);
+							mat_types.push_back(base_entry->GetColumn(LogicalIndex(col)).Type());
+						}
+						ScenarioDelta::ScanTableRows(context, *mat_entry, std::move(mat_cols), mat_types,
+						                             [&](DataChunk &chunk, idx_t row) {
+							                             auto key = ScenarioDelta::MakeKey(chunk, row, mat_positions);
+							                             auto net = nets.find(key);
+							                             if (net != nets.end() && net->second.net < 0) {
+								                             net->second.snap++;
+							                             }
+							                             return true;
+						                             });
+					}
+				}
+			}
+			// per value: clean deletes apply the net; a drifted value (its base
+			// count differs from the snapshot's) conflicts - 'theirs' keeps the
+			// base copies, 'ours' sets the base to the scenario's count
+			vector<row_t> base_rows_to_delete;
+			for (auto &net_pair : nets) {
+				auto &net = net_pair.second;
+				if (net.net >= 0) {
+					net.add = NumericCast<idx_t>(net.net);
+					continue;
+				}
+				idx_t now = net.base_rows.size();
+				idx_t del = MinValue<idx_t>(NumericCast<idx_t>(-net.net), now);
+				if (is_materialized && now != net.snap) {
+					conflicts_resolved++;
+					if (bind_data.policy == MergeConflictPolicy::ABORT) {
+						string rendered;
+						for (auto &value : *net.payload) {
+							rendered += (rendered.empty() ? "" : ", ") + value.ToString();
+						}
+						throw ConstraintException(
+						    "Cannot merge scenario '%s': the base changed underneath it (e.g. the copies of row (%s) "
+						    "of keyless table '%s'). Rerun with on_conflict := 'ours' (scenario wins) or 'theirs' "
+						    "(base wins)",
+						    bind_data.name, rendered, logical_name);
+					}
+					if (bind_data.policy == MergeConflictPolicy::THEIRS) {
+						del = 0;
+					} else {
+						auto target_signed = static_cast<int64_t>(net.snap) + net.net;
+						idx_t target = target_signed > 0 ? NumericCast<idx_t>(target_signed) : 0;
+						del = now > target ? now - target : 0;
+						net.add = target > now ? target - now : 0;
+					}
+				}
+				for (idx_t i = 0; i < del; i++) {
+					base_rows_to_delete.push_back(net.base_rows[i]);
+				}
 			}
 			auto binder = Binder::CreateBinder(context);
 			auto base_constraints = binder->BindConstraints(base_duck);
@@ -952,7 +1131,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			};
 			idx_t inserted = 0;
 			for (auto &net_pair : nets) {
-				for (int64_t n = 0; n < net_pair.second.net; n++) {
+				for (idx_t n = 0; n < net_pair.second.add; n++) {
 					auto &payload = *net_pair.second.payload;
 					for (idx_t col = 0; col < payload.size(); col++) {
 						append_chunk.SetValue(col, count, payload[col]);

@@ -282,7 +282,7 @@ INSERT INTO s.orders VALUES (61, 'ro', 1.00, 'open');
 statement ok
 ROLLBACK;
 
-# zero-row writes too: the check runs at plan time, not at the first written row
+# zero-row writes too: the check runs when the sink initializes, not at the first written row
 statement ok
 BEGIN TRANSACTION READ ONLY;
 
@@ -294,8 +294,8 @@ UPDATE s.orders SET amount = 0 WHERE order_id = -1;
 statement ok
 ROLLBACK;
 
-# prepared statements re-plan per transaction, so the check follows the
-# transaction the statement executes in
+# the check runs at EXECUTE, so it follows the transaction the statement
+# executes in
 statement ok
 PREPARE zero_update AS UPDATE s.orders SET amount = 0 WHERE order_id = -1;
 

@@ -11,6 +11,10 @@
 #include "duckdb/planner/expression/bound_conjunction_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/filter/conjunction_filter.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/filter/in_filter.hpp"
+#include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -19,6 +23,133 @@
 namespace duckdb {
 
 namespace {
+
+//! Default for anofox_scenario_suppression_hash_limit
+constexpr idx_t DEFAULT_SUPPRESSION_HASH_LIMIT = 4194304;
+//! Point lookups (key = c, key IN (...)) resolve at most this many keys
+//! through the delta index; larger key sets scan the delta
+constexpr idx_t MAX_POINT_KEYS = STANDARD_VECTOR_SIZE;
+
+//! Open-addressing set of 64-bit key hashes. Built once at scan init, then
+//! read lock-free by every scan thread. A hit is only a candidate: callers
+//! confirm it exactly (hash collisions are possible, if rare).
+class KeyHashSet {
+public:
+	idx_t Count() const {
+		return count;
+	}
+	void Clear() {
+		slots = vector<hash_t>();
+		count = 0;
+		mask = 0;
+	}
+	void Insert(hash_t hash) {
+		hash = Normalize(hash);
+		if ((count + 1) * 2 > slots.size()) {
+			Grow();
+		}
+		auto pos = hash & mask;
+		while (slots[pos] != 0) {
+			if (slots[pos] == hash) {
+				return;
+			}
+			pos = (pos + 1) & mask;
+		}
+		slots[pos] = hash;
+		count++;
+	}
+	bool Contains(hash_t hash) const {
+		if (count == 0) {
+			return false;
+		}
+		hash = Normalize(hash);
+		auto pos = hash & mask;
+		while (slots[pos] != 0) {
+			if (slots[pos] == hash) {
+				return true;
+			}
+			pos = (pos + 1) & mask;
+		}
+		return false;
+	}
+
+private:
+	static hash_t Normalize(hash_t hash) {
+		return hash == 0 ? 1 : hash; // 0 marks an empty slot
+	}
+	void Grow() {
+		vector<hash_t> old_slots = std::move(slots);
+		slots.assign(old_slots.empty() ? 1024 : old_slots.size() * 2, 0);
+		mask = slots.size() - 1;
+		count = 0;
+		for (auto hash : old_slots) {
+			if (hash != 0) {
+				Insert(hash);
+			}
+		}
+	}
+
+	vector<hash_t> slots;
+	idx_t count = 0;
+	hash_t mask = 0;
+};
+
+//! Hash the key columns of `chunk` (cast to the delta's key types first, so
+//! base and delta spell equal keys identically) into a flat HASH vector
+void HashKeyColumns(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions,
+                    const vector<LogicalType> &key_types, Vector &hashes) {
+	auto count = chunk.size();
+	for (idx_t k = 0; k < key_positions.size(); k++) {
+		auto &source = chunk.data[key_positions[k]];
+		unique_ptr<Vector> cast;
+		reference<Vector> input(source);
+		if (source.GetType() != key_types[k]) {
+			cast = make_uniq<Vector>(key_types[k], count);
+			VectorOperations::Cast(context, source, *cast, count);
+			input = *cast;
+		}
+		if (k == 0) {
+			VectorOperations::Hash(input.get(), hashes, count);
+		} else {
+			VectorOperations::CombineHash(hashes, input.get(), count);
+		}
+	}
+	hashes.Flatten(count);
+}
+
+//! The values an equality-style pushed filter pins a column to: `= c`,
+//! `IN (...)`, or such a filter inside an AND / optional filter. False when
+//! the filter does not pin the column to a finite set.
+bool PointFilterValues(const TableFilter &filter, vector<Value> &values) {
+	switch (filter.filter_type) {
+	case TableFilterType::CONSTANT_COMPARISON: {
+		auto &constant = filter.Cast<ConstantFilter>();
+		if (constant.comparison_type != ExpressionType::COMPARE_EQUAL) {
+			return false;
+		}
+		values.push_back(constant.constant);
+		return true;
+	}
+	case TableFilterType::IN_FILTER:
+		values = filter.Cast<InFilter>().values;
+		return true;
+	case TableFilterType::CONJUNCTION_AND:
+		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
+			if (PointFilterValues(*child, values)) {
+				return true;
+			}
+		}
+		return false;
+	case TableFilterType::OPTIONAL_FILTER: {
+		// optional filters are re-checked above the scan, so narrowing the
+		// delta side to their values never changes the result
+		auto &optional = filter.Cast<OptionalFilter>();
+		return optional.child_filter && PointFilterValues(*optional.child_filter, values);
+	}
+	default:
+		return false;
+	}
+}
 
 struct ScenarioScanBindData : public TableFunctionData {
 	ScenarioScanBindData(ScenarioTableEntry &entry_p, TableCatalogEntry &base_entry_p,
@@ -92,19 +223,29 @@ struct ScenarioScanGlobalState : public GlobalTableFunctionState {
 	ColumnDataParallelScanState delta_parallel_state;
 	bool has_visible_delta = false;
 	unordered_set<string> suppressed_keys;
-	//! Keyed deltas with a PK index: base rows are suppressed by probing the
-	//! index per base chunk instead of materializing every U/D key (#36)
+	//! Keyed deltas with a PK index: base rows are suppressed through the
+	//! index instead of materializing every U/D key as a string (#36)
 	ScenarioDeltaIndexProbe suppress_probe;
 	bool probe_suppression = false;
+	//! Hashes of the U/D keys (#39 F10): base rows whose key hash misses are
+	//! kept without touching the index, so only true candidates are probed and
+	//! scan threads never serialize on the index lock. Off above
+	//! anofox_scenario_suppression_hash_limit keys: every row is probed then.
+	KeyHashSet suppress_hashes;
+	bool hash_prefilter = false;
+	vector<LogicalType> key_types;
 	//! Keyless bag mode: how many base copies of each value to suppress
 	//! (consumed while scanning - the scan runs single-threaded then)
 	unordered_map<string, idx_t> suppress_budget;
 	//! Next __scenario_rowno to hand out (delta rows take the first numbers
 	//! at init, base chunks reserve ranges while scanning)
 	atomic<int64_t> next_rowno {0};
-	//! Pushed filters on __scenario_rowno, over the output layout; applied to
-	//! emitted base chunks (the base scan never sees the synthesized column)
-	unique_ptr<Expression> rowno_filter;
+	//! Pushed filters evaluated on emitted base chunks over the output layout,
+	//! after suppression: filters on __scenario_rowno (the base scan never sees
+	//! the synthesized column) and, for keyless tables with a suppression
+	//! budget, filters on rowid (#39 F2: which copy the budget swallows must
+	//! not depend on a filter)
+	unique_ptr<Expression> post_filter;
 
 	idx_t max_threads = 1;
 	idx_t MaxThreads() const override {
@@ -121,8 +262,21 @@ struct ScenarioScanLocalState : public LocalTableFunctionState {
 	// delta side
 	ColumnDataLocalScanState delta_local_state;
 	bool delta_done = false;
-	unique_ptr<ExpressionExecutor> rowno_filter_executor;
+	unique_ptr<ExpressionExecutor> post_filter_executor;
 };
+
+void AddPostFilter(ScenarioScanGlobalState &state, const TableFilter &filter, const LogicalType &type, idx_t out_pos) {
+	auto column_ref = make_uniq<BoundReferenceExpression>(type, out_pos);
+	auto filter_expr = filter.ToExpression(*column_ref);
+	if (state.post_filter) {
+		auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+		conjunction->children.push_back(std::move(state.post_filter));
+		conjunction->children.push_back(std::move(filter_expr));
+		state.post_filter = std::move(conjunction);
+	} else {
+		state.post_filter = std::move(filter_expr);
+	}
+}
 
 unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<ScenarioScanBindData>();
@@ -172,6 +326,8 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 	// unremapped would filter the wrong storage column - so rebuild it keyed
 	// by scan position, and fold origin filters against the base-side
 	// constant (0) instead of pushing them into storage.
+	// keyless rowid filters wait until the suppression budget is known
+	vector<pair<idx_t, idx_t>> deferred_rowid_filters; // (output pos, scan pos)
 	if (input.filters) {
 		for (auto &filter_entry : input.filters->filters) {
 			auto out_pos = filter_entry.first;
@@ -182,16 +338,11 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			if (result->out_map[out_pos].is_rowno) {
 				// synthesized after the base scan: evaluated on the emitted
 				// output instead (the delta side applies every filter anyway)
-				auto column_ref = make_uniq<BoundReferenceExpression>(LogicalType::BIGINT, out_pos);
-				auto filter_expr = filter_entry.second->ToExpression(*column_ref);
-				if (result->rowno_filter) {
-					auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-					conjunction->children.push_back(std::move(result->rowno_filter));
-					conjunction->children.push_back(std::move(filter_expr));
-					result->rowno_filter = std::move(conjunction);
-				} else {
-					result->rowno_filter = std::move(filter_expr);
-				}
+				AddPostFilter(*result, *filter_entry.second, LogicalType::BIGINT, out_pos);
+				continue;
+			}
+			if (bind_data.keyless && has_delta && input.column_indexes[out_pos].IsRowIdColumn()) {
+				deferred_rowid_filters.emplace_back(out_pos, scan_pos);
 				continue;
 			}
 			if (scan_pos == DConstants::INVALID_INDEX) {
@@ -394,58 +545,165 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			}
 		};
 		if (!bind_data.keyless && result->suppress_probe.Initialize(context, delta_table, bind_data.pk_columns)) {
-			// Vectorized: emit the I/U rows chunk-wise; suppression is left to
-			// per-chunk index probes on the base side
-			bool has_replacements = false;
-			ScenarioDelta::ScanTableChunks(context, delta_table, std::move(delta_column_ids), delta_types,
-			                               [&](DataChunk &chunk) {
-				                               UnifiedVectorFormat op_format;
-				                               chunk.data[0].ToUnifiedFormat(chunk.size(), op_format);
-				                               auto op_data = UnifiedVectorFormat::GetData<string_t>(op_format);
-				                               SelectionVector sel(chunk.size());
-				                               idx_t kept = 0;
-				                               for (idx_t row = 0; row < chunk.size(); row++) {
-					                               auto op = op_data[op_format.sel->get_index(row)].GetData()[0];
-					                               if (op == 'U' || op == 'D') {
-						                               has_replacements = true;
-					                               }
-					                               if (op == 'I' || op == 'U') {
-						                               sel.set_index(kept++, row);
-					                               }
-				                               }
-				                               if (kept == 0) {
-					                               return;
-				                               }
-				                               DataChunk out_chunk;
-				                               out_chunk.InitializeEmpty(output_types);
-				                               for (idx_t out_idx = 0; out_idx < delta_pos_for_output.size(); out_idx++) {
-					                               auto pos = delta_pos_for_output[out_idx];
-					                               auto &target = out_chunk.data[out_idx];
-					                               if (pos == DELTA_OUT_NULL) {
-						                               target.Reference(Value(LogicalType::ROW_TYPE));
-					                               } else if (pos == DELTA_OUT_ORIGIN) {
-						                               target.Reference(Value::TINYINT(1));
-					                               } else if (pos == DELTA_OUT_ROWNO) {
-						                               target.Sequence(delta_rowno, 1, kept);
-						                               delta_rowno += NumericCast<int64_t>(kept);
-					                               } else {
-						                               target.Slice(chunk.data[pos], sel, kept);
-					                               }
-				                               }
-				                               out_chunk.SetCardinality(kept);
-				                               if (filter_executor) {
-					                               SelectionVector filter_sel(kept);
-					                               auto passed = filter_executor->SelectExpression(out_chunk, filter_sel);
-					                               if (passed == 0) {
-						                               return;
-					                               }
-					                               if (passed < kept) {
-						                               out_chunk.Slice(filter_sel, passed);
-					                               }
-				                               }
-				                               result->visible_delta->Append(out_chunk);
-			                               });
-			result->probe_suppression = has_replacements;
+			// Vectorized: emit the I/U rows chunk-wise; base rows are
+			// suppressed by U/D key hash (exact check through the index)
+			for (auto pos : delta_key_positions) {
+				result->key_types.push_back(delta_types[pos]);
+			}
+			auto emit_delta_chunk = [&](DataChunk &chunk) {
+				UnifiedVectorFormat op_format;
+				chunk.data[0].ToUnifiedFormat(chunk.size(), op_format);
+				auto op_data = UnifiedVectorFormat::GetData<string_t>(op_format);
+				SelectionVector sel(chunk.size());
+				idx_t kept = 0;
+				for (idx_t row = 0; row < chunk.size(); row++) {
+					auto op = op_data[op_format.sel->get_index(row)].GetData()[0];
+					if (op == 'I' || op == 'U') {
+						sel.set_index(kept++, row);
+					}
+				}
+				if (kept == 0) {
+					return;
+				}
+				DataChunk out_chunk;
+				out_chunk.InitializeEmpty(output_types);
+				for (idx_t out_idx = 0; out_idx < delta_pos_for_output.size(); out_idx++) {
+					auto pos = delta_pos_for_output[out_idx];
+					auto &target = out_chunk.data[out_idx];
+					if (pos == DELTA_OUT_NULL) {
+						target.Reference(Value(LogicalType::ROW_TYPE));
+					} else if (pos == DELTA_OUT_ORIGIN) {
+						target.Reference(Value::TINYINT(1));
+					} else if (pos == DELTA_OUT_ROWNO) {
+						target.Sequence(delta_rowno, 1, kept);
+						delta_rowno += NumericCast<int64_t>(kept);
+					} else {
+						target.Slice(chunk.data[pos], sel, kept);
+					}
+				}
+				out_chunk.SetCardinality(kept);
+				if (filter_executor) {
+					SelectionVector filter_sel(kept);
+					auto passed = filter_executor->SelectExpression(out_chunk, filter_sel);
+					if (passed == 0) {
+						return;
+					}
+					if (passed < kept) {
+						out_chunk.Slice(filter_sel, passed);
+					}
+				}
+				result->visible_delta->Append(out_chunk);
+			};
+
+			// #39 F11: a scan whose pushed filters pin every key column to a
+			// few values (key = c, key IN (...)) resolves just those keys
+			// through the delta index instead of scanning the whole delta
+			vector<vector<Value>> point_values(bind_data.pk_columns.size());
+			bool point_lookup = input.filters != nullptr;
+			idx_t point_key_count = 1;
+			for (idx_t k = 0; point_lookup && k < bind_data.pk_columns.size(); k++) {
+				for (auto &filter_entry : input.filters->filters) {
+					auto id = input.column_indexes[filter_entry.first].GetPrimaryIndex();
+					if (id != bind_data.pk_columns[k] && id != SCENARIO_KEY_COLUMN_START + k) {
+						continue;
+					}
+					vector<Value> values;
+					if (PointFilterValues(*filter_entry.second, values)) {
+						point_values[k] = std::move(values);
+						break;
+					}
+				}
+				point_key_count *= point_values[k].size();
+				point_lookup = !point_values[k].empty() && point_key_count <= MAX_POINT_KEYS;
+			}
+			DataChunk point_keys;
+			if (point_lookup) {
+				// the cross product of the pinned values, cast to the key types
+				point_keys.Initialize(Allocator::Get(context), result->key_types, point_key_count);
+				for (idx_t row = 0; point_lookup && row < point_key_count; row++) {
+					idx_t rest = row;
+					for (idx_t k = 0; k < point_values.size(); k++) {
+						auto &value = point_values[k][rest % point_values[k].size()];
+						rest /= point_values[k].size();
+						Value cast_value;
+						string error;
+						if (!value.DefaultTryCastAs(result->key_types[k], cast_value, &error)) {
+							point_lookup = false;
+							break;
+						}
+						point_keys.SetValue(k, row, cast_value);
+					}
+				}
+				point_keys.SetCardinality(point_key_count);
+			}
+			if (point_lookup) {
+				vector<idx_t> positions;
+				for (idx_t k = 0; k < result->key_types.size(); k++) {
+					positions.push_back(k);
+				}
+				vector<char> ops;
+				vector<row_t> row_ids;
+				result->suppress_probe.Lookup(context, point_keys, positions, ops, row_ids);
+				Vector hashes(LogicalType::HASH, point_key_count);
+				HashKeyColumns(context, point_keys, positions, result->key_types, hashes);
+				auto hash_data = FlatVector::GetData<hash_t>(hashes);
+				unordered_set<string> seen;
+				DataChunk fetched;
+				fetched.Initialize(Allocator::Get(context), delta_types);
+				for (idx_t row = 0; row < point_key_count; row++) {
+					if (ops[row] == '\0' || !seen.insert(ScenarioDelta::MakeKey(point_keys, row, positions)).second) {
+						continue; // no delta row, or a duplicate IN value
+					}
+					if (ops[row] == 'U' || ops[row] == 'D') {
+						result->suppress_hashes.Insert(hash_data[row]);
+					}
+					if (ops[row] == 'I' || ops[row] == 'U') {
+						result->suppress_probe.FetchRow(context, row_ids[row], delta_column_ids, fetched);
+						emit_delta_chunk(fetched);
+					}
+				}
+				result->hash_prefilter = result->probe_suppression = result->suppress_hashes.Count() > 0;
+			} else {
+				Value limit_setting;
+				idx_t hash_limit = DEFAULT_SUPPRESSION_HASH_LIMIT;
+				if (context.TryGetCurrentSetting("anofox_scenario_suppression_hash_limit", limit_setting) &&
+				    !limit_setting.IsNull()) {
+					hash_limit = UBigIntValue::Get(limit_setting.DefaultCastAs(LogicalType::UBIGINT));
+				}
+				bool has_replacements = false;
+				bool hashing = hash_limit > 0;
+				Vector hashes(LogicalType::HASH, STANDARD_VECTOR_SIZE);
+				ScenarioDelta::ScanTableChunks(
+				    context, delta_table, std::move(delta_column_ids), delta_types, [&](DataChunk &chunk) {
+					    UnifiedVectorFormat op_format;
+					    chunk.data[0].ToUnifiedFormat(chunk.size(), op_format);
+					    auto op_data = UnifiedVectorFormat::GetData<string_t>(op_format);
+					    bool hashed = false;
+					    for (idx_t row = 0; row < chunk.size(); row++) {
+						    auto op = op_data[op_format.sel->get_index(row)].GetData()[0];
+						    if (op != 'U' && op != 'D') {
+							    continue;
+						    }
+						    has_replacements = true;
+						    if (!hashing) {
+							    continue;
+						    }
+						    if (!hashed) {
+							    HashKeyColumns(context, chunk, delta_key_positions, result->key_types, hashes);
+							    hashed = true;
+						    }
+						    result->suppress_hashes.Insert(FlatVector::GetData<hash_t>(hashes)[row]);
+						    if (result->suppress_hashes.Count() > hash_limit) {
+							    // too many keys to hold: probe every base row instead
+							    hashing = false;
+							    result->suppress_hashes.Clear();
+						    }
+					    }
+					    emit_delta_chunk(chunk);
+				    });
+				result->probe_suppression = has_replacements;
+				result->hash_prefilter = has_replacements && hashing;
+			}
 		} else if (!bind_data.keyless) {
 			ScenarioDelta::ScanTableRows(
 			    context, delta_table, std::move(delta_column_ids), delta_types, [&](DataChunk &chunk, idx_t row) {
@@ -525,6 +783,17 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			result->max_threads = 1;
 		}
 	}
+	// keyless rowid filters: in storage only when no budget is consumed;
+	// otherwise after suppression, or a filter would pick which copy the
+	// budget swallows (#39 F2)
+	for (auto &deferred : deferred_rowid_filters) {
+		auto &filter = *input.filters->filters.at(deferred.first);
+		if (result->suppress_budget.empty()) {
+			result->base_filters.PushFilter(ColumnIndex(deferred.second), filter.Copy());
+		} else {
+			AddPostFilter(*result, filter, LogicalType::ROW_TYPE, deferred.first);
+		}
+	}
 	return std::move(result);
 }
 
@@ -546,8 +815,8 @@ unique_ptr<LocalTableFunctionState> ScenarioScanInitLocal(ExecutionContext &cont
 		result->scan_chunk.Initialize(Allocator::Get(context.client), gstate.scan_types);
 	}
 	result->delta_done = !gstate.has_visible_delta;
-	if (gstate.rowno_filter) {
-		result->rowno_filter_executor = make_uniq<ExpressionExecutor>(context.client, *gstate.rowno_filter);
+	if (gstate.post_filter) {
+		result->post_filter_executor = make_uniq<ExpressionExecutor>(context.client, *gstate.post_filter);
 	}
 	return std::move(result);
 }
@@ -634,12 +903,44 @@ bool EmitBaseChunk(ClientContext &context, ScenarioScanGlobalState &gstate, Scen
 		// a base row is hidden when the delta holds a U/D row for its key
 		vector<char> ops;
 		vector<row_t> row_ids;
-		gstate.suppress_probe.Lookup(context, scan_target, gstate.key_positions, ops, row_ids);
 		SelectionVector sel(count);
 		idx_t kept = 0;
-		for (idx_t i = 0; i < count; i++) {
-			if (ops[i] != 'U' && ops[i] != 'D') {
-				sel.set_index(kept++, i);
+		if (gstate.hash_prefilter) {
+			// only rows whose key hash is a U/D key hash can be suppressed;
+			// confirm those few through the index
+			Vector hashes(LogicalType::HASH, count);
+			HashKeyColumns(context, scan_target, gstate.key_positions, gstate.key_types, hashes);
+			auto hash_data = FlatVector::GetData<hash_t>(hashes);
+			SelectionVector hit_sel(count);
+			idx_t hits = 0;
+			for (idx_t i = 0; i < count; i++) {
+				if (gstate.suppress_hashes.Contains(hash_data[i])) {
+					hit_sel.set_index(hits++, i);
+				}
+			}
+			if (hits > 0) {
+				DataChunk hit_chunk;
+				hit_chunk.InitializeEmpty(scan_target.GetTypes());
+				hit_chunk.Slice(scan_target, hit_sel, hits);
+				gstate.suppress_probe.Lookup(context, hit_chunk, gstate.key_positions, ops, row_ids);
+				vector<bool> suppressed(count, false);
+				for (idx_t h = 0; h < hits; h++) {
+					suppressed[hit_sel.get_index(h)] = ops[h] == 'U' || ops[h] == 'D';
+				}
+				for (idx_t i = 0; i < count; i++) {
+					if (!suppressed[i]) {
+						sel.set_index(kept++, i);
+					}
+				}
+			} else {
+				kept = count;
+			}
+		} else {
+			gstate.suppress_probe.Lookup(context, scan_target, gstate.key_positions, ops, row_ids);
+			for (idx_t i = 0; i < count; i++) {
+				if (ops[i] != 'U' && ops[i] != 'D') {
+					sel.set_index(kept++, i);
+				}
 			}
 		}
 		if (kept == 0) {
@@ -698,16 +999,17 @@ bool EmitBaseChunk(ClientContext &context, ScenarioScanGlobalState &gstate, Scen
 			}
 		}
 		output.SetCardinality(count);
-		if (lstate.rowno_filter_executor) {
-			SelectionVector sel(count);
-			idx_t kept = lstate.rowno_filter_executor->SelectExpression(output, sel);
-			if (kept == 0) {
-				output.Reset();
-				return false;
-			}
-			if (kept < count) {
-				output.Slice(sel, kept);
-			}
+	}
+	if (lstate.post_filter_executor) {
+		// without a projection, output is the scan chunk itself
+		SelectionVector sel(count);
+		idx_t kept = lstate.post_filter_executor->SelectExpression(output, sel);
+		if (kept == 0) {
+			output.Reset();
+			return false;
+		}
+		if (kept < count) {
+			output.Slice(sel, kept);
 		}
 	}
 	return true;

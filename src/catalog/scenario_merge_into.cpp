@@ -9,9 +9,10 @@
 // matching visible copy is updated (D(old) + I(new)) or deleted (D(old)),
 // exactly like core on a plain table. The whole-row identity cannot tell two
 // identical copies apart from one copy the join emits twice (several source
-// rows match it), so the scan adds __scenario_rowno and the action sinks share
-// one touched-row set: a second touch of the same copy is rejected, like the
-// keyed path's double-touch check.
+// rows match it), so the scan adds __scenario_rowno. The action sinks share
+// one touched-row set (keys, or row numbers for keyless tables): a second
+// touch of a target row is rejected - unless both touches are DELETEs, which
+// delete it once, like core.
 //===----------------------------------------------------------------------===//
 
 #include "catalog/scenario_catalog.hpp"
@@ -53,17 +54,18 @@ unique_ptr<MergeIntoOperator> PlanScenarioMergeAction(ClientContext &context, Lo
 		result->op = &MakeScenarioUpdateOperator(planner, std::move(return_types), entry, std::move(action.columns),
 		                                         std::move(action.expressions), std::move(defaults),
 		                                         std::move(bound_constraints), cardinality, op.return_chunk,
-		                                         op.row_id_start, touched);
+		                                         op.row_id_start, touched, SCENARIO_MERGE_OPERATION);
 		break;
 	}
 	case MergeActionType::MERGE_DELETE: {
 		result->op = &MakeScenarioDeleteOperator(planner, std::move(return_types), entry, op.row_id_start, cardinality,
-		                                         op.return_chunk, touched);
+		                                         op.return_chunk, touched, SCENARIO_MERGE_OPERATION);
 		break;
 	}
 	case MergeActionType::MERGE_INSERT: {
 		result->op = &MakeScenarioInsertOperator(planner, std::move(return_types), entry,
-		                                         std::move(bound_constraints), cardinality, op.return_chunk);
+		                                         std::move(bound_constraints), cardinality, op.return_chunk,
+		                                         SCENARIO_MERGE_OPERATION);
 		// remap the insert expressions to the full column layout (defaults
 		// for unmentioned columns) - same transformation core performs
 		if (!action.column_index_map.empty()) {
@@ -97,7 +99,7 @@ unique_ptr<MergeIntoOperator> PlanScenarioMergeAction(ClientContext &context, Lo
 
 PhysicalOperator &ScenarioCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
                                                  LogicalMergeInto &op, PhysicalOperator &plan) {
-	ThrowIfNotWritable(context, "MERGE INTO");
+	// read-only/freeze checks run at execution (the action sinks' BeginWrite)
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
 	ThrowIfKeylessUnsupported(context, entry);
 	if (op.return_chunk && !entry.base_entry.IsDuckTable()) {
@@ -105,10 +107,9 @@ PhysicalOperator &ScenarioCatalog::PlanMergeInto(ClientContext &context, Physica
 		                              "not supported yet");
 	}
 
-	shared_ptr<ScenarioTouchedRows> touched;
-	if (entry.key_columns.empty()) {
-		touched = make_shared_ptr<ScenarioTouchedRows>();
-	}
+	// one touched-row set for all actions: a target row matched twice is
+	// rejected even when the matches pick different actions (UPDATE + DELETE)
+	auto touched = make_shared_ptr<ScenarioTouchedRows>();
 	map<MergeActionCondition, vector<unique_ptr<MergeIntoOperator>>> actions;
 	for (auto &action_entry : op.actions) {
 		vector<unique_ptr<MergeIntoOperator>> planned_actions;

@@ -1,0 +1,332 @@
+# name: test/sql/attach_scan_suppression.test
+# description: #39 merge-on-read base suppression - keyless rowid filters run after the bag budget (F2), point lookups resolve through the delta index (F11), and the U/D key hash prefilter agrees with the full index probe (F10)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# ---------------------------------------------------------------------------
+# F2: keyless bag suppression must run before a pushed rowid filter, so a
+# rowid point read sees exactly what a full scan shows
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE bag (a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO bag VALUES (1, 1), (1, 1), (1, 1), (2, 2);
+
+statement ok
+CALL scenario_create('bags');
+
+statement ok
+ATTACH 'bags' AS sb (TYPE scenario);
+
+statement ok
+DELETE FROM sb.bag WHERE rowid = 0;
+
+query III
+SELECT rowid, a, b FROM sb.bag ORDER BY rowid;
+----
+1	1	1
+2	1	1
+3	2	2
+
+# rowid 1 is visible in the full scan, so a rowid point delete removes it
+query I
+DELETE FROM sb.bag WHERE rowid = 1;
+----
+1
+
+query III
+SELECT rowid, a, b FROM sb.bag ORDER BY rowid;
+----
+2	1	1
+3	2	2
+
+query I
+SELECT count(*) FROM sb.bag WHERE rowid = 2;
+----
+1
+
+query III
+SELECT rowid, a, b FROM sb.bag WHERE rowid = 2;
+----
+2	1	1
+
+# a suppressed copy never shows up through a rowid filter
+query I
+SELECT count(*) FROM sb.bag WHERE rowid IN (0, 1);
+----
+0
+
+# rowid filters arriving through a join (dynamic filter pushdown)
+query III
+SELECT t.rowid, t.a, t.b FROM sb.bag t JOIN (VALUES (2::BIGINT), (3::BIGINT)) v(r) ON t.rowid = v.r ORDER BY ALL;
+----
+2	1	1
+3	2	2
+
+statement ok
+DETACH sb;
+
+statement ok
+CALL scenario_drop('bags');
+
+# ---------------------------------------------------------------------------
+# F11: point lookups on the key read the delta through its PK index; every
+# op state must come out exactly as the full merge-on-read scan shows it
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE item (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO item SELECT i, i * 10 FROM range(1, 11) t(i);
+
+statement ok
+CALL scenario_create('points');
+
+statement ok
+ATTACH 'points' AS sp (TYPE scenario);
+
+statement ok
+UPDATE sp.item SET qty = -2 WHERE id = 2;
+
+statement ok
+DELETE FROM sp.item WHERE id = 3;
+
+statement ok
+INSERT INTO sp.item VALUES (11, 110);
+
+statement ok
+DELETE FROM sp.item WHERE id = 4;
+
+statement ok
+INSERT INTO sp.item VALUES (4, -4);
+
+# untouched, U, D, I, D->U
+query II
+SELECT id, qty FROM sp.item WHERE id = 1;
+----
+1	10
+
+query II
+SELECT id, qty FROM sp.item WHERE id = 2;
+----
+2	-2
+
+query I
+SELECT count(*) FROM sp.item WHERE id = 3;
+----
+0
+
+query II
+SELECT id, qty FROM sp.item WHERE id = 11;
+----
+11	110
+
+query II
+SELECT id, qty FROM sp.item WHERE id = 4;
+----
+4	-4
+
+# a key absent from both sides
+query I
+SELECT count(*) FROM sp.item WHERE id = 42;
+----
+0
+
+# IN lists and extra non-key predicates
+query II
+SELECT id, qty FROM sp.item WHERE id IN (1, 2, 3, 4, 11, 42) ORDER BY id;
+----
+1	10
+2	-2
+4	-4
+11	110
+
+query II
+SELECT id, qty FROM sp.item WHERE id = 2 AND qty < 0;
+----
+2	-2
+
+query I
+SELECT count(*) FROM sp.item WHERE id = 2 AND qty > 0;
+----
+0
+
+# point DML goes through the same path
+statement ok
+UPDATE sp.item SET qty = qty + 100 WHERE id = 2;
+
+statement ok
+UPDATE sp.item SET qty = qty + 100 WHERE id = 11;
+
+statement ok
+DELETE FROM sp.item WHERE id = 5;
+
+query II
+SELECT id, qty FROM sp.item ORDER BY id;
+----
+1	10
+2	98
+4	-4
+6	60
+7	70
+8	80
+9	90
+10	100
+11	210
+
+# transaction-local delta rows are found by point lookups too
+statement ok
+BEGIN;
+
+statement ok
+UPDATE sp.item SET qty = 7 WHERE id = 7;
+
+statement ok
+DELETE FROM sp.item WHERE id = 8;
+
+query II
+SELECT id, qty FROM sp.item WHERE id = 7;
+----
+7	7
+
+query I
+SELECT count(*) FROM sp.item WHERE id = 8;
+----
+0
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT id, qty FROM sp.item WHERE id IN (7, 8) ORDER BY id;
+----
+7	70
+8	80
+
+statement ok
+DETACH sp;
+
+statement ok
+CALL scenario_drop('points');
+
+# composite VARCHAR/INTEGER keys
+statement ok
+CREATE TABLE stock (region VARCHAR, sku INTEGER, qty INTEGER, PRIMARY KEY (region, sku));
+
+statement ok
+INSERT INTO stock SELECT r, s, s FROM (VALUES ('EU'), ('US')) t(r), range(1, 4) u(s);
+
+statement ok
+CALL scenario_create('composite');
+
+statement ok
+ATTACH 'composite' AS sc (TYPE scenario);
+
+statement ok
+UPDATE sc.stock SET qty = 0 WHERE region = 'EU' AND sku = 2;
+
+statement ok
+DELETE FROM sc.stock WHERE region = 'US' AND sku = 1;
+
+query TII
+SELECT * FROM sc.stock WHERE region = 'EU' AND sku = 2;
+----
+EU	2	0
+
+query I
+SELECT count(*) FROM sc.stock WHERE region = 'US' AND sku = 1;
+----
+0
+
+query TII
+SELECT * FROM sc.stock WHERE region = 'US' AND sku = 2;
+----
+US	2	2
+
+# only part of the key fixed: still the merged view
+query TII
+SELECT * FROM sc.stock WHERE sku = 2 ORDER BY ALL;
+----
+EU	2	0
+US	2	2
+
+statement ok
+DETACH sc;
+
+statement ok
+CALL scenario_drop('composite');
+
+# ---------------------------------------------------------------------------
+# F10: base rows are matched against an in-memory hash set of the U/D keys
+# (exact check through the delta index only on hash hits). Above the
+# configured limit the scan probes the index per base row instead; both
+# strategies must give the same merged relation.
+# ---------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE big (k VARCHAR, n INTEGER, qty BIGINT NOT NULL, PRIMARY KEY (k, n));
+
+statement ok
+INSERT INTO big SELECT 'k' || (i % 7), i, i FROM range(200000) t(i);
+
+statement ok
+CALL scenario_create('hashing');
+
+statement ok
+ATTACH 'hashing' AS sh (TYPE scenario);
+
+statement ok
+UPDATE sh.big SET qty = -qty WHERE n % 1000 = 0;
+
+statement ok
+DELETE FROM sh.big WHERE n % 1000 = 1;
+
+statement ok
+DELETE FROM sh.big WHERE n % 1000 = 2;
+
+statement ok
+INSERT INTO sh.big SELECT k, n, 7 FROM big WHERE n % 1000 = 2;
+
+statement ok
+INSERT INTO sh.big VALUES ('new', 1, 1);
+
+statement ok
+SET threads = 8;
+
+query III
+SELECT count(*), sum(qty), count(DISTINCT (k, n)) FROM sh.big;
+----
+199801	19920300801	199801
+
+statement ok
+SET anofox_scenario_suppression_hash_limit = 0;
+
+query III
+SELECT count(*), sum(qty), count(DISTINCT (k, n)) FROM sh.big;
+----
+199801	19920300801	199801
+
+statement ok
+SET anofox_scenario_suppression_hash_limit = 10;
+
+query III
+SELECT count(*), sum(qty), count(DISTINCT (k, n)) FROM sh.big;
+----
+199801	19920300801	199801
+
+statement ok
+RESET anofox_scenario_suppression_hash_limit;
+
+statement error
+SET anofox_scenario_suppression_hash_limit = -1;
+----
+
+statement ok
+DETACH sh;
+
+statement ok
+CALL scenario_drop('hashing');

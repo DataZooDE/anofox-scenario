@@ -8,6 +8,8 @@
 #include "duckdb/common/types/constraint_conflict_info.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/index/art/art.hpp"
+#include "duckdb/execution/index/art/art_operator.hpp"
+#include "duckdb/execution/index/art/iterator.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -19,6 +21,7 @@
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -31,12 +34,43 @@ constexpr idx_t ScenarioDelta::PAYLOAD_START;
 constexpr const char *ScenarioDelta::COUNT_COLUMN;
 
 optional_idx ScenarioDelta::CountColumnIndex(const TableCatalogEntry &delta_table) {
+	if (delta_table.HasPrimaryKey()) {
+		return optional_idx();
+	}
 	auto &columns = delta_table.GetColumns();
 	auto count = columns.LogicalColumnCount();
-	if (count > PAYLOAD_START && columns.GetColumn(LogicalIndex(count - 1)).Name() == COUNT_COLUMN) {
-		return optional_idx(count - 1);
+	if (count <= PAYLOAD_START + 1) {
+		return optional_idx();
+	}
+	auto last = count - 1;
+	if (columns.GetColumn(LogicalIndex(last)).Type() != LogicalType::BIGINT) {
+		return optional_idx();
+	}
+	// the structural marker: only the multiplicity column of a bag delta
+	// carries NOT NULL besides _op/_ts
+	for (auto &constraint : delta_table.GetConstraints()) {
+		if (constraint->type == ConstraintType::NOT_NULL &&
+		    constraint->Cast<NotNullConstraint>().index.index == last) {
+			return optional_idx(last);
+		}
 	}
 	return optional_idx();
+}
+
+string ScenarioDelta::CountColumnName(const TableCatalogEntry &delta_table) {
+	auto index = CountColumnIndex(delta_table);
+	if (!index.IsValid()) {
+		return string();
+	}
+	return delta_table.GetColumn(LogicalIndex(index.GetIndex())).Name();
+}
+
+string ScenarioDelta::NewCountColumnName(const ColumnList &payload_columns) {
+	string name = COUNT_COLUMN;
+	while (payload_columns.ColumnExists(name)) {
+		name = "_" + name;
+	}
+	return name;
 }
 
 static optional_ptr<DuckTableEntry> TryGetInternalTable(ClientContext &context, Catalog &host_catalog,
@@ -98,7 +132,8 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 			old_types.push_back(col.Type());
 		}
 		auto count_index = info->columns.LogicalColumnCount();
-		info->columns.AddColumn(ColumnDefinition(COUNT_COLUMN, LogicalType::BIGINT));
+		auto count_name = NewCountColumnName(info->columns);
+		info->columns.AddColumn(ColumnDefinition(count_name, LogicalType::BIGINT));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(OP_COL)));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TS_COL)));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(count_index)));
@@ -164,23 +199,50 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 	return legacy_names.size();
 }
 
-bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog,
-                                                  int64_t scenario_id) {
+bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                                  bool read_only_attach) {
 	if (!HasLegacyKeylessDeltas(context, host_catalog, scenario_id)) {
 		return true;
 	}
+	// Every skip below is safe: readers handle the legacy layout as
+	// _count = 1, and the next ATTACH that is allowed to write upgrades.
+	if (read_only_attach) {
+		return false; // READ_ONLY promises not to write the host
+	}
 	auto &host_db = host_catalog.GetAttached();
 	auto &meta = MetaTransaction::Get(context);
-	auto modified = meta.ModifiedDatabase();
-	if (host_db.IsReadOnly() || meta.IsReadOnly() || (modified && modified.get() != &host_db)) {
-		// not writable here: readers cope with the legacy layout, and the
-		// next ATTACH from a writable transaction upgrades
+	if (host_db.IsReadOnly() || meta.IsReadOnly()) {
 		return false;
+	}
+	auto modified = meta.ModifiedDatabase();
+	if (modified ? modified.get() != &host_db : !context.transaction.IsAutoCommit()) {
+		// inside an explicit transaction the upgrade would make the host the
+		// transaction's single writer behind the user's back (and block a
+		// later write to another database); only ride along when the
+		// transaction already writes the host
+		return false;
+	}
+	// another, older transaction on the host may hold uncommitted writes to
+	// the legacy delta: dropping it now would fail that transaction's commit
+	auto &transaction_manager = host_db.GetTransactionManager();
+	if (transaction_manager.IsDuckTransactionManager()) {
+		auto &duck_manager = DuckTransactionManager::Get(host_db);
+		auto &transaction = DuckTransaction::Get(context, host_db);
+		if (duck_manager.LowestActiveStart() < transaction.start_time) {
+			return false;
+		}
 	}
 	meta.ModifyDatabase(host_db, DatabaseModificationType::DROP_CATALOG_ENTRY |
 	                                 DatabaseModificationType::CREATE_CATALOG_ENTRY |
 	                                 DatabaseModificationType::INSERT_DATA);
-	UpgradeLegacyKeylessDeltas(context, host_catalog, scenario_id);
+	try {
+		UpgradeLegacyKeylessDeltas(context, host_catalog, scenario_id);
+	} catch (TransactionException &) {
+		// a catalog conflict with a concurrent transaction: keep the legacy
+		// layout rather than fail the ATTACH (each table's swap is
+		// self-contained, so tables upgraded before the conflict stay valid)
+		return false;
+	}
 	return true;
 }
 
@@ -339,8 +401,11 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 
 	DataChunk scan_chunk;
 	scan_chunk.Initialize(Allocator::Get(context), from_types);
+	// a legacy keyless delta into a bag delta: append each row with _count = 1
+	bool fill_count = target_column_offset == 0 && to_types.size() == from_types.size() + 1 &&
+	                  IsLegacyKeylessDelta(from_table) && CountColumnIndex(to_table).IsValid();
 	DataChunk append_chunk;
-	if (target_column_offset > 0) {
+	if (target_column_offset > 0 || fill_count) {
 		append_chunk.Initialize(Allocator::Get(context), to_types);
 	}
 	while (from_storage.NextParallelScan(context, parallel_state, state) > 0) {
@@ -350,7 +415,15 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 			if (scan_chunk.size() == 0) {
 				break;
 			}
-			if (target_column_offset == 0) {
+			if (fill_count) {
+				append_chunk.Reset();
+				for (idx_t col = 0; col < from_types.size(); col++) {
+					append_chunk.data[col].Reference(scan_chunk.data[col]);
+				}
+				append_chunk.data[from_types.size()].Reference(Value::BIGINT(1));
+				append_chunk.SetCardinality(scan_chunk.size());
+				to_storage.LocalAppend(to_table, context, append_chunk, to_constraints);
+			} else if (target_column_offset == 0) {
 				to_storage.LocalAppend(to_table, context, scan_chunk, to_constraints);
 			} else {
 				append_chunk.Reset();
@@ -409,7 +482,10 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 		// rows carry a multiplicity instead and readers aggregate. Secondary
 		// UNIQUE constraints are not mirrored here (D rows carry real
 		// payloads and would collide with their replacements).
-		info->columns.AddColumn(ColumnDefinition(COUNT_COLUMN, LogicalType::BIGINT));
+		// (named _count unless a base column already is - readers find it
+		// by position and its NOT NULL, see CountColumnIndex)
+		info->columns.AddColumn(
+		    ColumnDefinition(NewCountColumnName(base_entry.GetColumns()), LogicalType::BIGINT));
 		info->constraints.push_back(
 		    make_uniq<NotNullConstraint>(LogicalIndex(PAYLOAD_START + base_entry.GetColumns().LogicalColumnCount())));
 	} else {
@@ -579,6 +655,55 @@ bool ScenarioDeltaIndexProbe::Initialize(ClientContext &context, DuckTableEntry 
 	return false;
 }
 
+namespace {
+
+//! Every row id stored under `key` in one ART (a unique index can briefly hold
+//! two: a row deleted by a running transaction plus its replacement; the
+//! deleted_rows_in_use / checkpoint delta ARTs are not unique at all)
+void CollectARTRowIds(ART &art, const ARTKey &key, vector<row_t> &result) {
+	if (key.Empty() || !art.tree.HasMetadata()) {
+		return;
+	}
+	auto leaf = ARTOperator::Lookup(art, art.tree, key, 0);
+	if (!leaf) {
+		return;
+	}
+	if (leaf->GetType() == NType::LEAF_INLINED) {
+		result.push_back(leaf->GetRowId());
+		return;
+	}
+	// a nested leaf (gate): iterate its row ids, exactly as ART::SearchEqual
+	set<row_t> row_ids;
+	Iterator it(art);
+	it.FindMinimum(*leaf);
+	ARTKey empty_key;
+	RowIdSetOutput output(row_ids, NumericLimits<idx_t>::Maximum());
+	it.Scan(empty_key, output, false);
+	result.insert(result.end(), row_ids.begin(), row_ids.end());
+}
+
+//! Look the probe chunk's keys up in `art` (row i -> candidates[i])
+void CollectCandidates(ClientContext &context, ART &art, DataChunk &probe, vector<vector<row_t>> &candidates) {
+	DataChunk expr_chunk;
+	expr_chunk.Initialize(Allocator::Get(context), art.logical_types, probe.size());
+	art.ExecuteExpressions(probe, expr_chunk);
+	ArenaAllocator arena(Allocator::Get(context));
+	unsafe_vector<ARTKey> keys(probe.size());
+	art.GenerateKeys<>(arena, expr_chunk, keys);
+	for (idx_t i = 0; i < probe.size(); i++) {
+		CollectARTRowIds(art, keys[i], candidates[i]);
+	}
+}
+
+ART &CheckedART(BoundIndex &index) {
+	if (index.GetIndexType() != ART::TYPE_NAME) {
+		throw InternalException("anofox_scenario: concurrent changes made to a non-ART delta index");
+	}
+	return index.Cast<ART>();
+}
+
+} // namespace
+
 void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions,
                                      vector<char> &ops, vector<row_t> &row_ids) {
 	D_ASSERT(delta_table);
@@ -592,8 +717,7 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 	auto &storage = delta_table->GetStorage();
 	auto types = storage.GetTypes();
 	// The probe chunk is in delta layout: key columns hold the keys, every
-	// other column is NULL (unique indexes ignore NULLs, so the delta's
-	// secondary UNIQUE indexes stay silent)
+	// other column is NULL (the key index expressions only read the keys)
 	DataChunk probe;
 	probe.InitializeEmpty(types);
 	for (idx_t col = 0; col < types.size(); col++) {
@@ -617,37 +741,47 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 	auto local = local_storage.GetStorage(storage);
 	ConflictInfo conflict_info(key_ids);
 	vector<StorageIndex> op_column {StorageIndex(ScenarioDelta::OP_COL)};
-	auto collect = [&](bool global) {
-		ConflictManager manager(VerifyExistenceType::APPEND, count, &conflict_info);
-		if (global) {
-			storage.VerifyUniqueIndexes(storage.GetDataTableInfo()->GetIndexes(), local, probe, &manager);
-		} else {
-			storage.VerifyUniqueIndexes(local->append_indexes, local, probe, &manager);
+
+	// Read-only lookups of every key in the key index, mirroring core's index
+	// scan (TableScanFunction): besides the main ART, a committed row id can
+	// live in deleted_rows_in_use (deleted while older transactions still see
+	// it) or added_data_during_checkpoint (appended during a checkpoint). An
+	// older snapshot's visible delta row is often only found there.
+	auto collect = [&](TableIndexList &indexes, bool global) {
+		vector<vector<row_t>> candidates(count);
+		bool found = false;
+		for (auto &entry : indexes.IndexEntries()) {
+			auto &index = *entry.index;
+			if (!index.IsBound() || !index.IsUnique() || index.GetIndexType() != ART::TYPE_NAME ||
+			    !conflict_info.ConflictTargetMatches(index)) {
+				continue;
+			}
+			lock_guard<mutex> guard(entry.lock);
+			CollectCandidates(context, index.Cast<ART>(), probe, candidates);
+			if (entry.deleted_rows_in_use) {
+				CollectCandidates(context, CheckedART(*entry.deleted_rows_in_use), probe, candidates);
+			}
+			if (entry.added_data_during_checkpoint) {
+				CollectCandidates(context, CheckedART(*entry.added_data_during_checkpoint), probe, candidates);
+			}
+			found = true;
+			break;
 		}
-		if (!manager.HasConflicts()) {
+		if (!found) {
 			return;
 		}
-		if (global) {
-			manager.FinalizeGlobal(transaction, storage);
-		} else {
-			manager.FinalizeLocal(storage, local_storage);
-		}
-		auto conflict_count = manager.ConflictCount();
-		if (conflict_count == 0) {
-			return;
-		}
-		// Finalize prefers a visible second hit, but a lone hit may still name
-		// a row this transaction cannot see: keep only the visible ones
-		auto &inverted_sel = manager.GetInvertedSel();
-		auto hit_ids = FlatVector::GetData<row_t>(manager.GetRowIds());
-		Vector visible_ids(LogicalType::ROW_TYPE, conflict_count);
+		// Keep the one candidate this transaction can see (the key is a PK:
+		// at most one delta row per key is visible to any snapshot)
+		Vector visible_ids(LogicalType::ROW_TYPE, count);
 		auto visible_data = FlatVector::GetData<row_t>(visible_ids);
 		vector<idx_t> visible_rows;
-		for (idx_t i = 0; i < conflict_count; i++) {
-			auto row_id = hit_ids[i];
-			if (global ? storage.CanFetch(transaction, row_id) : local_storage.CanFetch(storage, row_id)) {
-				visible_data[visible_rows.size()] = row_id;
-				visible_rows.push_back(inverted_sel.get_index(i));
+		for (idx_t i = 0; i < count; i++) {
+			for (auto row_id : candidates[i]) {
+				if (global ? storage.CanFetch(transaction, row_id) : local_storage.CanFetch(storage, row_id)) {
+					visible_data[visible_rows.size()] = row_id;
+					visible_rows.push_back(i);
+					break;
+				}
 			}
 		}
 		if (visible_rows.empty()) {
@@ -670,9 +804,26 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 			row_ids[visible_rows[i]] = visible_data[i];
 		}
 	};
-	collect(true);
+	collect(storage.GetDataTableInfo()->GetIndexes(), true);
 	if (local) {
-		collect(false);
+		// the transaction's own appends; they supersede any committed hit
+		collect(local->append_indexes, false);
+	}
+}
+
+void ScenarioDeltaIndexProbe::FetchRow(ClientContext &context, row_t row_id, const vector<StorageIndex> &column_ids,
+                                       DataChunk &result) {
+	D_ASSERT(delta_table);
+	auto &storage = delta_table->GetStorage();
+	auto &transaction = DuckTransaction::Get(context, delta_table->catalog);
+	Vector row_ids(Value::BIGINT(row_id));
+	row_ids.Flatten(1);
+	ColumnFetchState fetch_state;
+	result.Reset();
+	if (row_id >= MAX_ROW_ID) {
+		LocalStorage::Get(transaction).FetchChunk(storage, row_ids, 1, column_ids, result, fetch_state);
+	} else {
+		storage.Fetch(transaction, result, column_ids, row_ids, 1, fetch_state);
 	}
 }
 

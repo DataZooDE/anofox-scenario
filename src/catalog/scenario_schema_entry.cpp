@@ -71,11 +71,10 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	auto qualified = QualifiedName(table_name);
 	// Two entries per table and transaction: the binder's (LookupEntry,
 	// temporary-flagged, see ScenarioTableEntry) and the enumeration one
-	// (Scan, a plain base table for introspection). The enumeration entry is
-	// cached under a key no logical name can produce (leading \x01).
-	auto cache_key = for_binding ? qualified : string(1, '\x01') + qualified;
+	// (Scan, a plain base table for introspection), cached in separate maps.
+	bool enumeration = !for_binding;
 
-	auto cached = transaction.FindEntry(cache_key);
+	auto cached = transaction.FindEntry(qualified, enumeration);
 	if (cached) {
 		return *cached;
 	}
@@ -91,7 +90,7 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table, for_binding);
 	entry->key_columns = ScenarioDelta::GetKeyColumns(context, scenario_catalog.GetHostCatalog(context),
 	                                                  scenario_catalog.scenario_id, qualified, base_table);
-	return transaction.PublishEntry(cache_key, std::move(entry));
+	return transaction.PublishEntry(qualified, std::move(entry), enumeration);
 }
 
 void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,

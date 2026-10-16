@@ -19,6 +19,7 @@
 namespace duckdb {
 
 class Catalog;
+class ColumnList;
 class ClientContext;
 class DuckTableEntry;
 class TableCatalogEntry;
@@ -34,12 +35,26 @@ public:
 	static constexpr idx_t PAYLOAD_START = 2;
 	static constexpr const char *COUNT_COLUMN = "_count";
 
-	//! Position of the trailing _count column, if this delta has one
+	//! Position of the trailing multiplicity column, if this delta has one.
+	//! Detected structurally, never by name: a bag delta has no PRIMARY KEY
+	//! and ends in a BIGINT column carrying a NOT NULL constraint. Payload
+	//! columns never carry NOT NULL in a delta (base constraints are not
+	//! mirrored), so a user column that happens to be named _count - or a
+	//! pre-v0.4.1 delta whose last payload column is - is never mistaken for
+	//! the multiplicity. Every reader goes through this helper.
 	static optional_idx CountColumnIndex(const TableCatalogEntry &delta_table);
+	//! Name of the multiplicity column (normally _count), or empty when the
+	//! delta has none; for SQL that addresses it by name
+	static string CountColumnName(const TableCatalogEntry &delta_table);
+	//! Name for a new multiplicity column over the given payload columns:
+	//! _count, prefixed with further underscores while a payload column
+	//! already uses the name (a keyless base table with its own _count)
+	static string NewCountColumnName(const ColumnList &payload_columns);
 
 	//! A keyless delta written before v0.4.1: no PRIMARY KEY and no trailing
-	//! _count. Such deltas only ever held 'I' rows (keyless UPDATE/DELETE was
-	//! gated), so readers treat them as an implicit _count of 1.
+	//! multiplicity column. Such deltas only ever held 'I' rows (keyless
+	//! UPDATE/DELETE was gated), so readers treat them as an implicit _count
+	//! of 1.
 	static bool IsLegacyKeylessDelta(const TableCatalogEntry &delta_table);
 	//! True when the scenario owns at least one legacy keyless delta
 	static bool HasLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
@@ -48,11 +63,16 @@ public:
 	//! UNIQUE indexes dropped), in the caller's transaction. The caller must
 	//! have registered the host write. Returns the number of upgraded tables.
 	static idx_t UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
-	//! Upgrade at a hook that may or may not be able to write the host
-	//! (ATTACH): registers the host write and upgrades only when that is
-	//! legal - writable host, read-write transaction, and no other database
-	//! already written in it. Returns false when legacy deltas remain.
-	static bool TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+	//! Upgrade at ATTACH, opportunistically: registers the host write and
+	//! upgrades only when that is safe - a writable host, an attach that is
+	//! not READ_ONLY, an autocommit statement (or a transaction that already
+	//! writes the host), no older transaction active on the host that might
+	//! hold uncommitted writes to the legacy delta, and no catalog conflict.
+	//! Otherwise the legacy layout stays (readers handle it as _count = 1)
+	//! and ATTACH never fails on its account. Returns false when legacy
+	//! deltas remain.
+	static bool TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                                          bool read_only_attach);
 
 	static string DeltaTableName(int64_t scenario_id, const string &table_name);
 	//! Materialized base copy: __anofox_scenario.s<id>_mat_<table> (Phase 2)
@@ -86,7 +106,10 @@ public:
 	static DuckTableEntry &CreateMatTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
 	                                      TableCatalogEntry &base_entry, const string *logical_name_override = nullptr);
 	//! Vectorized row copy between two tables with identical column layout
-	//! (offset maps source column i -> target column i + offset)
+	//! (offset maps source column i -> target column i + offset). A legacy
+	//! keyless delta copied into a bag delta (branching from a scenario that
+	//! was never upgraded) gets a multiplicity of 1 per row, leaving the
+	//! source untouched.
 	static void CopyTableData(ClientContext &context, DuckTableEntry &from_table, DuckTableEntry &to_table,
 	                          idx_t target_column_offset = 0);
 
@@ -115,10 +138,13 @@ public:
 
 //! Point lookups of keys in a keyed delta through its PRIMARY KEY index, so
 //! a statement touching a few rows does not pay for the whole delta (#36).
-//! Uses the two-phase lookup of core's INSERT ... ON CONFLICT: the committed
-//! index, then the transaction's own appends; hits on rows the transaction
-//! cannot see (deleted by it, or by a committed transaction) are dropped.
-//! Lookup is thread-safe for concurrent readers once initialized.
+//! Two phases: the committed key index - its main ART plus the
+//! deleted_rows_in_use / added_data_during_checkpoint ARTs, as core's index
+//! scan does - then the transaction's own appends. Hits on rows the
+//! transaction cannot see are dropped, so an older snapshot still finds its
+//! version of a row another transaction replaced since (#39). Lookup is
+//! thread-safe for concurrent readers once initialized (read-only ART
+//! lookups under each IndexEntry lock).
 class ScenarioDeltaIndexProbe {
 public:
 	//! False when the delta has no bound unique ART on exactly the key
@@ -131,6 +157,9 @@ public:
 	//! the _op of its visible delta row ('\0' = none) and that row's rowid
 	void Lookup(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions, vector<char> &ops,
 	            vector<row_t> &row_ids);
+	//! Fetch the given columns of one delta row found by Lookup (committed or
+	//! transaction-local row id) into `result` (initialized to those types)
+	void FetchRow(ClientContext &context, row_t row_id, const vector<StorageIndex> &column_ids, DataChunk &result);
 
 private:
 	optional_ptr<DuckTableEntry> delta_table;

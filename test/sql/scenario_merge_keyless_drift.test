@@ -1,0 +1,223 @@
+# name: test/sql/scenario_merge_keyless_drift.test
+# description: keyless merge-back on host bases: net-plan preview, 3-way copy-count drift for materialized scenarios (#39)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# --- preview of a keyless overlay scenario lists the net plan ---------------------------
+
+statement ok
+CREATE TABLE stock_moves (item INTEGER, note VARCHAR);
+
+statement ok
+INSERT INTO stock_moves VALUES (1, 'a'), (1, 'a'), (2, 'b'), (3, NULL);
+
+statement ok
+CALL scenario_create('moves');
+
+statement ok
+ATTACH 'moves' AS mv (TYPE scenario);
+
+# delete both copies of (1, 'a'), put one back (net -1); update (2, 'b');
+# delete (3, NULL)
+statement ok
+DELETE FROM mv.stock_moves WHERE item = 1;
+
+statement ok
+INSERT INTO mv.stock_moves VALUES (1, 'a');
+
+statement ok
+UPDATE mv.stock_moves SET note = 'z' WHERE item = 2;
+
+statement ok
+DELETE FROM mv.stock_moves WHERE item = 3;
+
+statement ok
+DETACH mv;
+
+# more changelog rows than planned copies: the preview lists the four copies
+# the merge applies, not the raw changelog
+query I
+SELECT count(*) > 4 FROM __anofox_scenario.s1_delta_stock_moves;
+----
+true
+
+query TTTT rowsort
+SELECT table_name, key, action, conflict::VARCHAR FROM scenario_merge_preview('moves');
+----
+stock_moves	(1, a)	delete	false
+stock_moves	(2, b)	delete	false
+stock_moves	(2, z)	insert	false
+stock_moves	(3, NULL)	delete	false
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('moves');
+----
+1	4	0
+
+query IT rowsort
+SELECT item, note FROM stock_moves;
+----
+1	a
+2	z
+
+# --- materialized keyless: copy-count drift on a deleted value is a 3-way conflict -------
+
+statement ok
+CREATE TABLE pallets (lot VARCHAR, weight INTEGER);
+
+statement ok
+INSERT INTO pallets SELECT 'X', 10 FROM range(5);
+
+statement ok
+INSERT INTO pallets VALUES ('Y', 20), ('Y', 20), ('W', 5);
+
+# three siblings with the same change, all snapshotted before the drift
+statement ok
+CALL scenario_create('p_abort', mode := 'materialized');
+
+statement ok
+CALL scenario_create('p_theirs', mode := 'materialized');
+
+statement ok
+CALL scenario_create('p_ours', mode := 'materialized');
+
+statement ok
+ATTACH 'p_abort' AS pa (TYPE scenario);
+
+statement ok
+ATTACH 'p_theirs' AS pt (TYPE scenario);
+
+statement ok
+ATTACH 'p_ours' AS po (TYPE scenario);
+
+# ('X', 10): 5 -> 3 copies (net -2); ('Y', 20): 2 -> 1 (net -1);
+# a new ('N', 1)
+statement ok
+DELETE FROM pa.pallets WHERE lot IN ('X', 'Y');
+
+statement ok
+INSERT INTO pa.pallets VALUES ('X', 10), ('X', 10), ('X', 10), ('Y', 20), ('N', 1);
+
+statement ok
+DELETE FROM pt.pallets WHERE lot IN ('X', 'Y');
+
+statement ok
+INSERT INTO pt.pallets VALUES ('X', 10), ('X', 10), ('X', 10), ('Y', 20), ('N', 1);
+
+statement ok
+DELETE FROM po.pallets WHERE lot IN ('X', 'Y');
+
+statement ok
+INSERT INTO po.pallets VALUES ('X', 10), ('X', 10), ('X', 10), ('Y', 20), ('N', 1);
+
+statement ok
+DETACH pa;
+
+statement ok
+DETACH pt;
+
+statement ok
+DETACH po;
+
+# no drift yet: the plan is clean
+query TTT rowsort
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('p_abort');
+----
+(N, 1)	insert	false
+(X, 10)	delete	false
+(X, 10)	delete	false
+(Y, 20)	delete	false
+
+# the live base gains three more copies of ('X', 10) underneath the scenarios
+statement ok
+INSERT INTO pallets SELECT 'X', 10 FROM range(3);
+
+query TTT rowsort
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('p_abort');
+----
+(N, 1)	insert	false
+(X, 10)	delete	true
+(X, 10)	delete	true
+(Y, 20)	delete	false
+
+statement error
+SELECT * FROM scenario_merge('p_abort');
+----
+<REGEX>:.*base changed underneath.*keyless table 'pallets'.*
+
+# the refused merge changed nothing
+query TII rowsort
+SELECT lot, weight, count(*) FROM pallets GROUP BY ALL;
+----
+W	5	1
+X	10	8
+Y	20	2
+
+# theirs: the drifted value keeps the base's copies, the rest applies
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('p_theirs', on_conflict := 'theirs');
+----
+1	2	1
+
+query TII rowsort
+SELECT lot, weight, count(*) FROM pallets GROUP BY ALL;
+----
+N	1	1
+W	5	1
+X	10	8
+Y	20	1
+
+# ours: the scenario's count wins - ('X', 10) ends at 3 copies (snapshot 5 + net -2).
+# ('Y', 20) now has 1 copy where the snapshot had 2: it drifted too, and the
+# scenario's count (1) already holds, so nothing more is deleted
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('p_ours', on_conflict := 'ours');
+----
+1	6	2
+
+query TII rowsort
+SELECT lot, weight, count(*) FROM pallets GROUP BY ALL;
+----
+N	1	2
+W	5	1
+X	10	3
+Y	20	1
+
+# --- ours restores copies the base lost --------------------------------------------------
+
+statement ok
+CREATE TABLE crates (tag VARCHAR);
+
+statement ok
+INSERT INTO crates VALUES ('c'), ('c'), ('c'), ('c');
+
+statement ok
+CALL scenario_create('cr', mode := 'materialized');
+
+statement ok
+ATTACH 'cr' AS cr (TYPE scenario);
+
+# 4 -> 3 copies
+statement ok
+DELETE FROM cr.crates;
+
+statement ok
+INSERT INTO cr.crates VALUES ('c'), ('c'), ('c');
+
+statement ok
+DETACH cr;
+
+# the base drops to 1 copy meanwhile
+statement ok
+DELETE FROM crates WHERE rowid IN (SELECT rowid FROM crates ORDER BY rowid LIMIT 3);
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('cr', on_conflict := 'ours');
+----
+1	2	1
+
+query I
+SELECT count(*) FROM crates WHERE tag = 'c';
+----
+3

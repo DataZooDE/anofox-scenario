@@ -180,14 +180,17 @@ class PhysicalScenarioInsert : public PhysicalOperator {
 public:
 	PhysicalScenarioInsert(PhysicalPlan &physical_plan, vector<LogicalType> types, ScenarioTableEntry &entry,
 	                       vector<unique_ptr<BoundConstraint>> bound_constraints, idx_t estimated_cardinality,
-	                       bool return_chunk)
+	                       bool return_chunk, const char *operation)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-	      entry(entry), bound_constraints(std::move(bound_constraints)), return_chunk(return_chunk) {
+	      entry(entry), bound_constraints(std::move(bound_constraints)), return_chunk(return_chunk),
+	      operation(operation) {
 	}
 
 	ScenarioTableEntry &entry;
 	vector<unique_ptr<BoundConstraint>> bound_constraints;
 	bool return_chunk;
+	//! Statement kind named in BeginWrite's errors (INSERT, or MERGE INTO)
+	const char *operation;
 
 public:
 	string GetName() const override {
@@ -218,6 +221,7 @@ protected:
 };
 
 unique_ptr<GlobalSinkState> PhysicalScenarioInsert::GetGlobalSinkState(ClientContext &context) const {
+	entry.GetScenarioCatalog().BeginWrite(context, operation, DatabaseModificationType::INSERT_DATA);
 	auto result = make_uniq<ScenarioInsertGlobalState>();
 	result->pk_columns = entry.key_columns;
 	return std::move(result);
@@ -236,10 +240,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		auto delta_ptr =
 		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
 		if (!delta_ptr) {
-			throw InvalidInputException(
-			    "Table '%s' was created in the base after scenario '%s': it is readable but not writable in "
-			    "this scenario (v1 limitation). Create a fresh scenario to modify it",
-			    entry.name, scenario_catalog.scenario_name);
+			ThrowTableCreatedAfterScenario(entry);
 		}
 		auto &delta = *delta_ptr;
 		gstate.delta_table = &delta;
@@ -370,8 +371,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	delta_chunk.SetCardinality(chunk.size());
 
 	// (delta_keys entries for this chunk were already recorded in the
-	// classification loop above)
-	scenario_catalog.MarkHostWrite(client, DatabaseModificationType::INSERT_DATA);
+	// classification loop above; the host write was registered by BeginWrite)
 	if (tombstones_to_remove.empty()) {
 		delta_table.GetStorage().LocalAppend(delta_table, client, delta_chunk, gstate.delta_constraints);
 	} else {
@@ -435,9 +435,10 @@ SourceResultType PhysicalScenarioInsert::GetDataInternal(ExecutionContext &conte
 PhysicalOperator &MakeScenarioInsertOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                              ScenarioTableEntry &entry,
                                              vector<unique_ptr<BoundConstraint>> bound_constraints,
-                                             idx_t estimated_cardinality, bool return_chunk) {
+                                             idx_t estimated_cardinality, bool return_chunk,
+                                             const char *operation) {
 	return planner.Make<PhysicalScenarioInsert>(std::move(types), entry, std::move(bound_constraints),
-	                                            estimated_cardinality, return_chunk);
+	                                            estimated_cardinality, return_chunk, operation);
 }
 
 //===----------------------------------------------------------------------===//
@@ -450,8 +451,9 @@ void ScenarioCatalog::ThrowIfNotWritable(ClientContext &context, const char *ope
 	// ScenarioTableEntry). That also skips DuckDB's pre-execution checks in
 	// ClientContext::CheckIfPreparedStatementIsExecutable /
 	// MetaTransaction::ModifyDatabase; they are restored here with DuckDB's
-	// own wording. Prepared statements re-bind (and re-plan) per transaction,
-	// so these run on every execution.
+	// own wording. Called from BeginWrite at execution time (not at planning,
+	// which PREPARE runs), so they follow the transaction a statement executes
+	// in, like core's.
 	if (MetaTransaction::Get(context).IsReadOnly()) {
 		throw TransactionException("Cannot write to database \"%s\" - transaction is launched in read-only mode",
 		                           GetAttached().GetName());
@@ -480,7 +482,6 @@ PhysicalOperator &ScenarioCatalog::PlanInsert(ClientContext &context, PhysicalPl
 	if (!plan) {
 		throw NotImplementedException("INSERT without a source is not supported for scenario tables");
 	}
-	ThrowIfNotWritable(context, "INSERT");
 	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
 		throw NotImplementedException(
 		    "ON CONFLICT clauses on scenario tables are not supported yet (planned for v0.4)");
@@ -490,7 +491,7 @@ PhysicalOperator &ScenarioCatalog::PlanInsert(ClientContext &context, PhysicalPl
 		plan = planner.ResolveDefaultsProjection(op, *plan);
 	}
 	auto &insert = planner.Make<PhysicalScenarioInsert>(op.types, entry, std::move(op.bound_constraints),
-	                                                    op.estimated_cardinality, op.return_chunk);
+	                                                    op.estimated_cardinality, op.return_chunk, "INSERT");
 	insert.children.push_back(*plan);
 	return insert;
 }

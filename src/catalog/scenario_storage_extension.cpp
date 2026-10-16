@@ -33,11 +33,14 @@ static unique_ptr<Catalog> ScenarioAttach(optional_ptr<StorageExtensionInfo> sto
 	}
 	// Keyless deltas written before v0.4.1 lack _count: upgrade them in place
 	// now, before any statement binds against this scenario (bound plans hold
-	// the delta entry, so a later swap would leave them dangling). Skipped
-	// when this transaction cannot write the host; readers then treat the
+	// the delta entry, so a later swap would leave them dangling). Only when
+	// that is safe - not for a READ_ONLY attach, not inside an explicit
+	// transaction that does not already write the host, not while another
+	// transaction may be writing the delta; readers otherwise treat the
 	// legacy layout as _count = 1. Freezing does not block it: the logical
 	// content is unchanged.
-	ScenarioDelta::TryUpgradeLegacyKeylessDeltas(context, host_catalog, entry->scenario_id);
+	ScenarioDelta::TryUpgradeLegacyKeylessDeltas(context, host_catalog, entry->scenario_id,
+	                                             options.access_mode == AccessMode::READ_ONLY);
 
 	// BaseSource resolution: the nearest materialized scenario in the parent
 	// chain (including self) provides the base tables; otherwise the live host.
