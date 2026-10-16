@@ -293,6 +293,12 @@ test/sql/
   scenario_keyless_upgrade.test   # pre-v0.4.1 keyless deltas (no _count) upgraded in place (#31)
   scenario_ducklake_keyless_merge.test # keyless bag merge-back into DuckLake bases: exact copies, drift (#31)
   attach_delta_key_probe.test     # single-row DML over a 100k-row delta resolves keys via the delta PK index, vs an oracle (#36)
+  attach_scan_suppression.test    # hashed base suppression, point lookups, keyless rowid filters after suppression (#39)
+  attach_double_touch.test        # repeat touches: DELETE no-ops, UPDATE/MERGE "same row twice", keyed + keyless (#39)
+  attach_virtual_columns.test     # __scenario_* virtual columns in user WHERE clauses; DELETE row-id positions (#39)
+  attach_write_checks.test        # read-only / frozen / single-writer checks at EXECUTE, not PREPARE (#39)
+  scenario_merge_keyless_drift.test # 3-way drift for keyless tables in materialized scenarios (#39)
+  scenario_ducklake_merge_hardening.test # legacy deltas, rowid columns, net-plan preview, idempotent lake re-merge (#39)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
 ```
