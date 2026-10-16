@@ -32,6 +32,79 @@
 
 namespace duckdb {
 
+//===----------------------------------------------------------------------===//
+// Double-touch detection
+//===----------------------------------------------------------------------===//
+
+void ScenarioTouchedRows::ThrowDoubleTouch(const char *verb) {
+	throw InvalidInputException(
+	    "Scenario %s modified the same row twice within one statement - this is not supported (v1)", verb);
+}
+
+bool ScenarioTouchedRows::TouchKey(const string &key, bool is_delete, const char *verb) {
+	auto inserted = keys.emplace(key, is_delete);
+	if (inserted.second) {
+		return true;
+	}
+	if (is_delete && inserted.first->second) {
+		return false; // already deleted by this statement: deleting it again is a no-op
+	}
+	ThrowDoubleTouch(verb);
+}
+
+bool ScenarioTouchedRows::TouchRowno(const Value &rowno_value, bool is_delete, const char *verb) {
+	// Keyless tables: identical copies share their whole-row identity, so a
+	// join emitting one copy twice is only detectable by its row number
+	if (rowno_value.IsNull()) {
+		throw InternalException("anofox_scenario: keyless DML row without __scenario_rowno");
+	}
+	auto rowno = rowno_value.GetValue<int64_t>();
+	if (rowno < 0) {
+		throw InternalException("anofox_scenario: negative __scenario_rowno");
+	}
+	auto slot = NumericCast<idx_t>(rowno);
+	if (slot >= rowno_touched.size()) {
+		auto new_size = MaxValue<idx_t>(slot + 1, rowno_touched.size() * 2);
+		rowno_touched.resize(new_size, false);
+		rowno_deleted.resize(new_size, false);
+	}
+	if (!rowno_touched[slot]) {
+		rowno_touched[slot] = true;
+		rowno_deleted[slot] = is_delete;
+		return true;
+	}
+	if (is_delete && rowno_deleted[slot]) {
+		return false;
+	}
+	ThrowDoubleTouch(verb);
+}
+
+bool ScenarioChildCanRepeatRows(const PhysicalOperator &child) {
+	switch (child.type) {
+	case PhysicalOperatorType::TABLE_SCAN:
+	case PhysicalOperatorType::FILTER:
+	case PhysicalOperatorType::PROJECTION:
+		break;
+	default:
+		// joins, but also anything unexpected: track conservatively
+		return true;
+	}
+	for (auto &grandchild : child.children) {
+		if (ScenarioChildCanRepeatRows(grandchild.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+[[noreturn]] void ThrowTableCreatedAfterScenario(ScenarioTableEntry &entry) {
+	auto &scenario_catalog = entry.GetScenarioCatalog();
+	throw InvalidInputException(
+	    "Table '%s' was created in the base after scenario '%s': it is readable but not writable in "
+	    "this scenario (v1 limitation). Create a fresh scenario to modify it",
+	    entry.name, scenario_catalog.scenario_name);
+}
+
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -46,11 +119,10 @@ public:
 	optional_idx delta_count_column;
 	ScenarioDeltaKeyMap delta_keys;
 	vector<idx_t> pk_columns;
-	//! Keys already written by this statement (double-touch detection)
-	unordered_set<string> touched_keys;
-	//! Keyless tables: __scenario_rowno values already written by this
-	//! statement (MERGE INTO shares one set across its action sinks instead)
-	ScenarioTouchedRows touched_rownos;
+	//! Rows already written by this statement (double-touch detection); MERGE
+	//! INTO shares one set across its action sinks instead. Only consulted
+	//! when the child can repeat a row (or an UPDATE can move a key).
+	ScenarioTouchedRows touched;
 	//! Base-side PK (PK-moving updates claim a new key) and secondary UNIQUE
 	//! verification
 	ScenarioBaseUniqueProbe base_probe;
@@ -72,10 +144,7 @@ public:
 		auto delta_ptr =
 		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
 		if (!delta_ptr) {
-			throw InvalidInputException(
-			    "Table '%s' was created in the base after scenario '%s': it is readable but not writable in "
-			    "this scenario (v1 limitation). Create a fresh scenario to modify it",
-			    entry.name, scenario_catalog.scenario_name);
+			ThrowTableCreatedAfterScenario(entry);
 		}
 		delta_table = delta_ptr;
 		auto binder = Binder::CreateBinder(client);
@@ -128,27 +197,8 @@ public:
 		}
 	}
 
-	void CheckDoubleTouch(const string &key, const char *verb) {
-		if (!touched_keys.insert(key).second) {
-			ThrowDoubleTouch(verb);
-		}
-	}
-
-	//! Keyless tables: identical copies share their whole-row identity, so a
-	//! join emitting one copy twice is only detectable by its row number
-	void CheckDoubleTouchKeyless(optional_ptr<ScenarioTouchedRows> shared, const Value &rowno, const char *verb) {
-		auto &touched = shared ? *shared : touched_rownos;
-		if (rowno.IsNull()) {
-			throw InternalException("anofox_scenario: keyless DML row without __scenario_rowno");
-		}
-		if (!touched.insert(rowno.GetValue<int64_t>()).second) {
-			ThrowDoubleTouch(verb);
-		}
-	}
-
-	static void ThrowDoubleTouch(const char *verb) {
-		throw InvalidInputException(
-		    "Scenario %s modified the same row twice within one statement - this is not supported (v1)", verb);
+	ScenarioTouchedRows &Touched(optional_ptr<ScenarioTouchedRows> shared) {
+		return shared ? *shared : touched;
 	}
 
 	//! Fetch full base rows by rowid (old values for changed-unique checks)
@@ -335,12 +385,13 @@ public:
 	                       vector<unique_ptr<Expression>> bound_defaults,
 	                       vector<unique_ptr<BoundConstraint>> bound_constraints, idx_t estimated_cardinality,
 	                       bool return_chunk, optional_idx explicit_row_id_start,
-	                       shared_ptr<ScenarioTouchedRows> shared_touched)
+	                       shared_ptr<ScenarioTouchedRows> shared_touched, bool track_touches, const char *operation)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
 	      entry(entry), columns(std::move(columns)), expressions(std::move(expressions)),
 	      bound_defaults(std::move(bound_defaults)), bound_constraints(std::move(bound_constraints)),
 	      return_chunk(return_chunk), explicit_row_id_start(explicit_row_id_start),
-	      shared_touched(std::move(shared_touched)) {
+	      shared_touched(std::move(shared_touched)), track_touches(track_touches || this->shared_touched),
+	      operation(operation) {
 	}
 
 	ScenarioTableEntry &entry;
@@ -352,8 +403,13 @@ public:
 	//! Position of the row-id columns in the child chunk. For plain UPDATE
 	//! they trail the projection; MERGE INTO supplies op.row_id_start.
 	optional_idx explicit_row_id_start;
-	//! MERGE INTO on keyless tables: row numbers touched by any action
+	//! MERGE INTO: rows touched by any of its actions
 	shared_ptr<ScenarioTouchedRows> shared_touched;
+	//! Double-touch tracking on: MERGE, a child that can repeat rows, or a
+	//! keyed update that can move keys
+	bool track_touches;
+	//! Statement kind named in BeginWrite's errors
+	const char *operation;
 
 public:
 	string GetName() const override {
@@ -366,6 +422,13 @@ public:
 		return false;
 	}
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		// keyed updates also delete superseded delta rows
+		entry.GetScenarioCatalog().BeginWrite(context, operation,
+		                                      entry.key_columns.empty()
+		                                          ? DatabaseModificationType::INSERT_DATA
+		                                          : DatabaseModificationType::UPDATE_DATA |
+		                                                DatabaseModificationType::INSERT_DATA |
+		                                                DatabaseModificationType::DELETE_DATA);
 		return make_uniq<ScenarioDMLGlobalState>();
 	}
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
@@ -422,13 +485,15 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 		// keyless bag: an update is D(old row) + I(new row), multiplicity 1
 		// each - the reader aggregates. The identity virtuals carry the old
 		// row; full_chunk carries the post-image.
-		entry.GetScenarioCatalog().MarkHostWrite(client, DatabaseModificationType::INSERT_DATA);
 		auto identity_count = entry.GetColumns().LogicalColumnCount();
 		auto rowno_pos = row_id_start + 1 + identity_count;
+		auto &touched = gstate.Touched(shared_touched.get());
 		vector<char> bag_ops;
 		vector<vector<Value>> bag_rows;
 		for (idx_t i = 0; i < chunk.size(); i++) {
-			gstate.CheckDoubleTouchKeyless(shared_touched.get(), chunk.GetValue(rowno_pos, i), "UPDATE");
+			if (track_touches) {
+				touched.TouchRowno(chunk.GetValue(rowno_pos, i), false, "UPDATE");
+			}
 			vector<Value> old_row;
 			for (idx_t col = 0; col < identity_count; col++) {
 				old_row.push_back(chunk.GetValue(row_id_start + 1 + col, i));
@@ -468,9 +533,7 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 		old_key_positions.push_back(row_id_start + 1 + k);
 	}
 
-	entry.GetScenarioCatalog().MarkHostWrite(client, DatabaseModificationType::UPDATE_DATA |
-	                                                     DatabaseModificationType::INSERT_DATA);
-
+	auto &touched = gstate.Touched(shared_touched.get());
 	// Apply the matrix. PK-moving updates decompose into DELETE(old key) +
 	// INSERT/tombstone-replace(new key).
 	auto column_count = entry.GetColumns().LogicalColumnCount();
@@ -508,7 +571,9 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 		auto origin = chunk.GetValue(row_id_start, i).GetValue<int8_t>();
 		auto old_key = ScenarioDelta::MakeKey(chunk, i, old_key_positions);
 		auto new_key = ScenarioDelta::MakeKey(full_chunk, i, new_key_positions);
-		gstate.CheckDoubleTouch(old_key, "UPDATE");
+		if (track_touches) {
+			touched.TouchKey(old_key, false, "UPDATE");
+		}
 
 		vector<Value> row_values;
 		for (idx_t col = 0; col < column_count; col++) {
@@ -546,7 +611,9 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 		}
 
 		// --- PK move ------------------------------------------------------
-		gstate.CheckDoubleTouch(new_key, "UPDATE");
+		if (track_touches) {
+			touched.TouchKey(new_key, false, "UPDATE");
+		}
 		if (check_secondary) {
 			if (origin == 0) {
 				sec_candidates.push_back({i, 0, chunk.GetValue(base_rowid_pos, i).GetValue<row_t>()});
@@ -693,20 +760,27 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 class PhysicalScenarioDelete : public PhysicalOperator {
 public:
 	PhysicalScenarioDelete(PhysicalPlan &physical_plan, vector<LogicalType> types, ScenarioTableEntry &entry,
-	                       idx_t row_id_start, idx_t estimated_cardinality, bool return_chunk,
-	                       shared_ptr<ScenarioTouchedRows> shared_touched)
+	                       vector<idx_t> row_id_positions, idx_t estimated_cardinality, bool return_chunk,
+	                       shared_ptr<ScenarioTouchedRows> shared_touched, bool track_touches, const char *operation)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
-	      entry(entry), row_id_start(row_id_start), return_chunk(return_chunk),
-	      shared_touched(std::move(shared_touched)) {
+	      entry(entry), row_id_positions(std::move(row_id_positions)), return_chunk(return_chunk),
+	      shared_touched(std::move(shared_touched)), track_touches(track_touches || this->shared_touched),
+	      operation(operation) {
 	}
 
 	ScenarioTableEntry &entry;
-	//! Position of __scenario_origin in the child chunk; keys follow, then
-	//! (duck bases) the base rowid
-	idx_t row_id_start;
+	//! Child-chunk position of each row-id column, in GetRowIdColumns order:
+	//! __scenario_origin, the identity keys, then (keyed duck bases) the base
+	//! rowid or (keyless) __scenario_rowno. Not necessarily contiguous: the
+	//! binder reuses a column the WHERE clause already projected.
+	vector<idx_t> row_id_positions;
 	bool return_chunk;
-	//! MERGE INTO on keyless tables: row numbers touched by any action
+	//! MERGE INTO: rows touched by any of its actions
 	shared_ptr<ScenarioTouchedRows> shared_touched;
+	//! Double-touch tracking on: MERGE, or a child that can repeat rows
+	bool track_touches;
+	//! Statement kind named in BeginWrite's errors
+	const char *operation;
 
 public:
 	string GetName() const override {
@@ -719,6 +793,9 @@ public:
 		return false;
 	}
 	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		entry.GetScenarioCatalog().BeginWrite(context, operation,
+		                                      DatabaseModificationType::DELETE_DATA |
+		                                          DatabaseModificationType::INSERT_DATA);
 		return make_uniq<ScenarioDMLGlobalState>();
 	}
 	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override;
@@ -744,32 +821,29 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 	gstate.LazyInit(client, entry);
 	chunk.Flatten();
 
-	vector<idx_t> key_positions;
-	for (idx_t k = 0; k < gstate.pk_columns.size(); k++) {
-		key_positions.push_back(row_id_start + 1 + k);
-	}
+	auto origin_pos = row_id_positions[0];
 	auto column_count = entry.GetColumns().LogicalColumnCount();
-
-	entry.GetScenarioCatalog().MarkHostWrite(client, DatabaseModificationType::DELETE_DATA |
-	                                                     DatabaseModificationType::INSERT_DATA);
+	auto &touched = gstate.Touched(shared_touched.get());
 
 	if (gstate.pk_columns.empty()) {
 		// keyless bag: append D(row, 1) per doomed visible row; the identity
 		// virtuals carry the whole row, so RETURNING needs no fetch
 		vector<char> bag_ops;
 		vector<vector<Value>> bag_rows;
-		auto rowno_pos = row_id_start + 1 + column_count;
+		auto rowno_pos = row_id_positions[1 + column_count];
 		for (idx_t i = 0; i < chunk.size(); i++) {
-			gstate.CheckDoubleTouchKeyless(shared_touched.get(), chunk.GetValue(rowno_pos, i), "DELETE");
+			if (track_touches && !touched.TouchRowno(chunk.GetValue(rowno_pos, i), true, "DELETE")) {
+				continue; // this copy is already deleted by the statement
+			}
 			vector<Value> row_values;
 			for (idx_t col = 0; col < column_count; col++) {
-				row_values.push_back(chunk.GetValue(row_id_start + 1 + col, i));
+				row_values.push_back(chunk.GetValue(row_id_positions[1 + col], i));
 			}
 			bag_ops.push_back('D');
 			bag_rows.push_back(std::move(row_values));
 			gstate.affected_count++;
 		}
-		if (return_chunk) {
+		if (return_chunk && !bag_rows.empty()) {
 			if (!gstate.return_collection) {
 				gstate.return_collection = make_uniq<ColumnDataCollection>(Allocator::Get(client), entry.GetTypes());
 			}
@@ -787,22 +861,37 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 		return SinkResultType::NEED_MORE_INPUT;
 	}
 
+	vector<idx_t> key_positions;
+	for (idx_t k = 0; k < gstate.pk_columns.size(); k++) {
+		key_positions.push_back(row_id_positions[1 + k]);
+	}
 	gstate.delta_keys.Resolve(client, chunk, key_positions);
+
+	// Rows this chunk deletes: a key the statement already deleted (a join
+	// matched it again) is skipped - no second tombstone, count or RETURNING row
+	vector<idx_t> doomed;
+	for (idx_t i = 0; i < chunk.size(); i++) {
+		if (track_touches && !touched.TouchKey(ScenarioDelta::MakeKey(chunk, i, key_positions), true, "DELETE")) {
+			continue;
+		}
+		doomed.push_back(i);
+	}
 
 	// RETURNING: fetch the visible values of the doomed rows *before* the
 	// delta is mutated. Base rows come by rowid (trails the keys in the child
 	// chunk); scenario rows come from their delta row (full payload for I/U).
 	vector<vector<Value>> returning_rows;
 	if (return_chunk) {
-		returning_rows.resize(chunk.size());
-		idx_t rowid_pos = row_id_start + 1 + gstate.pk_columns.size();
+		returning_rows.resize(doomed.size());
+		idx_t rowid_pos = row_id_positions[1 + gstate.pk_columns.size()];
 		vector<row_t> base_rowids, delta_rowids;
 		vector<idx_t> base_slots, delta_slots;
-		for (idx_t i = 0; i < chunk.size(); i++) {
-			auto origin = chunk.GetValue(row_id_start, i).GetValue<int8_t>();
+		for (idx_t d = 0; d < doomed.size(); d++) {
+			auto i = doomed[d];
+			auto origin = chunk.GetValue(origin_pos, i).GetValue<int8_t>();
 			if (origin == 0) {
 				base_rowids.push_back(chunk.GetValue(rowid_pos, i).GetValue<row_t>());
-				base_slots.push_back(i);
+				base_slots.push_back(d);
 			} else {
 				auto key = ScenarioDelta::MakeKey(chunk, i, key_positions);
 				auto existing = gstate.delta_keys.keys.find(key);
@@ -810,7 +899,7 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 					throw InternalException("anofox_scenario: delta row for deleted key not found in key map");
 				}
 				delta_rowids.push_back(existing->second.row_id);
-				delta_slots.push_back(i);
+				delta_slots.push_back(d);
 			}
 		}
 		auto fetch_rows = [&](TableCatalogEntry &table, const vector<row_t> &rowids, idx_t first_storage_col,
@@ -849,10 +938,9 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 	vector<char> append_ops;
 	vector<vector<Value>> append_rows;
 	vector<row_t> rows_to_remove;
-	for (idx_t i = 0; i < chunk.size(); i++) {
-		auto origin = chunk.GetValue(row_id_start, i).GetValue<int8_t>();
+	for (auto i : doomed) {
+		auto origin = chunk.GetValue(origin_pos, i).GetValue<int8_t>();
 		auto key = ScenarioDelta::MakeKey(chunk, i, key_positions);
-		gstate.CheckDoubleTouch(key, "DELETE");
 
 		if (origin == 0) {
 			// base row: tombstone (keys set, other payload NULL)
@@ -899,7 +987,7 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 	gstate.FlushDeletes(client, rows_to_remove);
 	gstate.FlushAppends(client, entry, append_ops, append_rows, rows_to_remove, removed_rows);
 
-	if (return_chunk) {
+	if (return_chunk && !returning_rows.empty()) {
 		if (!gstate.return_collection) {
 			gstate.return_collection = make_uniq<ColumnDataCollection>(client, entry.GetTypes());
 		}
@@ -925,19 +1013,24 @@ PhysicalOperator &MakeScenarioUpdateOperator(PhysicalPlanGenerator &planner, vec
                                              vector<unique_ptr<BoundConstraint>> bound_constraints,
                                              idx_t estimated_cardinality, bool return_chunk,
                                              optional_idx row_id_start,
-                                             shared_ptr<ScenarioTouchedRows> shared_touched) {
+                                             shared_ptr<ScenarioTouchedRows> shared_touched, const char *operation) {
 	return planner.Make<PhysicalScenarioUpdate>(std::move(types), entry, std::move(columns), std::move(expressions),
 	                                            std::move(bound_defaults), std::move(bound_constraints),
 	                                            estimated_cardinality, return_chunk, row_id_start,
-	                                            std::move(shared_touched));
+	                                            std::move(shared_touched), true, operation);
 }
 
 PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                              ScenarioTableEntry &entry, idx_t row_id_start,
                                              idx_t estimated_cardinality, bool return_chunk,
-                                             shared_ptr<ScenarioTouchedRows> shared_touched) {
-	return planner.Make<PhysicalScenarioDelete>(std::move(types), entry, row_id_start, estimated_cardinality,
-	                                            return_chunk, std::move(shared_touched));
+                                             shared_ptr<ScenarioTouchedRows> shared_touched, const char *operation) {
+	vector<idx_t> row_id_positions;
+	for (idx_t i = 0; i < entry.GetRowIdColumns().size(); i++) {
+		row_id_positions.push_back(row_id_start + i);
+	}
+	return planner.Make<PhysicalScenarioDelete>(std::move(types), entry, std::move(row_id_positions),
+	                                            estimated_cardinality, return_chunk, std::move(shared_touched), true,
+	                                            operation);
 }
 
 //===----------------------------------------------------------------------===//
@@ -954,7 +1047,12 @@ void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry
 	auto &scenario_catalog = entry.GetScenarioCatalog();
 	auto delta = ScenarioDelta::TryGetDeltaTable(context, scenario_catalog.GetHostCatalog(context),
 	                                             scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
-	if (!delta || !ScenarioDelta::CountColumnIndex(*delta).IsValid()) {
+	if (!delta) {
+		// no delta at all: the table was created in the base after the
+		// scenario - re-attaching cannot help
+		ThrowTableCreatedAfterScenario(entry);
+	}
+	if (!ScenarioDelta::CountColumnIndex(*delta).IsValid()) {
 		auto &host_db = scenario_catalog.GetHostCatalog(context).GetAttached();
 		if (host_db.IsReadOnly()) {
 			// the real obstacle: nothing could be written here anyway
@@ -972,19 +1070,29 @@ void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry
 
 PhysicalOperator &ScenarioCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
-	ThrowIfNotWritable(context, "UPDATE");
+	// read-only/freeze checks run at execution (BeginWrite), not here
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
 	ThrowIfKeylessUnsupported(context, entry);
+	// Track touched rows only when they can repeat (a join), or when a keyed
+	// update may move a key onto one another row of the statement touches
+	bool track_touches = ScenarioChildCanRepeatRows(plan);
+	for (auto &column : op.columns) {
+		for (auto key_column : entry.key_columns) {
+			if (entry.GetColumns().LogicalToPhysical(LogicalIndex(key_column)) == column) {
+				track_touches = true;
+			}
+		}
+	}
 	auto &update = planner.Make<PhysicalScenarioUpdate>(
 	    op.types, entry, op.columns, std::move(op.expressions), std::move(op.bound_defaults),
-	    std::move(op.bound_constraints), op.estimated_cardinality, op.return_chunk, optional_idx(), nullptr);
+	    std::move(op.bound_constraints), op.estimated_cardinality, op.return_chunk, optional_idx(), nullptr,
+	    track_touches, "UPDATE");
 	update.children.push_back(plan);
 	return update;
 }
 
 PhysicalOperator &ScenarioCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalDelete &op, PhysicalOperator &plan) {
-	ThrowIfNotWritable(context, "DELETE");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
 	if (op.return_chunk && !entry.base_entry.IsDuckTable() && !entry.key_columns.empty()) {
 		// keyless tables carry the whole row in their identity columns, so
@@ -993,9 +1101,19 @@ PhysicalOperator &ScenarioCatalog::PlanDelete(ClientContext &context, PhysicalPl
 		                              "not supported yet - SELECT the rows before deleting them");
 	}
 	ThrowIfKeylessUnsupported(context, entry);
-	auto &bound_ref = op.expressions[0]->Cast<BoundReferenceExpression>();
-	auto &del = planner.Make<PhysicalScenarioDelete>(op.types, entry, bound_ref.index, op.estimated_cardinality,
-	                                                 op.return_chunk, nullptr);
+	// One expression per row-id column. Their positions need not be
+	// contiguous: a WHERE clause that referenced a virtual identity column
+	// (e.g. __scenario_rowno) already projected it, and the binder reuses it.
+	vector<idx_t> row_id_positions;
+	for (auto &expr : op.expressions) {
+		row_id_positions.push_back(expr->Cast<BoundReferenceExpression>().index);
+	}
+	if (row_id_positions.size() != entry.GetRowIdColumns().size()) {
+		throw InternalException("anofox_scenario: DELETE row-id column count mismatch");
+	}
+	auto &del = planner.Make<PhysicalScenarioDelete>(op.types, entry, std::move(row_id_positions),
+	                                                 op.estimated_cardinality, op.return_chunk, nullptr,
+	                                                 ScenarioChildCanRepeatRows(plan), "DELETE");
 	del.children.push_back(plan);
 	return del;
 }

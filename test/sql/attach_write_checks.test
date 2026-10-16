@@ -1,0 +1,283 @@
+# name: test/sql/attach_write_checks.test
+# description: scenario write checks run at execution: PREPARE, single-writer errors, parallel sinks (#39)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE orders (order_id INTEGER PRIMARY KEY, status VARCHAR);
+
+statement ok
+INSERT INTO orders VALUES (1, 'open'), (2, 'open');
+
+statement ok
+CALL scenario_create('chk');
+
+statement ok
+ATTACH 'chk' AS s (TYPE scenario);
+
+# --- PREPARE in a READ ONLY transaction, EXECUTE later in a read-write one --------
+# Core defers its read-only checks to EXECUTE; scenario writes do the same, so
+# the prepared statement exists and runs once the transaction allows writes.
+
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement ok
+PREPARE ins AS INSERT INTO s.orders VALUES (10, 'prepared');
+
+statement ok
+PREPARE upd AS UPDATE s.orders SET status = 'held' WHERE order_id = 1;
+
+statement error
+EXECUTE ins;
+----
+<REGEX>:.*read-only mode.*
+
+statement ok
+ROLLBACK;
+
+statement ok
+EXECUTE ins;
+
+statement ok
+EXECUTE upd;
+
+query IT
+SELECT * FROM s.orders ORDER BY order_id;
+----
+1	held
+2	open
+10	prepared
+
+statement ok
+DEALLOCATE ins;
+
+statement ok
+DEALLOCATE upd;
+
+# --- PREPARE against a READ_ONLY scenario attach: refused at EXECUTE --------------
+
+statement ok
+ATTACH 'chk' AS ro (TYPE scenario, READ_ONLY);
+
+statement ok
+PREPARE ro_del AS DELETE FROM ro.orders WHERE order_id = 2;
+
+statement error
+EXECUTE ro_del;
+----
+<REGEX>:.*attached in read-only mode.*
+
+statement ok
+DEALLOCATE ro_del;
+
+statement ok
+DETACH ro;
+
+# --- frozen at PREPARE, unfrozen at EXECUTE ---------------------------------------
+
+statement ok
+CALL scenario_freeze('chk');
+
+statement ok
+PREPARE thaw AS UPDATE s.orders SET status = 'thawed' WHERE order_id = 2;
+
+statement error
+EXECUTE thaw;
+----
+<REGEX>:.*frozen.*
+
+statement ok
+CALL scenario_unfreeze('chk');
+
+statement ok
+EXECUTE thaw;
+
+query T
+SELECT status FROM s.orders WHERE order_id = 2;
+----
+thawed
+
+statement ok
+DEALLOCATE thaw;
+
+# --- single-writer violations name the scenario -----------------------------------
+
+statement ok
+ATTACH ':memory:' AS ledger_db;
+
+statement ok
+CREATE TABLE ledger_db.ledger (id INTEGER);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ledger_db.ledger VALUES (1);
+
+statement error
+UPDATE s.orders SET status = 'q' WHERE order_id = 1;
+----
+<REGEX>:.*Cannot write to scenario 'chk': this transaction already modified database "ledger_db".*single transaction can only write to a single attached database.*
+
+statement ok
+ROLLBACK;
+
+# ...up front, whether or not the statement would write any rows
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ledger_db.ledger VALUES (1);
+
+statement error
+UPDATE s.orders SET status = 'q' WHERE order_id = -1;
+----
+<REGEX>:.*Cannot write to scenario 'chk'.*
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ledger_db.ledger VALUES (1);
+
+statement error
+DELETE FROM s.orders WHERE order_id = -1;
+----
+<REGEX>:.*Cannot write to scenario 'chk'.*
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ledger_db.ledger VALUES (1);
+
+statement error
+INSERT INTO s.orders SELECT * FROM orders WHERE order_id = -1;
+----
+<REGEX>:.*Cannot write to scenario 'chk'.*
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ledger_db.ledger VALUES (1);
+
+statement error
+MERGE INTO s.orders USING (SELECT -1 AS order_id) v ON s.orders.order_id = v.order_id WHEN MATCHED THEN DELETE;
+----
+<REGEX>:.*Cannot write to scenario 'chk'.*
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH ledger_db;
+
+# host writes and scenario writes still share a transaction
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO orders VALUES (3, 'host');
+
+statement ok
+UPDATE s.orders SET status = 'both' WHERE order_id = 1;
+
+statement ok
+COMMIT;
+
+query IT
+SELECT * FROM s.orders WHERE order_id IN (1, 3) ORDER BY order_id;
+----
+1	both
+3	host
+
+# --- parallel sibling sinks: COPY FROM DATABASE plans one INSERT per table --------
+# The sinks of a UNION of INSERT pipelines initialize concurrently; registering
+# the host write must not race (it runs once per sink, serialized).
+
+statement ok
+CREATE TABLE fc_a (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+CREATE TABLE fc_b (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+CREATE TABLE fc_c (id INTEGER, qty INTEGER);
+
+statement ok
+CALL scenario_create('bulk');
+
+statement ok
+ATTACH 'bulk' AS b (TYPE scenario);
+
+statement ok
+ATTACH ':memory:' AS src;
+
+statement ok
+CREATE TABLE src.fc_a AS SELECT i::INTEGER AS id, (i % 97)::INTEGER AS qty FROM range(200000) t(i);
+
+statement ok
+CREATE TABLE src.fc_b AS SELECT i::INTEGER AS id, (i % 89)::INTEGER AS qty FROM range(200000) t(i);
+
+statement ok
+CREATE TABLE src.fc_c AS SELECT i::INTEGER AS id, (i % 83)::INTEGER AS qty FROM range(200000) t(i);
+
+statement ok
+SET threads = 8;
+
+loop i 0 5
+
+statement ok
+BEGIN;
+
+statement ok
+COPY FROM DATABASE src TO b (DATA);
+
+query III
+SELECT (SELECT count(*) FROM b.fc_a), (SELECT count(*) FROM b.fc_b), (SELECT count(*) FROM b.fc_c);
+----
+200000	200000	200000
+
+statement ok
+ROLLBACK;
+
+endloop
+
+statement ok
+COPY FROM DATABASE src TO b (DATA);
+
+statement ok
+CHECKPOINT;
+
+query III
+SELECT (SELECT sum(qty) FROM b.fc_a) = (SELECT sum(qty) FROM src.fc_a),
+       (SELECT count(*) FROM b.fc_b), (SELECT count(*) FROM fc_c);
+----
+true	200000	0
+
+statement ok
+DETACH src;
+
+statement ok
+DETACH b;
+
+statement ok
+CALL scenario_drop('bulk');
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('chk');

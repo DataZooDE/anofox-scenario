@@ -8,20 +8,23 @@ ScenarioTransaction::ScenarioTransaction(TransactionManager &manager, ClientCont
     : Transaction(manager, context), serial(++transaction_serial) {
 }
 
-optional_ptr<CatalogEntry> ScenarioTransaction::FindEntry(const string &name) {
+optional_ptr<CatalogEntry> ScenarioTransaction::FindEntry(const string &name, bool enumeration) {
 	lock_guard<mutex> guard(table_entries_lock);
-	auto entry = table_entries.find(name);
-	if (entry == table_entries.end()) {
+	auto &entries = enumeration ? enumeration_entries : table_entries;
+	auto entry = entries.find(name);
+	if (entry == entries.end()) {
 		return nullptr;
 	}
 	return entry->second.get();
 }
 
-CatalogEntry &ScenarioTransaction::PublishEntry(const string &name, unique_ptr<CatalogEntry> entry) {
+CatalogEntry &ScenarioTransaction::PublishEntry(const string &name, unique_ptr<CatalogEntry> entry,
+                                                bool enumeration) {
 	lock_guard<mutex> guard(table_entries_lock);
+	auto &entries = enumeration ? enumeration_entries : table_entries;
 	// a concurrent pipeline may have published it meanwhile: keep that one,
 	// references to it may already be in use
-	auto inserted = table_entries.emplace(name, std::move(entry));
+	auto inserted = entries.emplace(name, std::move(entry));
 	return *inserted.first->second;
 }
 

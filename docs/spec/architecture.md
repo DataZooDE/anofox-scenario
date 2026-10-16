@@ -55,7 +55,7 @@ real catalog. Most of the design follows from that one choice:
   the current transaction (owned by `ScenarioTransaction`), and physical plans hold references
   to them. `ScenarioCatalog::GetCatalogVersion` therefore folds a per-transaction serial into the
   host catalog's version: a prepared statement is re-bound in each new transaction and reused
-  within one. That re-bind also re-runs plan-time checks such as the frozen flag.
+  within one. Write checks (read-only, frozen) run at execution instead, see *Write attribution*.
 - **Constraints, types, and binder errors are DuckDB's**, not reimplementations.
 - **Transactions ride the host's.** Scenario DML runs in the caller's transaction, so `ROLLBACK`
   undoes scenario writes for free and ACID is inherited rather than rebuilt. Writes are
@@ -106,10 +106,23 @@ synthesize **`__scenario_rowno`**, a per-scan unique `BIGINT`:
 - Base chunks reserve ranges from an atomic counter as they stream.
 - Filters on it stay above the scan (`supports_pushdown_type`).
 
-The update and delete sinks reject a second touch of the same row number with the keyed path's
-`modified the same row twice` error. `PlanMergeInto` hands all of a `MERGE`'s action sinks one
-shared touched-row set, so a copy matched once by a `DELETE` action and again by an `UPDATE`
-action is caught too.
+The row number is only meaningful within one scan; the API reference documents it (with
+`__scenario_origin` / `__scenario_key_<k>`) as an internal, unstable column. A user `WHERE`
+clause may reference any of these virtual columns: the binder then reuses the already projected
+column for the DML row-id list (`Binder::BindRowIdColumns`), so a `DELETE`'s row-id columns need
+not be contiguous. `PlanDelete` therefore records each row-id column's own position from
+`LogicalDelete::expressions`; `UPDATE` and `MERGE` project them contiguously.
+
+**Double touch.** `ScenarioTouchedRows` records the rows a statement modified - the serialized
+key on keyed tables, the row number (two growable bitmaps: touched, deleted) on keyless ones.
+A repeated touch by a delete of a row a delete already removed is skipped (no second tombstone,
+count or `RETURNING` row: the outcome is the same whichever match wins, as in core). Any other
+repeat throws `modified the same row twice`. `PlanMergeInto` hands all of a `MERGE`'s action
+sinks one shared set, keyed and keyless alike, so a row matched by an `UPDATE` action and a
+`DELETE` action is caught there instead of surfacing as a raw delta PK violation. Tracking costs
+memory per touched row, so `UPDATE`/`DELETE` enable it only when the child plan can repeat a
+row (`ScenarioChildCanRepeatRows`: anything but scan/filter/projection, i.e. joins) or when a
+keyed `UPDATE` sets a key column (a key move must see the keys the statement touched).
 
 `ON CONFLICT` targets need a `UNIQUE` constraint, just like core. The binder derives the join
 from the table's unique indexes and raises core's own errors when there is none. The scenario
@@ -211,8 +224,8 @@ so uniqueness splits into three checks:
   - Merge-back registers every deleted base row in the transaction's delete indexes before it
     appends, so the base accepts the reused values too.
 
-`ScenarioCatalog::MarkHostWrite` is the chokepoint enforcing the single-writer rule and the
-frozen flag.
+`ScenarioCatalog::BeginWrite` is the chokepoint enforcing the single-writer rule, the read-only
+checks and the frozen flag.
 
 ### Write attribution
 
@@ -227,24 +240,30 @@ in the same transaction would fail, although only the host is ever physically mo
 
 `ScenarioTableEntry` therefore sets `temporary = true` on the entry the binder resolves. The
 binder then skips the registration (INSERT registers a read instead, so prepared statements still
-re-bind on catalog changes), and every sink calls `MarkHostWrite` before its first physical
-write, which calls `ModifyDatabase(host)`. Host and scenario writes thus name the same writer; a
-write to an unrelated database still trips DuckDB's check. The flag has no storage effect on
+re-bind on catalog changes), and every sink calls `BeginWrite` from `GetGlobalSinkState`, which
+ends in `MarkHostWrite` -> `ModifyDatabase(host)`. Host and scenario writes thus name the same
+writer. A transaction that already modified an unrelated database is refused by `MarkHostWrite`
+itself, naming the scenario (DuckDB's own check would only name the host). Sink global states
+are created by `PipelineInitializeTask`s, which can run on worker threads in parallel (e.g. the
+UNION of INSERTs `COPY FROM DATABASE` plans), and `ModifyDatabase` / `SetModifications` are not
+synchronized, so `BeginWrite` serializes behind a process-wide mutex; it runs once per sink, not
+per chunk. The flag has no storage effect on
 scenario entries - `temporary` only matters for entries stored in a `CatalogSet` and logged to
 the WAL, and scenario entries live in neither.
 
-Because the binder-time checks no longer see the scenario catalog, the plan hooks (`PlanInsert`,
-`PlanUpdate`, `PlanDelete`, `PlanMergeInto`) restore them in `ThrowIfNotWritable`, next to the
-frozen check and with DuckDB's own wording: read-only transaction, scenario attached `READ_ONLY`,
-host attached read-only. They run before execution, so zero-row writes fail too, and prepared
-statements re-plan per transaction (see *Entries are per transaction*). `MarkHostWrite` repeats
-them as a backstop.
+Because the binder-time checks no longer see the scenario catalog, `BeginWrite` restores them in
+`ThrowIfNotWritable`, next to the frozen check and with DuckDB's own wording: read-only
+transaction, scenario attached `READ_ONLY`, host attached read-only. They run when the sink is
+initialized - before any row flows, so zero-row writes fail too, but at `EXECUTE` rather than
+at physical planning, which `PREPARE` performs: a write prepared in a read-only transaction
+stays executable later, as in core. `MarkHostWrite` repeats the read-only checks as a backstop.
 
 Introspection reads the flag as well (`duckdb_tables().temporary`, and from it
 `information_schema.tables.table_type` / `commit_action` and `SHOW [ALL] TABLES`). So each
 transaction caches *two* entries per table in `ScenarioTransaction`: the binder's, from
 `LookupEntry`, flagged temporary; and the enumeration one, from `ScenarioSchemaEntry::Scan`,
-which is a plain `BASE TABLE` (cache key prefixed with `\x01`). This split holds because DuckDB
+which is a plain `BASE TABLE` (kept in a separate map, `enumeration_entries`, so no table name
+can collide with it). This split holds because DuckDB
 resolves DML targets only through `Catalog::GetEntry` -> `SchemaCatalogEntry::LookupEntry`
 (`bind_insert.cpp:538`, `bind_basetableref.cpp:163/229` for UPDATE/DELETE/MERGE). `Scan` feeds
 only enumeration: `duckdb_tables.cpp:83`, `duckdb_columns.cpp:91`, `duckdb_constraints`, and
@@ -342,7 +361,7 @@ On success the scenario ends frozen, with `merged_at` set and an empty delta.
 |------|----------------|
 | `anofox_scenario_extension.cpp` | Entry point, function registration |
 | `catalog/scenario_storage_extension.cpp` | `ATTACH (TYPE scenario)`, base source resolution |
-| `catalog/scenario_catalog.cpp` | Catalog impl, `MarkHostWrite`, freeze chokepoint |
+| `catalog/scenario_catalog.cpp` | Catalog impl, `BeginWrite`/`MarkHostWrite` write chokepoint |
 | `catalog/scenario_schema_entry.cpp` | Synthetic `main` schema, DDL rejection |
 | `catalog/scenario_table_entry.cpp` | Base mirror, virtual identity columns |
 | `catalog/scenario_scan.cpp` | Merge-on-read scan |
