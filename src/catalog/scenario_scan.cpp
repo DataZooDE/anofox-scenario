@@ -63,7 +63,7 @@ struct ScenarioScanOutputMapping {
 	bool is_rowno = false;
 };
 
-//! Merge-on-read scan. The (small) visible delta streams through a parallel
+//! Merge-on-read scan. The visible delta streams through a parallel
 //! ColumnDataCollection scan; base row groups are handed out to threads via
 //! DataTable's parallel-scan API with tombstoned/updated keys suppressed.
 struct ScenarioScanGlobalState : public GlobalTableFunctionState {
@@ -92,6 +92,10 @@ struct ScenarioScanGlobalState : public GlobalTableFunctionState {
 	ColumnDataParallelScanState delta_parallel_state;
 	bool has_visible_delta = false;
 	unordered_set<string> suppressed_keys;
+	//! Keyed deltas with a PK index: base rows are suppressed by probing the
+	//! index per base chunk instead of materializing every U/D key (#36)
+	ScenarioDeltaIndexProbe suppress_probe;
+	bool probe_suppression = false;
 	//! Keyless bag mode: how many base copies of each value to suppress
 	//! (consumed while scanning - the scan runs single-threaded then)
 	unordered_map<string, idx_t> suppress_budget;
@@ -389,7 +393,60 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 				flush();
 			}
 		};
-		if (!bind_data.keyless) {
+		if (!bind_data.keyless && result->suppress_probe.Initialize(context, delta_table, bind_data.pk_columns)) {
+			// Vectorized: emit the I/U rows chunk-wise; suppression is left to
+			// per-chunk index probes on the base side
+			bool has_replacements = false;
+			ScenarioDelta::ScanTableChunks(context, delta_table, std::move(delta_column_ids), delta_types,
+			                               [&](DataChunk &chunk) {
+				                               UnifiedVectorFormat op_format;
+				                               chunk.data[0].ToUnifiedFormat(chunk.size(), op_format);
+				                               auto op_data = UnifiedVectorFormat::GetData<string_t>(op_format);
+				                               SelectionVector sel(chunk.size());
+				                               idx_t kept = 0;
+				                               for (idx_t row = 0; row < chunk.size(); row++) {
+					                               auto op = op_data[op_format.sel->get_index(row)].GetData()[0];
+					                               if (op == 'U' || op == 'D') {
+						                               has_replacements = true;
+					                               }
+					                               if (op == 'I' || op == 'U') {
+						                               sel.set_index(kept++, row);
+					                               }
+				                               }
+				                               if (kept == 0) {
+					                               return;
+				                               }
+				                               DataChunk out_chunk;
+				                               out_chunk.InitializeEmpty(output_types);
+				                               for (idx_t out_idx = 0; out_idx < delta_pos_for_output.size(); out_idx++) {
+					                               auto pos = delta_pos_for_output[out_idx];
+					                               auto &target = out_chunk.data[out_idx];
+					                               if (pos == DELTA_OUT_NULL) {
+						                               target.Reference(Value(LogicalType::ROW_TYPE));
+					                               } else if (pos == DELTA_OUT_ORIGIN) {
+						                               target.Reference(Value::TINYINT(1));
+					                               } else if (pos == DELTA_OUT_ROWNO) {
+						                               target.Sequence(delta_rowno, 1, kept);
+						                               delta_rowno += NumericCast<int64_t>(kept);
+					                               } else {
+						                               target.Slice(chunk.data[pos], sel, kept);
+					                               }
+				                               }
+				                               out_chunk.SetCardinality(kept);
+				                               if (filter_executor) {
+					                               SelectionVector filter_sel(kept);
+					                               auto passed = filter_executor->SelectExpression(out_chunk, filter_sel);
+					                               if (passed == 0) {
+						                               return;
+					                               }
+					                               if (passed < kept) {
+						                               out_chunk.Slice(filter_sel, passed);
+					                               }
+				                               }
+				                               result->visible_delta->Append(out_chunk);
+			                               });
+			result->probe_suppression = has_replacements;
+		} else if (!bind_data.keyless) {
 			ScenarioDelta::ScanTableRows(
 			    context, delta_table, std::move(delta_column_ids), delta_types, [&](DataChunk &chunk, idx_t row) {
 				    auto op = chunk.GetValue(0, row).GetValue<string>()[0];
@@ -495,8 +552,8 @@ unique_ptr<LocalTableFunctionState> ScenarioScanInitLocal(ExecutionContext &cont
 	return std::move(result);
 }
 
-bool EmitBaseChunk(ScenarioScanGlobalState &gstate, ScenarioScanLocalState &lstate, DataChunk &output,
-                   DataChunk &scan_target);
+bool EmitBaseChunk(ClientContext &context, ScenarioScanGlobalState &gstate, ScenarioScanLocalState &lstate,
+                   DataChunk &output, DataChunk &scan_target);
 
 void ScenarioScanExecute(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &bind_data = input.bind_data->Cast<ScenarioScanBindData>();
@@ -542,7 +599,7 @@ void ScenarioScanExecute(ClientContext &context, TableFunctionInput &input, Data
 				}
 				continue;
 			}
-			if (!EmitBaseChunk(gstate, lstate, output, scan_target)) {
+			if (!EmitBaseChunk(context, gstate, lstate, output, scan_target)) {
 				continue; // whole chunk suppressed; scan on
 			}
 			return;
@@ -562,7 +619,7 @@ void ScenarioScanExecute(ClientContext &context, TableFunctionInput &input, Data
 			output.SetCardinality(0);
 			return;
 		}
-		if (!EmitBaseChunk(gstate, lstate, output, scan_target)) {
+		if (!EmitBaseChunk(context, gstate, lstate, output, scan_target)) {
 			continue;
 		}
 		return;
@@ -570,10 +627,29 @@ void ScenarioScanExecute(ClientContext &context, TableFunctionInput &input, Data
 }
 
 //! Apply suppression + projection to a scanned base chunk; false = fully suppressed
-bool EmitBaseChunk(ScenarioScanGlobalState &gstate, ScenarioScanLocalState &lstate, DataChunk &output,
-                   DataChunk &scan_target) {
+bool EmitBaseChunk(ClientContext &context, ScenarioScanGlobalState &gstate, ScenarioScanLocalState &lstate,
+                   DataChunk &output, DataChunk &scan_target) {
 	idx_t count = scan_target.size();
-	if (!gstate.suppressed_keys.empty()) {
+	if (gstate.probe_suppression) {
+		// a base row is hidden when the delta holds a U/D row for its key
+		vector<char> ops;
+		vector<row_t> row_ids;
+		gstate.suppress_probe.Lookup(context, scan_target, gstate.key_positions, ops, row_ids);
+		SelectionVector sel(count);
+		idx_t kept = 0;
+		for (idx_t i = 0; i < count; i++) {
+			if (ops[i] != 'U' && ops[i] != 'D') {
+				sel.set_index(kept++, i);
+			}
+		}
+		if (kept == 0) {
+			return false;
+		}
+		if (kept < count) {
+			scan_target.Slice(sel, kept);
+			count = kept;
+		}
+	} else if (!gstate.suppressed_keys.empty()) {
 		SelectionVector sel(count);
 		idx_t kept = 0;
 		for (idx_t i = 0; i < count; i++) {

@@ -102,7 +102,7 @@ public:
 		}
 		pk_columns = entry.key_columns;
 		if (!pk_columns.empty()) {
-			delta_keys.Load(client, *delta_ptr, pk_columns);
+			delta_keys.Initialize(client, *delta_ptr, pk_columns);
 		}
 		delta_count_column = ScenarioDelta::CountColumnIndex(*delta_ptr);
 		delta_chunk.Initialize(Allocator::Get(client), delta_ptr->GetStorage().GetTypes());
@@ -502,6 +502,8 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 	for (auto pk_col : gstate.pk_columns) {
 		new_key_positions.push_back(pk_col);
 	}
+	gstate.delta_keys.Resolve(client, chunk, old_key_positions);
+	gstate.delta_keys.Resolve(client, full_chunk, new_key_positions);
 	for (idx_t i = 0; i < chunk.size(); i++) {
 		auto origin = chunk.GetValue(row_id_start, i).GetValue<int8_t>();
 		auto old_key = ScenarioDelta::MakeKey(chunk, i, old_key_positions);
@@ -784,6 +786,8 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 		gstate.FlushAppends(client, entry, bag_ops, bag_rows);
 		return SinkResultType::NEED_MORE_INPUT;
 	}
+
+	gstate.delta_keys.Resolve(client, chunk, key_positions);
 
 	// RETURNING: fetch the visible values of the doomed rows *before* the
 	// delta is mutated. Base rows come by rowid (trails the keys in the child

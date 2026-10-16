@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "catalog/scenario_delta.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
@@ -40,11 +41,28 @@ struct ScenarioDeltaKeyInfo {
 	row_t row_id; // rowid within the delta table (valid in this transaction)
 };
 
-//! In-memory view of a delta table keyed by PK; deltas are small by invariant
+//! A statement's view of a keyed delta table: PK -> delta row. A key absent
+//! from `keys` is not in the delta. Keys are resolved on demand by probing
+//! the delta's PRIMARY KEY index (committed + transaction-local), so a
+//! statement costs O(rows it touches), not O(delta) (#36). Sinks must
+//! Resolve() every key a chunk references before reading or writing `keys`
+//! for it: each key is then probed once, before the statement changed it, and
+//! `keys` equals a start-of-statement snapshot restricted to touched keys.
 struct ScenarioDeltaKeyMap {
 	unordered_map<string, ScenarioDeltaKeyInfo> keys;
 
-	void Load(ClientContext &context, DuckTableEntry &delta_table, const vector<idx_t> &pk_columns);
+	void Initialize(ClientContext &context, DuckTableEntry &delta_table, const vector<idx_t> &pk_columns);
+	//! Resolve the keys of `chunk` (key values at `key_positions`, in PK order)
+	void Resolve(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions);
+
+private:
+	//! Fallback when the delta has no bound PK index: snapshot every key
+	void LoadAll(ClientContext &context);
+
+	optional_ptr<DuckTableEntry> delta_table;
+	vector<idx_t> pk_columns;
+	ScenarioDeltaIndexProbe index_probe;
+	unordered_set<string> resolved;
 };
 
 //! Evaluate the base table's NOT NULL and CHECK constraints on scenario rows
