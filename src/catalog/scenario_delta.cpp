@@ -8,6 +8,8 @@
 #include "duckdb/common/types/constraint_conflict_info.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "duckdb/execution/index/art/art.hpp"
+#include "duckdb/execution/index/art/art_operator.hpp"
+#include "duckdb/execution/index/art/iterator.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -579,6 +581,55 @@ bool ScenarioDeltaIndexProbe::Initialize(ClientContext &context, DuckTableEntry 
 	return false;
 }
 
+namespace {
+
+//! Every row id stored under `key` in one ART (a unique index can briefly hold
+//! two: a row deleted by a running transaction plus its replacement; the
+//! deleted_rows_in_use / checkpoint delta ARTs are not unique at all)
+void CollectARTRowIds(ART &art, const ARTKey &key, vector<row_t> &result) {
+	if (key.Empty() || !art.tree.HasMetadata()) {
+		return;
+	}
+	auto leaf = ARTOperator::Lookup(art, art.tree, key, 0);
+	if (!leaf) {
+		return;
+	}
+	if (leaf->GetType() == NType::LEAF_INLINED) {
+		result.push_back(leaf->GetRowId());
+		return;
+	}
+	// a nested leaf (gate): iterate its row ids, exactly as ART::SearchEqual
+	set<row_t> row_ids;
+	Iterator it(art);
+	it.FindMinimum(*leaf);
+	ARTKey empty_key;
+	RowIdSetOutput output(row_ids, NumericLimits<idx_t>::Maximum());
+	it.Scan(empty_key, output, false);
+	result.insert(result.end(), row_ids.begin(), row_ids.end());
+}
+
+//! Look the probe chunk's keys up in `art` (row i -> candidates[i])
+void CollectCandidates(ClientContext &context, ART &art, DataChunk &probe, vector<vector<row_t>> &candidates) {
+	DataChunk expr_chunk;
+	expr_chunk.Initialize(Allocator::Get(context), art.logical_types, probe.size());
+	art.ExecuteExpressions(probe, expr_chunk);
+	ArenaAllocator arena(Allocator::Get(context));
+	unsafe_vector<ARTKey> keys(probe.size());
+	art.GenerateKeys<>(arena, expr_chunk, keys);
+	for (idx_t i = 0; i < probe.size(); i++) {
+		CollectARTRowIds(art, keys[i], candidates[i]);
+	}
+}
+
+ART &CheckedART(BoundIndex &index) {
+	if (index.GetIndexType() != ART::TYPE_NAME) {
+		throw InternalException("anofox_scenario: concurrent changes made to a non-ART delta index");
+	}
+	return index.Cast<ART>();
+}
+
+} // namespace
+
 void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions,
                                      vector<char> &ops, vector<row_t> &row_ids) {
 	D_ASSERT(delta_table);
@@ -592,8 +643,7 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 	auto &storage = delta_table->GetStorage();
 	auto types = storage.GetTypes();
 	// The probe chunk is in delta layout: key columns hold the keys, every
-	// other column is NULL (unique indexes ignore NULLs, so the delta's
-	// secondary UNIQUE indexes stay silent)
+	// other column is NULL (the key index expressions only read the keys)
 	DataChunk probe;
 	probe.InitializeEmpty(types);
 	for (idx_t col = 0; col < types.size(); col++) {
@@ -617,37 +667,47 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 	auto local = local_storage.GetStorage(storage);
 	ConflictInfo conflict_info(key_ids);
 	vector<StorageIndex> op_column {StorageIndex(ScenarioDelta::OP_COL)};
-	auto collect = [&](bool global) {
-		ConflictManager manager(VerifyExistenceType::APPEND, count, &conflict_info);
-		if (global) {
-			storage.VerifyUniqueIndexes(storage.GetDataTableInfo()->GetIndexes(), local, probe, &manager);
-		} else {
-			storage.VerifyUniqueIndexes(local->append_indexes, local, probe, &manager);
+
+	// Read-only lookups of every key in the key index, mirroring core's index
+	// scan (TableScanFunction): besides the main ART, a committed row id can
+	// live in deleted_rows_in_use (deleted while older transactions still see
+	// it) or added_data_during_checkpoint (appended during a checkpoint). An
+	// older snapshot's visible delta row is often only found there.
+	auto collect = [&](TableIndexList &indexes, bool global) {
+		vector<vector<row_t>> candidates(count);
+		bool found = false;
+		for (auto &entry : indexes.IndexEntries()) {
+			auto &index = *entry.index;
+			if (!index.IsBound() || !index.IsUnique() || index.GetIndexType() != ART::TYPE_NAME ||
+			    !conflict_info.ConflictTargetMatches(index)) {
+				continue;
+			}
+			lock_guard<mutex> guard(entry.lock);
+			CollectCandidates(context, index.Cast<ART>(), probe, candidates);
+			if (entry.deleted_rows_in_use) {
+				CollectCandidates(context, CheckedART(*entry.deleted_rows_in_use), probe, candidates);
+			}
+			if (entry.added_data_during_checkpoint) {
+				CollectCandidates(context, CheckedART(*entry.added_data_during_checkpoint), probe, candidates);
+			}
+			found = true;
+			break;
 		}
-		if (!manager.HasConflicts()) {
+		if (!found) {
 			return;
 		}
-		if (global) {
-			manager.FinalizeGlobal(transaction, storage);
-		} else {
-			manager.FinalizeLocal(storage, local_storage);
-		}
-		auto conflict_count = manager.ConflictCount();
-		if (conflict_count == 0) {
-			return;
-		}
-		// Finalize prefers a visible second hit, but a lone hit may still name
-		// a row this transaction cannot see: keep only the visible ones
-		auto &inverted_sel = manager.GetInvertedSel();
-		auto hit_ids = FlatVector::GetData<row_t>(manager.GetRowIds());
-		Vector visible_ids(LogicalType::ROW_TYPE, conflict_count);
+		// Keep the one candidate this transaction can see (the key is a PK:
+		// at most one delta row per key is visible to any snapshot)
+		Vector visible_ids(LogicalType::ROW_TYPE, count);
 		auto visible_data = FlatVector::GetData<row_t>(visible_ids);
 		vector<idx_t> visible_rows;
-		for (idx_t i = 0; i < conflict_count; i++) {
-			auto row_id = hit_ids[i];
-			if (global ? storage.CanFetch(transaction, row_id) : local_storage.CanFetch(storage, row_id)) {
-				visible_data[visible_rows.size()] = row_id;
-				visible_rows.push_back(inverted_sel.get_index(i));
+		for (idx_t i = 0; i < count; i++) {
+			for (auto row_id : candidates[i]) {
+				if (global ? storage.CanFetch(transaction, row_id) : local_storage.CanFetch(storage, row_id)) {
+					visible_data[visible_rows.size()] = row_id;
+					visible_rows.push_back(i);
+					break;
+				}
 			}
 		}
 		if (visible_rows.empty()) {
@@ -670,9 +730,26 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 			row_ids[visible_rows[i]] = visible_data[i];
 		}
 	};
-	collect(true);
+	collect(storage.GetDataTableInfo()->GetIndexes(), true);
 	if (local) {
-		collect(false);
+		// the transaction's own appends; they supersede any committed hit
+		collect(local->append_indexes, false);
+	}
+}
+
+void ScenarioDeltaIndexProbe::FetchRow(ClientContext &context, row_t row_id, const vector<StorageIndex> &column_ids,
+                                       DataChunk &result) {
+	D_ASSERT(delta_table);
+	auto &storage = delta_table->GetStorage();
+	auto &transaction = DuckTransaction::Get(context, delta_table->catalog);
+	Vector row_ids(Value::BIGINT(row_id));
+	row_ids.Flatten(1);
+	ColumnFetchState fetch_state;
+	result.Reset();
+	if (row_id >= MAX_ROW_ID) {
+		LocalStorage::Get(transaction).FetchChunk(storage, row_ids, 1, column_ids, result, fetch_state);
+	} else {
+		storage.Fetch(transaction, result, column_ids, row_ids, 1, fetch_state);
 	}
 }
 

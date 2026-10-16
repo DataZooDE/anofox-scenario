@@ -78,12 +78,38 @@ reject the operations that make no sense on a branch — which is why all DDL is
 Delta-first ordering is what makes a scenario row win over the base row with the same key — so an
 `UPDATE` reads back as a modification rather than a duplicate.
 
-For keyed deltas, the claimed set is never materialized (#36). Step 1 emits the `I`/`U` rows
-chunk-wise. In step 2, each base chunk probes the delta's `PRIMARY KEY` index
-(`ScenarioDeltaIndexProbe`, `scenario_delta.cpp`) and drops the rows whose key has a `U` or `D` row.
-A point query therefore pays for the rows it reads, not for the whole delta: a 100k-row delta no
-longer costs every single-row `UPDATE`/`DELETE` a full key-set build. Deltas without a bound PK
-index, and keyless bag deltas, keep the materialized claim set.
+For keyed deltas, the claimed set is never materialized as strings (#36, #39). Step 1 emits the
+`I`/`U` rows chunk-wise and, for every `U`/`D` row, inserts the vectorized hash of its key into an
+open-addressing hash set (`KeyHashSet`, `scenario_scan.cpp`). In step 2, each base chunk hashes its
+keys the same way. A row whose hash misses is kept without further work. Only the hits are
+confirmed exactly, through the delta's `PRIMARY KEY` index (`ScenarioDeltaIndexProbe`,
+`scenario_delta.cpp`), because a 64-bit hash can collide. The set is read-only after init, so
+parallel base scans never serialize on the index lock; the index is touched about once per
+suppressed row. Past `anofox_scenario_suppression_hash_limit` `U`/`D` keys (default 4,194,304,
+about 16 bytes each) the set is dropped and every base row probes the index instead: bounded
+memory, but serialized per index.
+
+**Point lookups (#39).** When the pushed filters pin every key column to a finite set of values
+(`key = c`, `key IN (...)`, or such a filter inside an `AND` or an optional filter; at most 2048
+keys after the cross product), init skips the delta scan. It looks those keys up through the index,
+fetches the visible `I`/`U` rows by row id (`ScenarioDeltaIndexProbe::FetchRow`), and seeds the hash
+set with the `U`/`D` keys. A single-row `SELECT`/`UPDATE`/`DELETE` therefore costs O(log delta)
+instead of O(delta).
+
+**Snapshot visibility of the probe (#39).** Every delta change deletes a row and appends its
+replacement. When a transaction commits such a change while older transactions are still running,
+DuckDB moves the old row id from the main PK ART into `IndexEntry::deleted_rows_in_use`. Rows
+appended during a checkpoint go to `added_data_during_checkpoint`. So the probe does what core's
+index scan (`TableScanFunction`) does: under `IndexEntry::lock` it runs read-only `ARTOperator`
+lookups in all three ARTs, collects every row id stored under the key (nested leaves included),
+and keeps the one that `DataTable::CanFetch` says the transaction can see. It then repeats this
+for the transaction's own `append_indexes`, whose hits supersede the committed ones. An older
+snapshot thus keeps finding its own version of a key that another connection has since changed.
+Without this, the base row would resurface next to the delta row, and the write sinks would
+misclassify the key.
+
+Deltas without a bound PK index keep the materialized string claim set. Keyless bag deltas use a
+per-value suppression budget instead (below).
 
 ### Keyless tables
 
@@ -105,6 +131,14 @@ synthesize **`__scenario_rowno`**, a per-scan unique `BIGINT`:
 - Visible delta rows take `0..n-1` when the scan initializes.
 - Base chunks reserve ranges from an atomic counter as they stream.
 - Filters on it stay above the scan (`supports_pushdown_type`).
+
+The suppression budget swallows the *first* base copies of a value that reach it. A filter
+pushed into the base scan on the physical `rowid` would therefore change which copy is
+swallowed: with three copies at rowids 0-2 and one deleted, `WHERE rowid = 1` would consume the
+budget on rowid 1 rather than 0. Whenever the budget is non-empty, keyless `rowid` filters
+(including dynamic join filters) are therefore held back from storage and evaluated on the
+emitted chunk after suppression. They use the same post-filter that `__scenario_rowno` filters
+use (#39). Without a budget they are pushed down as usual.
 
 The update and delete sinks reject a second touch of the same row number with the keyed path's
 `modified the same row twice` error. `PlanMergeInto` hands all of a `MERGE`'s action sinks one

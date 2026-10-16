@@ -115,10 +115,13 @@ public:
 
 //! Point lookups of keys in a keyed delta through its PRIMARY KEY index, so
 //! a statement touching a few rows does not pay for the whole delta (#36).
-//! Uses the two-phase lookup of core's INSERT ... ON CONFLICT: the committed
-//! index, then the transaction's own appends; hits on rows the transaction
-//! cannot see (deleted by it, or by a committed transaction) are dropped.
-//! Lookup is thread-safe for concurrent readers once initialized.
+//! Two phases: the committed key index - its main ART plus the
+//! deleted_rows_in_use / added_data_during_checkpoint ARTs, as core's index
+//! scan does - then the transaction's own appends. Hits on rows the
+//! transaction cannot see are dropped, so an older snapshot still finds its
+//! version of a row another transaction replaced since (#39). Lookup is
+//! thread-safe for concurrent readers once initialized (read-only ART
+//! lookups under each IndexEntry lock).
 class ScenarioDeltaIndexProbe {
 public:
 	//! False when the delta has no bound unique ART on exactly the key
@@ -131,6 +134,9 @@ public:
 	//! the _op of its visible delta row ('\0' = none) and that row's rowid
 	void Lookup(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions, vector<char> &ops,
 	            vector<row_t> &row_ids);
+	//! Fetch the given columns of one delta row found by Lookup (committed or
+	//! transaction-local row id) into `result` (initialized to those types)
+	void FetchRow(ClientContext &context, row_t row_id, const vector<StorageIndex> &column_ids, DataChunk &result);
 
 private:
 	optional_ptr<DuckTableEntry> delta_table;
