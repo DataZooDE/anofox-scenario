@@ -173,7 +173,7 @@ DELETE FROM lake.events WHERE rowid = (SELECT min(rowid) FROM lake.events WHERE 
 statement ok
 INSERT INTO lake.events VALUES ('b', 2);
 
-# only the deletes of the drifted value conflict (preview rows are delta rows)
+# only the deletes of the drifted value conflict (one preview row per planned copy)
 query TT rowsort
 SELECT DISTINCT action, conflict::VARCHAR FROM scenario_merge_preview('ev_theirs') WHERE action = 'delete';
 ----
