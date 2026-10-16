@@ -64,17 +64,26 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
     base rows the scenario deleted or changed don't conflict, scenario rows do, and NULLs never
     do. Without a `UNIQUE` constraint to target you get DuckDB's own binder error (`There are
     no UNIQUE/PRIMARY KEY constraints ...`).
-  - One difference from a plain table: if several source rows match the *same* target copy,
-    the statement fails with `modified the same row twice` (plain DuckDB silently applies one
-    of the matches). This is the same rule keyed scenario tables follow.
+  - One difference from a plain table: if several source rows match the *same* target copy
+    and would *update* it, the statement fails with `modified the same row twice` (plain DuckDB
+    silently applies one of the matches). This is the same rule keyed scenario tables follow.
+- **One target row matched several times** (`UPDATE ... FROM`, `DELETE ... USING`, `MERGE`
+  with a non-unique source), keyed and keyless tables alike: repeated *deletes* are applied
+  once, as in core - the row is deleted, counted and returned by `RETURNING` once, and two
+  `MERGE ... THEN DELETE` actions may both match it. Anything that would *update* a row
+  twice, or update and delete it in one `MERGE`, fails with `modified the same row twice`
+  (core silently picks one match); the statement leaves no trace.
 - **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it. Host
   writes and scenario writes may share one explicit transaction, in any order and across any
   number of scenarios on the same host: every scenario row physically lands in the host
   database, so `BEGIN; INSERT INTO main.orders ...; UPDATE s.orders ...; COMMIT;` commits (or
   rolls back) both sides atomically. Writing to a genuinely different attached database in the
-  same transaction is still refused by DuckDB's single-writer rule. Writes in a
-  `READ ONLY` transaction or through a scenario attached `READ_ONLY` fail before execution,
-  even when they would touch zero rows.
+  same transaction is still refused by the single-writer rule, with an error naming the
+  scenario (`Cannot write to scenario '<name>': this transaction already modified database
+  ...`). Writes in a `READ ONLY` transaction, through a scenario attached `READ_ONLY`, or to a
+  frozen scenario fail at the start of execution, even when they would touch zero rows. Like
+  core, these checks run at `EXECUTE`, not `PREPARE`: a write prepared in a read-only
+  transaction (or while the scenario is frozen) runs once the executing transaction allows it.
 - **Reads under concurrency:** a transaction keeps reading its own snapshot of a scenario even
   after another connection commits changes to the same keys. A write from that older snapshot to
   a key someone else changed since fails with DuckDB's normal write-write conflict.
@@ -85,6 +94,12 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   | Setting | Default | Meaning |
   | --- | --- | --- |
   | `anofox_scenario_suppression_hash_limit` | `4194304` | The most updated/deleted keys per table that are hashed in memory (about 16 bytes each). Above it, each base row is looked up in the delta's key index instead: less memory, but scans of that table no longer run in parallel. `0` always uses the index. |
+- **Internal identity columns:** scenario tables expose virtual columns that the write path
+  uses to identify rows - `__scenario_origin` (0 = base row, 1 = scenario row),
+  `__scenario_key_<k>`, and, on keyless tables, `__scenario_rowno`. They can be selected and
+  filtered on, but they are not part of the table and not stable identifiers: `__scenario_rowno`
+  is numbered afresh by every scan (scenario rows first), so a value read by one statement may
+  name a different row in the next. Don't store or page by it.
 - **DDL:** not permitted inside scenarios (one canonical error).
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time.

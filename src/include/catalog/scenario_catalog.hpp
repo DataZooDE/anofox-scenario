@@ -47,11 +47,14 @@ public:
 	//! pipelines at once (e.g. SHOW ALL TABLES). Entries are never replaced
 	//! once published - a reference handed out must stay valid.
 	mutex table_entries_lock;
-	//! The cached entry for name, if any
-	optional_ptr<CatalogEntry> FindEntry(const string &name);
+	//! Catalog-enumeration variants of the table entries (ScenarioSchemaEntry::
+	//! Scan), kept apart so no logical name can collide with them
+	case_insensitive_map_t<unique_ptr<CatalogEntry>> enumeration_entries;
+	//! The cached entry for name, if any (enumeration: the Scan variant)
+	optional_ptr<CatalogEntry> FindEntry(const string &name, bool enumeration = false);
 	//! Publish entry under name unless another thread got there first; returns
 	//! whichever entry is cached
-	CatalogEntry &PublishEntry(const string &name, unique_ptr<CatalogEntry> entry);
+	CatalogEntry &PublishEntry(const string &name, unique_ptr<CatalogEntry> entry, bool enumeration = false);
 	//! Process-unique id of this transaction; feeds ScenarioCatalog::GetCatalogVersion
 	idx_t serial;
 };
@@ -233,15 +236,23 @@ public:
 	Catalog &GetBaseCatalog(ClientContext &context);
 	//! The scenario transaction for this catalog in the current context
 	ScenarioTransaction &GetScenarioTransaction(ClientContext &context);
-	//! Plan-time chokepoint for every write (INSERT/UPDATE/DELETE/MERGE): throws
-	//! when the transaction is read-only, the scenario or its host is attached
-	//! read-only, or the scenario is frozen. Runs before execution, so a
-	//! statement that would write zero rows fails too.
+	//! Execution-time chokepoint for every write (INSERT/UPDATE/DELETE/MERGE),
+	//! called once per scenario write sink from GetGlobalSinkState - before any
+	//! Sink runs, so a statement that would write zero rows is checked too, and
+	//! at EXECUTE rather than PREPARE (core defers its checks the same way).
+	//! Throws when the transaction is read-only, the scenario or its host is
+	//! attached read-only, or the scenario is frozen; then registers the HOST
+	//! database as the transaction's write target (MarkHostWrite). Serialized
+	//! process-wide: sibling sinks of one plan initialize on worker threads.
+	void BeginWrite(ClientContext &context, const char *operation, DatabaseModificationType type);
+
+private:
+	//! The checks of BeginWrite
 	void ThrowIfNotWritable(ClientContext &context, const char *operation);
-	//! Register a physical write to the host database from a scenario DML
-	//! sink, before its first physical write. Attributes the write to the HOST
-	//! database (the scenario catalog is never the registered write target),
-	//! so host DML and scenario DML can share one transaction.
+	//! Attribute the write to the HOST database (the scenario catalog is never
+	//! the registered write target), so host DML and scenario DML can share one
+	//! transaction. Throws a scenario-named error when the transaction already
+	//! modified a different database.
 	void MarkHostWrite(ClientContext &context, DatabaseModificationType type);
 
 private:

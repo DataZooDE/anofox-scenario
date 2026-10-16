@@ -184,16 +184,38 @@ MERGE INTO s.inventory_events t USING (VALUES ('E5', 'west', 1), ('E5', 'west', 
 ----
 same row twice
 
-# the same rule covers UPDATE ... FROM / DELETE ... USING joins
+# the same rule covers UPDATE ... FROM joins
 statement error
 UPDATE s.inventory_events SET qty = 0 FROM (VALUES ('E5'), ('E5')) v(sku) WHERE inventory_events.sku = v.sku;
 ----
 same row twice
 
-statement error
+# ...while repeated deletes are well defined: each copy is deleted once, like
+# core (#39; checked inside a rolled-back transaction to keep the fixture)
+statement ok
+BEGIN;
+
+statement ok
+CREATE TEMP TABLE e5_oracle AS SELECT * FROM oracle.inventory_events;
+
+statement ok
+DELETE FROM e5_oracle USING (VALUES ('E5'), ('E5')) v(sku) WHERE e5_oracle.sku = v.sku;
+
+statement ok
 DELETE FROM s.inventory_events USING (VALUES ('E5'), ('E5')) v(sku) WHERE inventory_events.sku = v.sku;
+
+query I
+SELECT count(*) FROM (SELECT * FROM s.inventory_events EXCEPT ALL SELECT * FROM e5_oracle);
 ----
-same row twice
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM e5_oracle EXCEPT ALL SELECT * FROM s.inventory_events);
+----
+0
+
+statement ok
+ROLLBACK;
 
 # __scenario_rowno is a per-scan unique row number (delta rows first); filters on it work
 query I

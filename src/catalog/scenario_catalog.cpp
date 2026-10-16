@@ -177,18 +177,29 @@ ScenarioTransaction &ScenarioCatalog::GetScenarioTransaction(ClientContext &cont
 	return Transaction::Get(context, *this).Cast<ScenarioTransaction>();
 }
 
+void ScenarioCatalog::BeginWrite(ClientContext &context, const char *operation, DatabaseModificationType type) {
+	// Sinks initialize their global state in PipelineInitializeTasks, which
+	// may run on worker threads in parallel (e.g. the UNION of INSERT
+	// pipelines COPY FROM DATABASE plans). MetaTransaction::ModifyDatabase and
+	// DuckTransaction::SetModifications are not synchronized, so registrations
+	// - of every scenario, they may share one host transaction - take turns.
+	static mutex begin_write_lock;
+	lock_guard<mutex> guard(begin_write_lock);
+	ThrowIfNotWritable(context, operation);
+	MarkHostWrite(context, type);
+}
+
 void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModificationType type) {
 	// The single point where a scenario write is attributed to a database.
 	// Scenario table entries are flagged temporary (see ScenarioTableEntry), so
 	// the binder does not register the scenario catalog as the statement's
-	// write target; the sinks call this before their first physical write and
-	// register the HOST database - where the rows actually land. Host DML and
+	// write target; BeginWrite registers the HOST database instead - where the
+	// rows actually land - once per sink, before execution. Host DML and
 	// scenario DML (of any number of scenarios on this host) thus modify one
 	// database and may share a transaction; a write to a genuinely different
-	// database still trips MetaTransaction's single-writer check. Because the
-	// binder-time checks no longer cover the scenario catalog, the read-only
-	// checks of ClientContext::CheckIfPreparedStatementIsExecutable are
-	// mirrored here.
+	// database is refused, naming the scenario. Because the binder-time checks
+	// no longer cover the scenario catalog, the read-only checks of
+	// ClientContext::CheckIfPreparedStatementIsExecutable are mirrored here.
 	auto &host_db = GetHostCatalog(context).GetAttached();
 	auto &meta = MetaTransaction::Get(context);
 	if (meta.IsReadOnly()) {
@@ -206,6 +217,14 @@ void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModification
 		    host_db.GetName());
 	}
 	auto modified = meta.ModifiedDatabase();
+	if (modified && modified.get() != &host_db && modified.get() != &GetAttached()) {
+		// MetaTransaction would refuse this too, but naming only the host
+		throw TransactionException(
+		    "Cannot write to scenario '%s': this transaction already modified database \"%s\". Scenario writes "
+		    "land in the host database \"%s\", and a single transaction can only write to a single attached "
+		    "database",
+		    scenario_name, modified->GetName(), host_db.GetName());
+	}
 	if (modified && modified.get() == &GetAttached()) {
 		// Defensive: a code path that registered the scenario catalog itself
 		// as the write target (none of the DML binders do, see above). Keep

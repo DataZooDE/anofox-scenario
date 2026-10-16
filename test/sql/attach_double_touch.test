@@ -1,0 +1,245 @@
+# name: test/sql/attach_double_touch.test
+# description: one statement touching a target row twice (joins, MERGE actions), keyed and keyless (#39)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# keyed: stock positions per SKU
+statement ok
+CREATE TABLE stock (sku VARCHAR PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO stock VALUES ('A1', 10), ('B2', 20), ('C3', 30), ('D4', 40);
+
+# keyless: an event log with genuine duplicate copies
+statement ok
+CREATE TABLE events (sku VARCHAR, kind VARCHAR);
+
+statement ok
+INSERT INTO events VALUES ('A1', 'sale'), ('A1', 'sale'), ('B2', 'sale'), ('C3', 'return');
+
+# recall list with a duplicate entry (two recall notices for A1)
+statement ok
+CREATE TABLE recall (sku VARCHAR);
+
+statement ok
+INSERT INTO recall VALUES ('A1'), ('A1'), ('C3');
+
+# plain-table oracles: what core DuckDB does
+statement ok
+CREATE TABLE stock_oracle AS SELECT * FROM stock;
+
+statement ok
+CREATE TABLE events_oracle AS SELECT * FROM events;
+
+statement ok
+CALL scenario_create('dt');
+
+statement ok
+ATTACH 'dt' AS s (TYPE scenario);
+
+# --- DELETE ... USING with a duplicate match deletes the row once ---------------
+
+statement ok
+DELETE FROM stock_oracle USING recall WHERE stock_oracle.sku = recall.sku;
+
+query I
+DELETE FROM s.stock USING recall WHERE stock.sku = recall.sku;
+----
+2
+
+query TI
+SELECT * FROM s.stock ORDER BY sku;
+----
+B2	20
+D4	40
+
+query I
+SELECT count(*) FROM (SELECT * FROM s.stock EXCEPT ALL SELECT * FROM stock_oracle);
+----
+0
+
+# one tombstone per deleted key
+query TI
+SELECT _op, count(*) FROM __anofox_scenario.s1_delta_stock GROUP BY _op;
+----
+D	2
+
+# keyless: each matched copy is deleted once, both A1 copies go
+statement ok
+DELETE FROM events_oracle USING recall WHERE events_oracle.sku = recall.sku;
+
+query I
+DELETE FROM s.events USING recall WHERE events.sku = recall.sku;
+----
+3
+
+query TT
+SELECT * FROM s.events ORDER BY ALL;
+----
+B2	sale
+
+query I
+SELECT count(*) FROM (SELECT * FROM events_oracle EXCEPT ALL SELECT * FROM s.events);
+----
+0
+
+# --- RETURNING reports each deleted row once ------------------------------------
+
+statement ok
+INSERT INTO s.stock VALUES ('E5', 50);
+
+statement ok
+INSERT INTO s.events VALUES ('E5', 'sale'), ('E5', 'sale');
+
+query TI rowsort
+DELETE FROM s.stock USING (VALUES ('E5'), ('E5'), ('B2')) v(sku) WHERE stock.sku = v.sku RETURNING sku, qty;
+----
+B2	20
+E5	50
+
+query TT rowsort
+DELETE FROM s.events USING (VALUES ('E5'), ('E5')) v(sku) WHERE events.sku = v.sku RETURNING sku, kind;
+----
+E5	sale
+E5	sale
+
+query I
+SELECT count(*) FROM s.events;
+----
+1
+
+# --- MERGE: DELETE twice is fine, UPDATE twice or UPDATE + DELETE is not ---------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('dt');
+
+statement ok
+CALL scenario_create('m');
+
+statement ok
+ATTACH 'm' AS s (TYPE scenario);
+
+# MERGE reports the matched source rows, exactly like core on a plain table
+query I
+MERGE INTO s.stock t USING recall r ON t.sku = r.sku WHEN MATCHED THEN DELETE;
+----
+3
+
+query TI
+SELECT * FROM s.stock ORDER BY sku;
+----
+B2	20
+D4	40
+
+# two DELETE actions matching one row through different source rows
+query I
+MERGE INTO s.stock t USING (VALUES ('B2', 1), ('B2', 2)) v(sku, q) ON t.sku = v.sku
+    WHEN MATCHED AND v.q = 1 THEN DELETE
+    WHEN MATCHED THEN DELETE;
+----
+2
+
+query TI
+SELECT * FROM s.stock ORDER BY sku;
+----
+D4	40
+
+query I
+MERGE INTO s.events t USING recall r ON t.sku = r.sku WHEN MATCHED THEN DELETE;
+----
+5
+
+query TT
+SELECT * FROM s.events;
+----
+B2	sale
+
+# keyed UPDATE matched twice: the double-touch error
+statement error
+MERGE INTO s.stock t USING (VALUES ('D4', 1), ('D4', 2)) v(sku, q) ON t.sku = v.sku
+    WHEN MATCHED THEN UPDATE SET qty = v.q;
+----
+same row twice
+
+# keyed: one row hit by a DELETE action and an UPDATE action - the clear
+# double-touch error, not a raw delta PRIMARY KEY violation
+statement error
+MERGE INTO s.stock t USING (VALUES ('D4', 1), ('D4', 2)) v(sku, q) ON t.sku = v.sku
+    WHEN MATCHED AND v.q = 1 THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = v.q;
+----
+same row twice
+
+statement error
+MERGE INTO s.stock t USING (VALUES ('D4', 1), ('D4', 2)) v(sku, q) ON t.sku = v.sku
+    WHEN MATCHED AND v.q = 2 THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = v.q;
+----
+same row twice
+
+# a scenario-inserted row (delta origin) too
+statement ok
+INSERT INTO s.stock VALUES ('F6', 60);
+
+statement error
+MERGE INTO s.stock t USING (VALUES ('F6', 1), ('F6', 2)) v(sku, q) ON t.sku = v.sku
+    WHEN MATCHED AND v.q = 1 THEN UPDATE SET qty = v.q
+    WHEN MATCHED THEN DELETE;
+----
+same row twice
+
+# UPDATE ... FROM with a duplicate match stays an error (the result would be arbitrary)
+statement error
+UPDATE s.stock SET qty = v.q FROM (VALUES ('D4', 1), ('D4', 2)) v(sku, q) WHERE stock.sku = v.sku;
+----
+same row twice
+
+# the failed statements changed nothing
+query TI
+SELECT * FROM s.stock ORDER BY sku;
+----
+D4	40
+F6	60
+
+# --- no join: tracking is off, plain statements behave as before ----------------
+
+query I
+UPDATE s.stock SET qty = qty + 1;
+----
+2
+
+query I
+UPDATE s.events SET kind = upper(kind);
+----
+1
+
+query I
+DELETE FROM s.events WHERE kind = 'SALE';
+----
+1
+
+# PK-moving updates still detect a move onto a key the statement touches
+statement ok
+INSERT INTO s.stock VALUES ('G7', 70);
+
+statement error
+UPDATE s.stock SET sku = 'G7' WHERE sku = 'D4' OR sku = 'G7';
+----
+<REGEX>:.*(same row twice|Duplicate key).*
+
+query TI
+SELECT * FROM s.stock ORDER BY sku;
+----
+D4	41
+F6	61
+G7	70
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('m');

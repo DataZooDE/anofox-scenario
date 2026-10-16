@@ -1,0 +1,96 @@
+# name: test/sql/attach_virtual_columns.test
+# description: DML whose WHERE clause references the internal __scenario_* identity columns (#39)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE readings (sensor VARCHAR, val INTEGER);
+
+statement ok
+INSERT INTO readings VALUES ('t1', 1), ('t2', 2), ('t3', 3), ('t3', 3);
+
+statement ok
+CREATE TABLE sensors (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+INSERT INTO sensors VALUES (1, 'north'), (2, 'south'), (3, 'east');
+
+statement ok
+CALL scenario_create('vc');
+
+statement ok
+ATTACH 'vc' AS s (TYPE scenario);
+
+# --- keyless: __scenario_rowno is a per-scan row number --------------------------
+
+query I
+SELECT count(DISTINCT __scenario_rowno) FROM s.readings;
+----
+4
+
+# a DELETE filtering on it removes exactly the one row it selects in that scan
+# (it used to read the identity columns at the wrong positions and crash)
+statement ok
+CREATE TEMP TABLE picked AS SELECT sensor, val FROM s.readings WHERE __scenario_rowno = 1;
+
+query I
+DELETE FROM s.readings WHERE __scenario_rowno = 1;
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT * FROM readings EXCEPT ALL SELECT * FROM s.readings EXCEPT ALL SELECT * FROM picked);
+----
+0
+
+query I
+SELECT count(*) FROM s.readings;
+----
+3
+
+# combined with other identity columns, in an expression, with RETURNING
+query I
+DELETE FROM s.readings WHERE __scenario_rowno + 0 >= 0 AND __scenario_origin = 0 RETURNING 42;
+----
+42
+42
+42
+
+query I
+SELECT count(*) FROM s.readings;
+----
+0
+
+# --- keyed: __scenario_origin / __scenario_key_<k> in the WHERE clause ------------
+
+statement ok
+INSERT INTO s.sensors VALUES (4, 'west');
+
+query IT
+DELETE FROM s.sensors WHERE __scenario_origin = 1 RETURNING id, name;
+----
+4	west
+
+query IT
+DELETE FROM s.sensors WHERE __scenario_key_0 = 2 RETURNING id, name;
+----
+2	south
+
+query IT
+SELECT * FROM s.sensors ORDER BY id;
+----
+1	north
+3	east
+
+# base untouched
+query I
+SELECT count(*) FROM sensors;
+----
+3
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('vc');

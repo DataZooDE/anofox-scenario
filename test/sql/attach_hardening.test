@@ -120,3 +120,54 @@ query I
 SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%_delta_%';
 ----
 0
+
+# --- enumeration and binder entries never share a cache slot (#39) ---------------
+# The enumeration variant of table t was cached under "\x01t", so a real table
+# named "\x01t" bound to t's entry once catalog enumeration ran in the same
+# transaction.
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+CREATE TABLE "t" (v VARCHAR PRIMARY KEY);
+
+statement ok
+INSERT INTO "t" VALUES ('x');
+
+statement ok
+CALL scenario_create('enum_cache');
+
+statement ok
+ATTACH 'enum_cache' AS e (TYPE scenario);
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) >= 2 FROM duckdb_tables() WHERE database_name = 'e';
+----
+true
+
+statement ok
+INSERT INTO e."t" VALUES ('hello');
+
+query T
+SELECT v FROM e."t" ORDER BY v;
+----
+hello
+x
+
+query I
+SELECT count(*) FROM e.t;
+----
+0
+
+statement ok
+COMMIT;
+
+statement ok
+DETACH e;
+
+statement ok
+CALL scenario_drop('enum_cache');

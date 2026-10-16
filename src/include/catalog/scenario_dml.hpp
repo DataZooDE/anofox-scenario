@@ -31,9 +31,33 @@ static constexpr column_t SCENARIO_KEY_COLUMN_START = SCENARIO_ORIGIN_COLUMN_ID 
 //! join (MERGE / UPDATE ... FROM) emits twice; the row number can.
 static constexpr column_t SCENARIO_ROWNO_COLUMN_ID = SCENARIO_ORIGIN_COLUMN_ID - 1;
 
-//! Row numbers of keyless target rows already modified by this statement,
-//! shared by all action sinks of one MERGE INTO
-using ScenarioTouchedRows = unordered_set<int64_t>;
+//! Target rows already modified by one statement (double-touch detection).
+//! One instance per UPDATE/DELETE sink, or one shared by all action sinks of a
+//! MERGE INTO. Keyed tables track the serialized key, keyless tables the
+//! per-scan __scenario_rowno (dense from 0, so two bitmaps suffice).
+//! A DELETE touching a row a DELETE of the same statement already removed is
+//! a no-op (the outcome is the same whichever match wins); every other repeat
+//! - an UPDATE, or an UPDATE and a DELETE of one MERGE - throws.
+class ScenarioTouchedRows {
+public:
+	//! true: first touch, apply it. false: repeated DELETE, skip the row.
+	bool TouchKey(const string &key, bool is_delete, const char *verb);
+	bool TouchRowno(const Value &rowno, bool is_delete, const char *verb);
+
+	[[noreturn]] static void ThrowDoubleTouch(const char *verb);
+
+private:
+	//! key -> touched by a DELETE
+	unordered_map<string, bool> keys;
+	vector<bool> rowno_touched;
+	vector<bool> rowno_deleted;
+};
+
+//! Can the physical child of an UPDATE/DELETE emit one target row more than
+//! once (a join: UPDATE ... FROM, DELETE ... USING, IN-subqueries)? A bare
+//! scan + filter + projection cannot, so it needs no touch tracking (and no
+//! per-row memory).
+bool ScenarioChildCanRepeatRows(const PhysicalOperator &child);
 
 //! State of one PK in the delta table
 struct ScenarioDeltaKeyInfo {
@@ -121,7 +145,8 @@ private:
 PhysicalOperator &MakeScenarioInsertOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                              ScenarioTableEntry &entry,
                                              vector<unique_ptr<BoundConstraint>> bound_constraints,
-                                             idx_t estimated_cardinality, bool return_chunk);
+                                             idx_t estimated_cardinality, bool return_chunk,
+                                             const char *operation = "INSERT");
 PhysicalOperator &MakeScenarioUpdateOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                              ScenarioTableEntry &entry, vector<PhysicalIndex> columns,
                                              vector<unique_ptr<Expression>> expressions,
@@ -129,15 +154,24 @@ PhysicalOperator &MakeScenarioUpdateOperator(PhysicalPlanGenerator &planner, vec
                                              vector<unique_ptr<BoundConstraint>> bound_constraints,
                                              idx_t estimated_cardinality, bool return_chunk,
                                              optional_idx row_id_start,
-                                             shared_ptr<ScenarioTouchedRows> shared_touched = nullptr);
+                                             shared_ptr<ScenarioTouchedRows> shared_touched = nullptr,
+                                             const char *operation = "UPDATE");
+//! The row-id columns (GetRowIdColumns order) are contiguous from row_id_start,
+//! as in MERGE INTO's projection
 PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                              ScenarioTableEntry &entry, idx_t row_id_start,
                                              idx_t estimated_cardinality, bool return_chunk,
-                                             shared_ptr<ScenarioTouchedRows> shared_touched = nullptr);
+                                             shared_ptr<ScenarioTouchedRows> shared_touched = nullptr,
+                                             const char *operation = "DELETE");
+
+//! Operation name the write sinks of a MERGE INTO report in BeginWrite errors
+static constexpr const char *SCENARIO_MERGE_OPERATION = "MERGE INTO";
 
 //! Keyless tables need a v0.4.1+ bag delta (with _count) for UPDATE, DELETE
 //! and MERGE INTO; throws otherwise
 void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry);
+//! The error for writing a table created in the base after the scenario
+[[noreturn]] void ThrowTableCreatedAfterScenario(ScenarioTableEntry &entry);
 
 //! Source-side state for DML operators: emits either the affected-count row
 //! or, with RETURNING, the collected result rows
