@@ -316,11 +316,18 @@ DETACH c;
 statement ok
 CALL scenario_create('legacy_parent_child', from_scenario := 'legacy_parent');
 
-# the parent was upgraded in the create transaction, then copied verbatim
-query T
-SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's2_delta_web_events' ORDER BY column_index DESC LIMIT 1;
+# branching never rewrites the parent (a concurrent writer of the parent would
+# lose its commit): the parent keeps its legacy layout...
+query I
+SELECT count(*) FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's2_delta_web_events' AND column_name = '_count';
 ----
-_count
+0
+
+# ...and the child gets the parent's rows in the bag layout, one copy each
+query TII
+SELECT d._op, d._count, count(*) FROM __anofox_scenario.s5_delta_web_events d GROUP BY ALL;
+----
+I	1	2
 
 statement ok
 ATTACH 'legacy_parent_child' AS pc (TYPE scenario);
@@ -749,3 +756,320 @@ DETACH t;
 
 statement ok
 DETACH other;
+
+# === #39: the upgrade only runs where it is safe ============================================
+
+# helper scenarios, each with a hand-made legacy delta on clicks
+
+statement ok
+CALL scenario_create('legacy_begin');
+
+statement ok
+CALL scenario_create('legacy_ride');
+
+statement ok
+CALL scenario_create('legacy_ro');
+
+statement ok
+CALL scenario_create('legacy_conc');
+
+query IT
+SELECT scenario_id, name FROM scenario_list() WHERE scenario_id >= 9 ORDER BY scenario_id;
+----
+9	legacy_begin
+10	legacy_ride
+11	legacy_ro
+12	legacy_conc
+
+foreach sid 9 10 11 12
+
+statement ok
+DROP TABLE __anofox_scenario.s${sid}_delta_clicks;
+
+statement ok
+CREATE TABLE __anofox_scenario.s${sid}_delta_clicks (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    page VARCHAR, campaign VARCHAR);
+
+statement ok
+INSERT INTO __anofox_scenario.s${sid}_delta_clicks VALUES
+    ('I', TIMESTAMP '2026-06-01 08:00:00', '/legacy', 'old'),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', '/legacy', 'old');
+
+endloop
+
+# --- ATTACH inside an explicit transaction does not claim the host as the writer ---------
+
+statement ok
+ATTACH '__TEST_DIR__/keyless_upgrade_other.db' AS other;
+
+statement ok
+BEGIN;
+
+statement ok
+ATTACH 'legacy_begin' AS lb (TYPE scenario);
+
+query I
+SELECT count(*) FROM lb.clicks WHERE page = '/legacy';
+----
+2
+
+# writing another database later in the same transaction still works
+statement ok
+INSERT INTO other.audit VALUES ('after attach');
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM other.audit WHERE note = 'after attach';
+----
+1
+
+# the upgrade was skipped, not rolled back half-way
+query I
+SELECT count(*) FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's9_delta_clicks' AND column_name = '_count';
+----
+0
+
+statement ok
+DETACH lb;
+
+statement ok
+DETACH other;
+
+# --- a transaction that already writes the host upgrades along the way --------------------
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO clicks VALUES ('/ride', NULL);
+
+statement ok
+ATTACH 'legacy_ride' AS lr (TYPE scenario);
+
+query I
+DELETE FROM lr.clicks WHERE page = '/legacy';
+----
+2
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's10_delta_clicks' AND column_name = '_count';
+----
+1
+
+statement ok
+DETACH lr;
+
+# --- READ_ONLY attach never rewrites host tables ---------------------------------------------
+
+statement ok
+ATTACH 'legacy_ro' AS lro (TYPE scenario, READ_ONLY);
+
+query TT
+SELECT page, campaign FROM lro.clicks WHERE page = '/legacy';
+----
+/legacy	old
+/legacy	old
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's11_delta_clicks' AND column_name = '_count';
+----
+0
+
+statement ok
+DETACH lro;
+
+# --- ATTACH from another connection never breaks an in-flight writer -------------------------
+
+# con1 attaches inside a transaction (no upgrade) and writes the legacy delta
+statement ok con1
+BEGIN;
+
+statement ok con1
+ATTACH 'legacy_conc' AS lc (TYPE scenario);
+
+statement ok con1
+INSERT INTO lc.clicks VALUES ('/con1', 'pending');
+
+# con2 attaches the same scenario while con1's write is uncommitted: the
+# upgrade (drop + recreate of the delta) is skipped instead of dooming con1
+statement ok con2
+ATTACH 'legacy_conc' AS lc2 (TYPE scenario);
+
+query I con2
+SELECT count(*) FROM lc2.clicks WHERE page = '/legacy';
+----
+2
+
+statement ok con1
+COMMIT;
+
+query TT con2
+SELECT page, campaign FROM lc2.clicks WHERE page IN ('/legacy', '/con1') ORDER BY ALL;
+----
+/con1	pending
+/legacy	old
+/legacy	old
+
+query I con2
+SELECT count(*) FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's12_delta_clicks' AND column_name = '_count';
+----
+0
+
+statement ok con1
+DETACH lc;
+
+# once nobody else is busy, a plain re-ATTACH upgrades
+statement ok con2
+DETACH lc2;
+
+statement ok con2
+ATTACH 'legacy_conc' AS lc2 (TYPE scenario);
+
+query TII con2
+SELECT page, _count, count(*) FROM __anofox_scenario.s12_delta_clicks GROUP BY ALL ORDER BY ALL;
+----
+/con1	1	1
+/legacy	1	2
+
+query I con2
+DELETE FROM lc2.clicks WHERE page = '/legacy';
+----
+2
+
+statement ok con2
+DETACH lc2;
+
+# --- a keyless base table with its own _count column ------------------------------------
+
+# a legacy scenario whose delta predates the table's user _count column being
+# confused with the multiplicity: created first, delta fabricated below
+statement ok
+CALL scenario_create('cnt_legacy');
+
+query I
+SELECT scenario_id FROM scenario_list() WHERE name = 'cnt_legacy';
+----
+13
+
+statement ok
+CREATE TABLE inv (sku VARCHAR, _count BIGINT);
+
+statement ok
+INSERT INTO inv VALUES ('a', 1);
+
+# pre-v0.4.1 layout: the last column is the USER's _count, not a multiplicity
+statement ok
+CREATE TABLE __anofox_scenario.s13_delta_inv (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    sku VARCHAR, _count BIGINT);
+
+statement ok
+INSERT INTO __anofox_scenario.s13_delta_inv VALUES
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 'b', 3),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 'c', 0);
+
+# read before any upgrade: one copy each, user values intact
+query TIT rowsort
+SELECT sku, _count, change_type FROM scenario_diff('cnt_legacy', 'inv');
+----
+b	3	added
+c	0	added
+
+query TIII
+SELECT table_name, rows_added, rows_modified, rows_removed FROM scenario_diff_summary('cnt_legacy') WHERE table_name = 'inv';
+----
+inv	2	0	0
+
+statement ok
+ATTACH 'cnt_legacy' AS cl (TYPE scenario);
+
+# upgraded: the multiplicity column takes a free name after the user's _count
+query T
+SELECT string_agg(column_name, ',' ORDER BY column_index) FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's13_delta_inv';
+----
+_op,_ts,sku,_count,__count
+
+query TI rowsort
+SELECT sku, _count FROM cl.inv;
+----
+a	1
+b	3
+c	0
+
+statement ok
+INSERT INTO cl.inv VALUES ('d', 7), ('d', 7);
+
+query I
+DELETE FROM cl.inv WHERE sku = 'b';
+----
+1
+
+query TI rowsort
+SELECT sku, _count FROM cl.inv;
+----
+a	1
+c	0
+d	7
+d	7
+
+query TIII
+SELECT table_name, rows_added, rows_modified, rows_removed FROM scenario_diff_summary('cnt_legacy') WHERE table_name = 'inv';
+----
+inv	3	0	0
+
+statement ok
+DETACH cl;
+
+# a new scenario over the same table: scenario_create no longer collides
+statement ok
+CALL scenario_create('cnt_fresh');
+
+statement ok
+ATTACH 'cnt_fresh' AS cf (TYPE scenario);
+
+statement ok
+INSERT INTO cf.inv VALUES ('e', 5), ('e', 5), ('f', NULL);
+
+query I
+UPDATE cf.inv SET _count = 6 WHERE sku = 'e';
+----
+2
+
+query I
+DELETE FROM cf.inv WHERE sku = 'a';
+----
+1
+
+query TI rowsort
+SELECT sku, _count FROM cf.inv;
+----
+e	6
+e	6
+f	NULL
+
+query TIT rowsort
+SELECT sku, _count, change_type FROM scenario_diff('cnt_fresh', 'inv');
+----
+a	1	removed
+e	6	added
+e	6	added
+f	NULL	added
+
+statement ok
+DETACH cf;
+
+query I
+SELECT rows_applied > 0 FROM scenario_merge('cnt_fresh');
+----
+true
+
+query TI rowsort
+SELECT sku, _count FROM inv;
+----
+e	6
+e	6
+f	NULL

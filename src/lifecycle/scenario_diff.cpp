@@ -161,9 +161,8 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	    ScenarioDelta::GetKeyColumns(context, host_catalog, entry->scenario_id, table_name, *base_entry);
 	if (pk_columns.empty()) {
 		// keyless: a bag diff over whole rows, netting the delta's I/D counts
-		if (!ScenarioDelta::CountColumnIndex(*delta).IsValid()) {
-			target.count_expr = "1";
-		}
+		auto count_name = ScenarioDelta::CountColumnName(*delta);
+		target.count_expr = count_name.empty() ? "1" : Q(count_name);
 		target.keyless = true;
 	}
 	unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
@@ -356,6 +355,8 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 	vector<string> tables;
 	//! keyless (bag) deltas: their payload columns; empty for keyed deltas
 	vector<vector<string>> bag_columns;
+	//! keyless (bag) deltas: the multiplicity column's name
+	vector<string> count_names;
 	auto schema = host_catalog.GetSchema(context, ScenarioRegistry::SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
 	if (schema) {
 		schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
@@ -370,6 +371,7 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 					}
 				}
 				bag_columns.push_back(std::move(columns));
+				count_names.push_back(ScenarioDelta::CountColumnName(table));
 			}
 		});
 	}
@@ -389,7 +391,7 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 			       " AS VARCHAR) AS table_name, CAST(coalesce(sum(__anofox_net) FILTER (__anofox_net > 0), 0) AS "
 			       "BIGINT) AS rows_added, CAST(0 AS BIGINT) AS rows_modified, CAST(coalesce(-sum(__anofox_net) "
 			       "FILTER (__anofox_net < 0), 0) AS BIGINT) AS rows_removed FROM (SELECT sum(CASE WHEN _op = 'I' "
-			       "THEN _count ELSE -_count END) AS __anofox_net FROM " +
+			       "THEN " + Q(count_names[t]) + " ELSE -" + Q(count_names[t]) + " END) AS __anofox_net FROM " +
 			       host_prefix + Q(delta_table) + " GROUP BY " + ColumnList(bag_columns[t]) + ")";
 			continue;
 		}
