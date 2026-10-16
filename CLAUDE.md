@@ -292,6 +292,7 @@ test/sql/
   scenario_materialized_fk.test   # materialized copies over FK schemas; merge-back enforces FKs (#24)
   scenario_keyless_upgrade.test   # pre-v0.4.1 keyless deltas (no _count) upgraded in place (#31)
   scenario_ducklake_keyless_merge.test # keyless bag merge-back into DuckLake bases: exact copies, drift (#31)
+  attach_delta_key_probe.test     # single-row DML over a 100k-row delta resolves keys via the delta PK index, vs an oracle (#36)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
 ```

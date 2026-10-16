@@ -4,6 +4,10 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/common/types/conflict_manager.hpp"
+#include "duckdb/common/types/constraint_conflict_info.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
+#include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -12,8 +16,10 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
 namespace duckdb {
@@ -518,6 +524,155 @@ void ScenarioDelta::ScanTableRows(ClientContext &context, DuckTableEntry &table,
 				}
 			}
 		}
+	}
+}
+
+void ScenarioDelta::ScanTableChunks(ClientContext &context, DuckTableEntry &table, vector<StorageIndex> column_ids,
+                                    const vector<LogicalType> &scan_types,
+                                    const std::function<void(DataChunk &)> &callback) {
+	auto &data_table = table.GetStorage();
+	auto &transaction = DuckTransaction::Get(context, table.catalog);
+
+	ParallelTableScanState parallel_state;
+	data_table.InitializeParallelScan(context, parallel_state, {});
+	TableScanState state;
+	state.Initialize(std::move(column_ids), context);
+
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(context), scan_types);
+	while (data_table.NextParallelScan(context, parallel_state, state) > 0) {
+		while (true) {
+			chunk.Reset();
+			data_table.Scan(transaction, chunk, state);
+			if (chunk.size() == 0) {
+				break;
+			}
+			callback(chunk);
+		}
+	}
+}
+
+//===----------------------------------------------------------------------===//
+// ScenarioDeltaIndexProbe
+//===----------------------------------------------------------------------===//
+
+bool ScenarioDeltaIndexProbe::Initialize(ClientContext &context, DuckTableEntry &delta, const vector<idx_t> &keys) {
+	delta_table = nullptr;
+	key_columns = keys;
+	key_ids.clear();
+	if (key_columns.empty()) {
+		return false;
+	}
+	for (auto key_col : key_columns) {
+		key_ids.insert(ScenarioDelta::PAYLOAD_START + key_col);
+	}
+	auto &storage = delta.GetStorage();
+	storage.BindIndexes(context);
+	ConflictInfo conflict_info(key_ids);
+	for (auto &index : storage.GetDataTableInfo()->GetIndexes().Indexes()) {
+		if (index.IsBound() && index.IsUnique() && index.GetIndexType() == ART::TYPE_NAME &&
+		    conflict_info.ConflictTargetMatches(index)) {
+			delta_table = &delta;
+			return true;
+		}
+	}
+	return false;
+}
+
+void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions,
+                                     vector<char> &ops, vector<row_t> &row_ids) {
+	D_ASSERT(delta_table);
+	D_ASSERT(key_positions.size() == key_columns.size());
+	auto count = chunk.size();
+	ops.assign(count, '\0');
+	row_ids.assign(count, -1);
+	if (count == 0) {
+		return;
+	}
+	auto &storage = delta_table->GetStorage();
+	auto types = storage.GetTypes();
+	// The probe chunk is in delta layout: key columns hold the keys, every
+	// other column is NULL (unique indexes ignore NULLs, so the delta's
+	// secondary UNIQUE indexes stay silent)
+	DataChunk probe;
+	probe.InitializeEmpty(types);
+	for (idx_t col = 0; col < types.size(); col++) {
+		probe.data[col].Reference(Value(types[col]));
+	}
+	for (idx_t k = 0; k < key_columns.size(); k++) {
+		auto delta_col = ScenarioDelta::PAYLOAD_START + key_columns[k];
+		auto &source = chunk.data[key_positions[k]];
+		if (source.GetType() == types[delta_col]) {
+			probe.data[delta_col].Reference(source);
+		} else {
+			Vector cast(types[delta_col], count);
+			VectorOperations::Cast(context, source, cast, count);
+			probe.data[delta_col].Reference(cast);
+		}
+	}
+	probe.SetCardinality(count);
+
+	auto &transaction = DuckTransaction::Get(context, delta_table->catalog);
+	auto &local_storage = LocalStorage::Get(transaction);
+	auto local = local_storage.GetStorage(storage);
+	ConflictInfo conflict_info(key_ids);
+	vector<StorageIndex> op_column {StorageIndex(ScenarioDelta::OP_COL)};
+	auto collect = [&](bool global) {
+		ConflictManager manager(VerifyExistenceType::APPEND, count, &conflict_info);
+		if (global) {
+			storage.VerifyUniqueIndexes(storage.GetDataTableInfo()->GetIndexes(), local, probe, &manager);
+		} else {
+			storage.VerifyUniqueIndexes(local->append_indexes, local, probe, &manager);
+		}
+		if (!manager.HasConflicts()) {
+			return;
+		}
+		if (global) {
+			manager.FinalizeGlobal(transaction, storage);
+		} else {
+			manager.FinalizeLocal(storage, local_storage);
+		}
+		auto conflict_count = manager.ConflictCount();
+		if (conflict_count == 0) {
+			return;
+		}
+		// Finalize prefers a visible second hit, but a lone hit may still name
+		// a row this transaction cannot see: keep only the visible ones
+		auto &inverted_sel = manager.GetInvertedSel();
+		auto hit_ids = FlatVector::GetData<row_t>(manager.GetRowIds());
+		Vector visible_ids(LogicalType::ROW_TYPE, conflict_count);
+		auto visible_data = FlatVector::GetData<row_t>(visible_ids);
+		vector<idx_t> visible_rows;
+		for (idx_t i = 0; i < conflict_count; i++) {
+			auto row_id = hit_ids[i];
+			if (global ? storage.CanFetch(transaction, row_id) : local_storage.CanFetch(storage, row_id)) {
+				visible_data[visible_rows.size()] = row_id;
+				visible_rows.push_back(inverted_sel.get_index(i));
+			}
+		}
+		if (visible_rows.empty()) {
+			return;
+		}
+		DataChunk fetched;
+		fetched.Initialize(Allocator::Get(context), {LogicalType::VARCHAR}, visible_rows.size());
+		ColumnFetchState fetch_state;
+		if (global) {
+			storage.Fetch(transaction, fetched, op_column, visible_ids, visible_rows.size(), fetch_state);
+		} else {
+			local_storage.FetchChunk(storage, visible_ids, visible_rows.size(), op_column, fetched, fetch_state);
+		}
+		if (fetched.size() != visible_rows.size()) {
+			throw InternalException("anofox_scenario: delta index probe fetched %llu of %llu rows", fetched.size(),
+			                        visible_rows.size());
+		}
+		for (idx_t i = 0; i < visible_rows.size(); i++) {
+			ops[visible_rows[i]] = fetched.GetValue(0, i).GetValue<string>()[0];
+			row_ids[visible_rows[i]] = visible_data[i];
+		}
+	};
+	collect(true);
+	if (local) {
+		collect(false);
 	}
 }
 

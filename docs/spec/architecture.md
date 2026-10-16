@@ -78,6 +78,13 @@ reject the operations that make no sense on a branch — which is why all DDL is
 Delta-first ordering is what makes a scenario row win over the base row with the same key — so an
 `UPDATE` reads back as a modification rather than a duplicate.
 
+For keyed deltas, the claimed set is never materialized (#36). Step 1 emits the `I`/`U` rows
+chunk-wise. In step 2, each base chunk probes the delta's `PRIMARY KEY` index
+(`ScenarioDeltaIndexProbe`, `scenario_delta.cpp`) and drops the rows whose key has a `U` or `D` row.
+A point query therefore pays for the rows it reads, not for the whole delta: a 100k-row delta no
+longer costs every single-row `UPDATE`/`DELETE` a full key-set build. Deltas without a bound PK
+index, and keyless bag deltas, keep the materialized claim set.
+
 ### Keyless tables
 
 Without a PK or declared `key_columns` there is nothing to match on, so the delta becomes a
@@ -172,6 +179,15 @@ repeatedly during a scenario's life, so each write resolves an **op transition**
 
 Collapsing to net effect keeps the delta proportional to *rows touched* rather than *statements
 run*, and keeps `scenario_diff` honest: a row updated five times reports one modification.
+
+To find the existing delta row, a keyed sink resolves only the keys its chunk references
+(`ScenarioDeltaKeyMap`, `scenario_insert.cpp`). It probes the delta's `PRIMARY KEY` ART, first the
+committed index and then the transaction's own appends, the same two-phase lookup core uses for
+`INSERT ... ON CONFLICT`. Hits on rows not visible to the transaction are dropped. Each key is
+probed once per statement, before the statement changes it, so the result equals a
+start-of-statement snapshot. A statement therefore costs O(rows it touches), not O(delta size).
+That matters for loops of single-row prepared statements over a large delta (#36). A delta
+without a bound PK index falls back to a full snapshot scan.
 
 `NOT NULL`, `CHECK`, PK, and (on keyed tables) `UNIQUE` are validated against the **merged**
 state, so a scenario insert colliding with an untouched base row is caught. Conflicts with base

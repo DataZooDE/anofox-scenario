@@ -1,0 +1,303 @@
+# name: test/sql/attach_delta_key_probe.test
+# description: single-row DML over a large delta resolves keys through the delta's PK index (#36). Every statement runs against the scenario and against a plain copy of the base (the oracle); the merged relation must equal the oracle.
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+load __TEST_DIR__/scenario_delta_key_probe.db
+
+# the runner would otherwise checkpoint the 200k-row tables on most commits,
+# drowning the per-statement cost this test is about
+statement ok
+SET checkpoint_threshold = '1GB';
+
+# 200k orders over a composite (VARCHAR, INTEGER) key
+statement ok
+CREATE TABLE orders (region VARCHAR, order_no INTEGER, qty INTEGER NOT NULL, PRIMARY KEY (region, order_no));
+
+statement ok
+INSERT INTO orders
+SELECT r.region, o.order_no, o.order_no % 97
+FROM (VALUES ('AMER'), ('APAC'), ('EU'), ('LATAM'), ('MEA')) r(region), range(40000) o(order_no);
+
+statement ok
+CREATE TABLE oracle AS FROM orders;
+
+statement ok
+ALTER TABLE oracle ADD PRIMARY KEY (region, order_no);
+
+statement ok
+CALL scenario_create('plan', 'large delta, single-row DML');
+
+statement ok
+ATTACH 'plan' AS s (TYPE scenario);
+
+# 100k tombstones: the delta is large before any single-row statement runs
+statement ok
+DELETE FROM s.orders WHERE order_no % 2 = 0;
+
+statement ok
+DELETE FROM oracle WHERE order_no % 2 = 0;
+
+query I
+SELECT count(*) FROM __anofox_scenario.s1_delta_orders WHERE _op = 'D';
+----
+100000
+
+# re-insert 1000 deleted keys, one autocommit statement each (D -> U)
+loop i 0 1000
+
+statement ok
+INSERT INTO s.orders VALUES ('EU', ${i} * 2, 1000 + ${i});
+
+statement ok
+INSERT INTO oracle VALUES ('EU', ${i} * 2, 1000 + ${i});
+
+endloop
+
+# 1000 brand-new keys (I)
+loop i 0 1000
+
+statement ok
+INSERT INTO s.orders VALUES ('NEW', ${i}, 7);
+
+statement ok
+INSERT INTO oracle VALUES ('NEW', ${i}, 7);
+
+endloop
+
+# collisions are still found: a key the scenario re-inserted, a new key, a live base key
+statement error
+INSERT INTO s.orders VALUES ('EU', 0, 1);
+----
+the key was already inserted or modified in this scenario
+
+statement error
+INSERT INTO s.orders VALUES ('NEW', 999, 1);
+----
+the key was already inserted or modified in this scenario
+
+statement error
+INSERT INTO s.orders VALUES ('AMER', 1, 1);
+----
+the key exists in the base table
+
+# single-row updates of base rows (base -> U)
+loop i 0 500
+
+statement ok
+UPDATE s.orders SET qty = qty + 1 WHERE region = 'APAC' AND order_no = ${i} * 2 + 1;
+
+statement ok
+UPDATE oracle SET qty = qty + 1 WHERE region = 'APAC' AND order_no = ${i} * 2 + 1;
+
+endloop
+
+# single-row updates of scenario rows (U -> U, I -> I)
+loop i 0 200
+
+statement ok
+UPDATE s.orders SET qty = qty * 2 WHERE region = 'EU' AND order_no = ${i} * 2;
+
+statement ok
+UPDATE oracle SET qty = qty * 2 WHERE region = 'EU' AND order_no = ${i} * 2;
+
+statement ok
+UPDATE s.orders SET qty = qty + ${i} WHERE region = 'NEW' AND order_no = 999 - ${i};
+
+statement ok
+UPDATE oracle SET qty = qty + ${i} WHERE region = 'NEW' AND order_no = 999 - ${i};
+
+endloop
+
+# PK-moving single-row updates: the new key is resolved too
+loop i 0 200
+
+statement ok
+UPDATE s.orders SET order_no = order_no + 100000 WHERE region = 'LATAM' AND order_no = ${i} * 2 + 1;
+
+statement ok
+UPDATE oracle SET order_no = order_no + 100000 WHERE region = 'LATAM' AND order_no = ${i} * 2 + 1;
+
+endloop
+
+# moving onto a key the scenario already holds is still a collision
+statement error
+UPDATE s.orders SET order_no = 100001 WHERE region = 'LATAM' AND order_no = 1001;
+----
+Duplicate key
+
+# single-row deletes of scenario inserts (I -> gone) and base rows (-> D)
+loop i 0 500
+
+statement ok
+DELETE FROM s.orders WHERE region = 'NEW' AND order_no = ${i};
+
+statement ok
+DELETE FROM oracle WHERE region = 'NEW' AND order_no = ${i};
+
+statement ok
+DELETE FROM s.orders WHERE region = 'MEA' AND order_no = ${i} * 2 + 1;
+
+statement ok
+DELETE FROM oracle WHERE region = 'MEA' AND order_no = ${i} * 2 + 1;
+
+endloop
+
+# a deleted scenario insert can be inserted again (its old delta row is not visible)
+statement ok
+INSERT INTO s.orders VALUES ('NEW', 0, 11);
+
+statement ok
+INSERT INTO oracle VALUES ('NEW', 0, 11);
+
+# one explicit transaction: keys resolve against this transaction's own appends
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM s.orders WHERE region = 'AMER' AND order_no = 3;
+
+statement ok
+INSERT INTO s.orders VALUES ('AMER', 3, 33);
+
+statement ok
+INSERT INTO s.orders VALUES ('TXN', 1, 1);
+
+statement ok
+DELETE FROM s.orders WHERE region = 'TXN' AND order_no = 1;
+
+statement ok
+INSERT INTO s.orders VALUES ('TXN', 1, 2);
+
+statement ok
+UPDATE s.orders SET qty = 3 WHERE region = 'TXN' AND order_no = 1;
+
+statement ok
+COMMIT;
+
+statement ok
+BEGIN;
+
+statement ok
+DELETE FROM oracle WHERE region = 'AMER' AND order_no = 3;
+
+statement ok
+INSERT INTO oracle VALUES ('AMER', 3, 33);
+
+statement ok
+INSERT INTO oracle VALUES ('TXN', 1, 3);
+
+statement ok
+COMMIT;
+
+# a transaction-local duplicate is found
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO s.orders VALUES ('TXN', 2, 1);
+
+statement error
+INSERT INTO s.orders VALUES ('TXN', 2, 1);
+----
+the key was already inserted or modified in this scenario
+
+statement ok
+ROLLBACK;
+
+# rolled-back appends leave nothing behind
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO s.orders VALUES ('RB', 1, 1);
+
+statement ok
+DELETE FROM s.orders WHERE region = 'EU' AND order_no = 4;
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO s.orders VALUES ('RB', 1, 1);
+
+statement ok
+INSERT INTO oracle VALUES ('RB', 1, 1);
+
+statement error
+INSERT INTO s.orders VALUES ('EU', 4, 1);
+----
+the key was already inserted or modified in this scenario
+
+# the merged relation equals the oracle, both ways
+query I
+SELECT count(*) FROM (FROM s.orders EXCEPT ALL FROM oracle);
+----
+0
+
+query I
+SELECT count(*) FROM (FROM oracle EXCEPT ALL FROM s.orders);
+----
+0
+
+query II
+SELECT count(*), sum(qty) = (SELECT sum(qty) FROM oracle) FROM s.orders;
+----
+101003	true
+
+# after a checkpoint (delta rows rewritten) and a restart (indexes reloaded)
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SET checkpoint_threshold = '1GB';
+
+statement ok
+ATTACH 'plan' AS s (TYPE scenario);
+
+statement ok
+UPDATE s.orders SET qty = 0 WHERE region = 'EU' AND order_no = 0;
+
+statement ok
+UPDATE oracle SET qty = 0 WHERE region = 'EU' AND order_no = 0;
+
+statement ok
+DELETE FROM s.orders WHERE region = 'EU' AND order_no = 2;
+
+statement ok
+DELETE FROM oracle WHERE region = 'EU' AND order_no = 2;
+
+statement ok
+INSERT INTO s.orders VALUES ('EU', 2, 22);
+
+statement ok
+INSERT INTO oracle VALUES ('EU', 2, 22);
+
+statement error
+INSERT INTO s.orders VALUES ('NEW', 600, 1);
+----
+the key was already inserted or modified in this scenario
+
+statement error
+INSERT INTO s.orders VALUES ('AMER', 5, 1);
+----
+the key exists in the base table
+
+query I
+SELECT count(*) FROM (FROM s.orders EXCEPT ALL FROM oracle);
+----
+0
+
+query I
+SELECT count(*) FROM (FROM oracle EXCEPT ALL FROM s.orders);
+----
+0
+
+# the base was never written
+query II
+SELECT count(*), sum(qty) FROM orders;
+----
+200000	9594510

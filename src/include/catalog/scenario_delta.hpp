@@ -99,7 +99,7 @@ public:
 
 	//! Serialize the key columns of a row into a canonical comparable string
 	//! (length-prefixed, NULL-tagged). Used for suppression sets and the
-	//! delta key map; deltas are small by invariant.
+	//! delta key map (keyed deltas resolve keys via ScenarioDeltaIndexProbe).
 	static string MakeKey(DataChunk &chunk, idx_t row, const vector<idx_t> &key_positions);
 
 	//! Scan the given columns of a table in the caller's transaction,
@@ -108,6 +108,34 @@ public:
 	static void ScanTableRows(ClientContext &context, DuckTableEntry &table, vector<StorageIndex> column_ids,
 	                          const vector<LogicalType> &scan_types,
 	                          const std::function<bool(DataChunk &, idx_t)> &callback);
+	//! Chunk-at-a-time variant of ScanTableRows (vectorized consumers)
+	static void ScanTableChunks(ClientContext &context, DuckTableEntry &table, vector<StorageIndex> column_ids,
+	                            const vector<LogicalType> &scan_types, const std::function<void(DataChunk &)> &callback);
+};
+
+//! Point lookups of keys in a keyed delta through its PRIMARY KEY index, so
+//! a statement touching a few rows does not pay for the whole delta (#36).
+//! Uses the two-phase lookup of core's INSERT ... ON CONFLICT: the committed
+//! index, then the transaction's own appends; hits on rows the transaction
+//! cannot see (deleted by it, or by a committed transaction) are dropped.
+//! Lookup is thread-safe for concurrent readers once initialized.
+class ScenarioDeltaIndexProbe {
+public:
+	//! False when the delta has no bound unique ART on exactly the key
+	//! columns; callers then fall back to scanning the delta
+	bool Initialize(ClientContext &context, DuckTableEntry &delta_table, const vector<idx_t> &key_columns);
+	bool IsInitialized() const {
+		return delta_table != nullptr;
+	}
+	//! For every row of `chunk` (key values at `key_positions`, in key order):
+	//! the _op of its visible delta row ('\0' = none) and that row's rowid
+	void Lookup(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions, vector<char> &ops,
+	            vector<row_t> &row_ids);
+
+private:
+	optional_ptr<DuckTableEntry> delta_table;
+	vector<idx_t> key_columns;
+	unordered_set<column_t> key_ids;
 };
 
 } // namespace duckdb

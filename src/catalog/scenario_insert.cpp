@@ -32,8 +32,53 @@ namespace duckdb {
 // Shared write-path helpers (also used by update/delete sinks)
 //===----------------------------------------------------------------------===//
 
-void ScenarioDeltaKeyMap::Load(ClientContext &context, DuckTableEntry &delta_table, const vector<idx_t> &pk_columns) {
+void ScenarioDeltaKeyMap::Initialize(ClientContext &context, DuckTableEntry &delta, const vector<idx_t> &pk) {
 	keys.clear();
+	resolved.clear();
+	delta_table = &delta;
+	pk_columns = pk;
+	// every keyed delta is created with PRIMARY KEY (<key columns>)
+	if (!index_probe.Initialize(context, delta, pk_columns)) {
+		LoadAll(context);
+	}
+}
+
+void ScenarioDeltaKeyMap::Resolve(ClientContext &context, DataChunk &chunk, const vector<idx_t> &key_positions) {
+	if (!index_probe.IsInitialized() || chunk.size() == 0) {
+		return;
+	}
+	SelectionVector sel(chunk.size());
+	idx_t count = 0;
+	vector<string> probe_keys;
+	for (idx_t i = 0; i < chunk.size(); i++) {
+		auto key = ScenarioDelta::MakeKey(chunk, i, key_positions);
+		if (resolved.insert(key).second) {
+			sel.set_index(count++, i);
+			probe_keys.push_back(std::move(key));
+		}
+	}
+	if (count == 0) {
+		return;
+	}
+	DataChunk unresolved;
+	unresolved.InitializeEmpty(chunk.GetTypes());
+	unresolved.Reference(chunk);
+	unresolved.Slice(sel, count);
+	vector<char> ops;
+	vector<row_t> row_ids;
+	index_probe.Lookup(context, unresolved, key_positions, ops, row_ids);
+	for (idx_t i = 0; i < count; i++) {
+		if (ops[i] != '\0') {
+			ScenarioDeltaKeyInfo info;
+			info.op = ops[i];
+			info.row_id = row_ids[i];
+			keys[probe_keys[i]] = info;
+		}
+	}
+}
+
+void ScenarioDeltaKeyMap::LoadAll(ClientContext &context) {
+	auto &delta_table = *this->delta_table;
 	vector<StorageIndex> column_ids;
 	vector<LogicalType> types;
 	column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
@@ -205,7 +250,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		// parent row may exist only in the scenario)
 		gstate.base_probe.Initialize(entry, gstate.pk_columns);
 		if (!gstate.pk_columns.empty()) {
-			gstate.delta_keys.Load(client, delta, gstate.pk_columns);
+			gstate.delta_keys.Initialize(client, delta, gstate.pk_columns);
 		}
 		gstate.delta_chunk.Initialize(Allocator::Get(client), delta.GetStorage().GetTypes());
 		gstate.verify_chunk.Initialize(Allocator::Get(client), entry.GetTypes());
@@ -229,6 +274,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 			}
 			key_positions.push_back(pk_col);
 		}
+		gstate.delta_keys.Resolve(client, chunk, key_positions);
 		SelectionVector base_verify_sel(chunk.size());
 		idx_t base_verify_count = 0;
 		for (idx_t i = 0; i < chunk.size(); i++) {
