@@ -163,6 +163,27 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 				               " AND " + mat_match + " AND (" + drift_columns + "))";
 			}
 		}
+		if (!entry->base_catalog.empty() && pk_columns.empty()) {
+			// keyless lake table: a deleted value (negative net) drifted when
+			// its lake count differs from its snapshot count - mirrors
+			// scenario_merge's bag conflict check
+			string match_d2, match_b, match_m;
+			for (auto &col : base_entry->GetColumns().Logical()) {
+				auto name = QM(col.Name());
+				if (!match_b.empty()) {
+					match_d2 += " AND ";
+					match_b += " AND ";
+					match_m += " AND ";
+				}
+				match_d2 += "d2." + name + " IS NOT DISTINCT FROM d." + name;
+				match_b += "b." + name + " IS NOT DISTINCT FROM d." + name;
+				match_m += "m." + name + " IS NOT DISTINCT FROM d." + name;
+			}
+			drift_clause = "((SELECT sum(CASE WHEN d2._op = 'I' THEN d2._count ELSE -d2._count END) FROM " +
+			               internal_prefix + QM(delta_pair.first) + " d2 WHERE " + match_d2 +
+			               ") < 0 AND (SELECT count(*) FROM " + base_name + " b WHERE " + match_b +
+			               ") <> (SELECT count(*) FROM " + snapshot_ref + " WHERE " + match_m + "))";
+		}
 		if (!sql.empty()) {
 			sql += " UNION ALL ";
 		}
@@ -303,23 +324,78 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 		}
 
 		if (pk_columns.empty()) {
-			// keyless bag deltas cannot be applied to a foreign base by SQL
-			// alone (deleting N of M identical rows needs rowids): refuse
-			// loudly instead of silently dropping the deletes
-			auto deletes = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'D'");
-			if (deletes > 0) {
-				con.Rollback();
-				throw NotImplementedException(
-				    "Cannot merge scenario '%s': keyless table '%s' has scenario deletes/updates, which cannot "
-				    "be applied to base catalog '%s'. Declare key_columns at scenario_create for keyed "
-				    "merge-back",
-				    entry.name, logical_name, entry.base_catalog);
+			// keyless bag: whole-row identity. Net multiplicity per value;
+			// negative nets delete exactly that many lake copies (picked by
+			// DuckLake rowid), positive nets insert copies. A deleted value
+			// whose lake count differs from its snapshot count drifted
+			// (3-way conflict, like a changed row under a touched key).
+			string cols, b_cols, n_cols, match_b, match_m;
+			for (auto &col : base_entry->GetColumns().Logical()) {
+				auto name = QM(col.Name());
+				if (!cols.empty()) {
+					cols += ", ";
+					b_cols += ", ";
+					n_cols += ", ";
+					match_b += " AND ";
+					match_m += " AND ";
+				}
+				cols += name;
+				b_cols += "b." + name;
+				n_cols += "n." + name;
+				match_b += "b." + name + " IS NOT DISTINCT FROM n." + name;
+				match_m += "m." + name + " IS NOT DISTINCT FROM n." + name;
 			}
-			auto inserted = count_of("SELECT count(*) FROM " + delta_ref + " d WHERE d._op = 'I'");
-			if (inserted > 0) {
-				run("INSERT INTO " + base_ref + " SELECT " + payload_cols + " FROM " + delta_ref +
-				    " d WHERE d._op = 'I'");
-				rows_applied += inserted;
+			// per-value nets + lake/snapshot counts, captured before the lake
+			// is touched
+			run("CREATE OR REPLACE TEMP TABLE __anofox_merge_bag AS WITH net AS (SELECT " + payload_cols +
+			    ", CAST(sum(CASE WHEN d._op = 'I' THEN d._count ELSE -d._count END) AS BIGINT) AS __anofox_net FROM " + delta_ref +
+			    " d GROUP BY ALL) SELECT " + n_cols + ", n.__anofox_net, CASE WHEN n.__anofox_net < 0 THEN (SELECT "
+			    "count(*) FROM " + base_ref + " b WHERE " + match_b + ") END AS __anofox_now, CASE WHEN "
+			    "n.__anofox_net < 0 THEN (SELECT count(*) FROM " + snapshot_ref + " WHERE " + match_m +
+			    ") END AS __anofox_snap FROM net n WHERE n.__anofox_net <> 0");
+			string drifted = "n.__anofox_net < 0 AND n.__anofox_now <> n.__anofox_snap";
+			auto n_conflicts = count_of("SELECT count(*) FROM __anofox_merge_bag n WHERE " + drifted);
+			if (n_conflicts > 0 && policy == MergeConflictPolicy::ABORT) {
+				auto sample = run("SELECT CAST((" + n_cols + ") AS VARCHAR) FROM __anofox_merge_bag n WHERE " +
+				                  drifted + " LIMIT 1");
+				auto sample_row = sample->Fetch()->GetValue(0, 0).ToString();
+				con.Rollback();
+				throw ConstraintException(
+				    "Cannot merge scenario '%s': the base changed underneath it (e.g. the copies of row %s of "
+				    "keyless table '%s'). Rerun with on_conflict := 'ours' (scenario wins) or 'theirs' (base wins)",
+				    entry.name, sample_row, logical_name);
+			}
+			conflicts_resolved += n_conflicts;
+			// copies to delete / add per value: clean values apply the net;
+			// drifted values keep the lake ('theirs') or end at the
+			// scenario's count snap + net ('ours')
+			string target = "greatest(n.__anofox_snap + n.__anofox_net, 0)";
+			string del_expr, add_expr;
+			if (policy == MergeConflictPolicy::OURS) {
+				del_expr = "CASE WHEN n.__anofox_net >= 0 THEN 0 WHEN n.__anofox_now <> n.__anofox_snap THEN "
+				           "greatest(n.__anofox_now - " + target + ", 0) ELSE least(-n.__anofox_net, n.__anofox_now) END";
+				add_expr = "CASE WHEN n.__anofox_net > 0 THEN n.__anofox_net WHEN n.__anofox_now <> n.__anofox_snap "
+				           "THEN greatest(" + target + " - n.__anofox_now, 0) ELSE 0 END";
+			} else {
+				del_expr = "CASE WHEN n.__anofox_net >= 0 OR n.__anofox_now <> n.__anofox_snap THEN 0 ELSE "
+				           "least(-n.__anofox_net, n.__anofox_now) END";
+				add_expr = "greatest(n.__anofox_net, 0)";
+			}
+			run("CREATE OR REPLACE TEMP TABLE __anofox_merge_bag_plan AS SELECT " + n_cols + ", " + del_expr +
+			    " AS __anofox_del, " + add_expr + " AS __anofox_add FROM __anofox_merge_bag n");
+			// delete exactly __anofox_del copies of each value (lowest rowids)
+			auto deleted = count_of(
+			    "DELETE FROM " + base_ref + " WHERE rowid IN (SELECT __anofox_rid FROM (SELECT b.rowid AS "
+			    "__anofox_rid, n.__anofox_del, row_number() OVER (PARTITION BY " + b_cols +
+			    " ORDER BY b.rowid) AS __anofox_rn FROM " + base_ref + " b JOIN __anofox_merge_bag_plan n ON " +
+			    match_b + " WHERE n.__anofox_del > 0) WHERE __anofox_rn <= __anofox_del)");
+			auto inserted = count_of("INSERT INTO " + base_ref + " SELECT " + cols + " FROM (SELECT " + n_cols +
+			                         ", unnest(range(n.__anofox_add)) FROM __anofox_merge_bag_plan n WHERE "
+			                         "n.__anofox_add > 0)");
+			run("DROP TABLE __anofox_merge_bag");
+			run("DROP TABLE __anofox_merge_bag_plan");
+			rows_applied += deleted + inserted;
+			if (deleted + inserted > 0) {
 				tables_changed++;
 			}
 			continue;

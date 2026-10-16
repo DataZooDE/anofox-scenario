@@ -100,9 +100,10 @@ SELECT count(*) FROM s.forecast WHERE id = 4;
 ----
 0
 
-# --- mixing host writes and scenario writes in one transaction: clear error ----------
-# (single-writer-per-transaction; physically both go to the host, but the
-# binder's registration targets differ - documented v1 limitation)
+# --- mixing host writes and scenario writes in one transaction (#31) -----------
+# Both physically land in the host database, and the scenario sinks attribute
+# their writes to the host, so the single-writer rule holds (see
+# attach_mixed_txn.test for the full matrix).
 
 statement ok
 BEGIN;
@@ -110,13 +111,16 @@ BEGIN;
 statement ok
 INSERT INTO forecast VALUES (9, 900);
 
-statement error
+statement ok
 INSERT INTO s.forecast VALUES (10, 1000);
-----
-<REGEX>:.*single transaction.*
 
 statement ok
 ROLLBACK;
+
+query II
+SELECT (SELECT count(*) FROM forecast WHERE id IN (9, 10)), (SELECT count(*) FROM s.forecast WHERE id IN (9, 10));
+----
+0	0
 
 statement ok
 DETACH s;

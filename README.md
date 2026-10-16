@@ -341,10 +341,10 @@ isolation tiers, and a map of the source tree — see
 
 ## Limitations
 
-- **Single-writer**: host writes and scenario writes cannot share one explicit transaction
 - **DDL restrictions**: schema modifications are not permitted inside scenarios
-- **Keyless tables**: tables with no PRIMARY KEY need `key_columns :=` declared to unlock
-  `MERGE INTO` and `ON CONFLICT`; UPDATE/DELETE and `scenario_diff` work with bag semantics
+- **Keyless tables**: tables with no PRIMARY KEY use bag semantics for UPDATE/DELETE/MERGE
+  INTO, `scenario_diff` and merge-back (host and DuckLake bases). `ON CONFLICT` needs a `UNIQUE`
+  conflict target. Declare `key_columns :=` for keyed matching
 - **Overlay isolation**: in the default `delta` mode, base changes show through unless the
   scenario touched the same key — use `mode := 'materialized'` or a DuckLake `base :=` for
   full isolation

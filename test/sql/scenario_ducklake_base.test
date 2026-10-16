@@ -185,7 +185,7 @@ SELECT * FROM scenario_merge('lakescen');
 ----
 <REGEX>:.*already merged.*
 
-# --- keyless lake tables: bag deletes cannot merge back (codex finding #1) ----------
+# --- keyless lake tables: bag deletes merge back (#31) ------------------------------
 
 statement ok
 CREATE TABLE lake.rawlog (line VARCHAR);
@@ -216,16 +216,18 @@ SELECT line, change_type FROM scenario_diff('main', 'lakebag', 'rawlog');
 ----
 a	removed
 
-statement error
-SELECT * FROM scenario_merge('lakebag');
+# keyless lake deletes merge back with exact multiplicity (#31); the later
+# 'c' is not a touched value, so it is no conflict and survives
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('lakebag');
 ----
-<REGEX>:.*keyless.*key_columns.*
+1	1	0
 
-# the lake was not touched by the refused merge (a, b + the later c)
-query I
-SELECT count(*) FROM lake.rawlog;
+query T rowsort
+SELECT line FROM lake.rawlog;
 ----
-3
+b
+c
 
 statement ok
 DETACH lb;

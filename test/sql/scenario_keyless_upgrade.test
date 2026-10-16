@@ -1,0 +1,751 @@
+# name: test/sql/scenario_keyless_upgrade.test
+# description: keyless deltas written before v0.4.1 (no _count column) are upgraded in place (#31)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+load __TEST_DIR__/keyless_upgrade.db
+
+# A pre-v0.4.1 keyless delta was s<id>_delta_<t>(_op, _ts, <base columns>):
+# no PRIMARY KEY, no trailing _count, the base's secondary UNIQUE constraints
+# mirrored, and only 'I' rows (UPDATE/DELETE on keyless tables were gated, so
+# every row is one inserted copy). The tests below fabricate exactly that
+# layout by hand and check that old scenarios get full keyless support.
+
+statement ok
+CREATE TABLE web_events (session_id INTEGER, url VARCHAR, ts TIMESTAMP, referrer VARCHAR);
+
+# duplicates and NULLs are meaningful in a bag
+statement ok
+INSERT INTO web_events VALUES
+    (1, '/home',    TIMESTAMP '2026-07-01 10:00:00', 'google'),
+    (1, '/home',    TIMESTAMP '2026-07-01 10:00:00', 'google'),
+    (2, '/pricing', TIMESTAMP '2026-07-01 10:05:00', NULL),
+    (3, NULL,       TIMESTAMP '2026-07-01 10:07:00', NULL),
+    (4, '/docs',    TIMESTAMP '2026-07-01 11:00:00', 'twitter');
+
+# keyless, but with a secondary UNIQUE (old deltas mirrored it)
+statement ok
+CREATE TABLE devices (serial VARCHAR UNIQUE, owner VARCHAR);
+
+statement ok
+INSERT INTO devices VALUES ('SN-1', 'alice'), ('SN-2', 'bob');
+
+statement ok
+CALL scenario_create('legacy', 'written by v0.4.0');
+
+statement ok
+CALL scenario_create('legacy_parent', 'branched without attaching');
+
+statement ok
+CALL scenario_create('legacy_frozen', 'frozen before the upgrade');
+
+query IT
+SELECT scenario_id, name FROM scenario_list() ORDER BY scenario_id;
+----
+1	legacy
+2	legacy_parent
+3	legacy_frozen
+
+# --- fabricate the pre-v0.4.1 layout for scenarios 1..3 --------------------------------
+
+statement ok
+DROP TABLE __anofox_scenario.s1_delta_web_events;
+
+statement ok
+CREATE TABLE __anofox_scenario.s1_delta_web_events (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    session_id INTEGER, url VARCHAR, ts TIMESTAMP, referrer VARCHAR);
+
+statement ok
+INSERT INTO __anofox_scenario.s1_delta_web_events VALUES
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 5, '/signup',  TIMESTAMP '2026-07-02 09:00:00', 'newsletter'),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 5, '/signup',  TIMESTAMP '2026-07-02 09:00:00', 'newsletter'),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 1, '/home',    TIMESTAMP '2026-07-01 10:00:00', 'google'),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 6, NULL,       NULL,                            NULL),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 2, '/pricing', TIMESTAMP '2026-07-01 10:05:00', NULL);
+
+statement ok
+DROP TABLE __anofox_scenario.s1_delta_devices;
+
+statement ok
+CREATE TABLE __anofox_scenario.s1_delta_devices (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    serial VARCHAR, owner VARCHAR, UNIQUE (serial));
+
+statement ok
+INSERT INTO __anofox_scenario.s1_delta_devices VALUES
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 'SN-3', 'carol'),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', NULL,   'dave'),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', NULL,   'erin');
+
+statement ok
+DROP TABLE __anofox_scenario.s2_delta_web_events;
+
+statement ok
+CREATE TABLE __anofox_scenario.s2_delta_web_events (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    session_id INTEGER, url VARCHAR, ts TIMESTAMP, referrer VARCHAR);
+
+statement ok
+INSERT INTO __anofox_scenario.s2_delta_web_events VALUES
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 8, '/cart', TIMESTAMP '2026-07-03 12:00:00', 'ads'),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 8, '/cart', TIMESTAMP '2026-07-03 12:00:00', 'ads');
+
+statement ok
+DROP TABLE __anofox_scenario.s3_delta_web_events;
+
+statement ok
+CREATE TABLE __anofox_scenario.s3_delta_web_events (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    session_id INTEGER, url VARCHAR, ts TIMESTAMP, referrer VARCHAR);
+
+statement ok
+INSERT INTO __anofox_scenario.s3_delta_web_events VALUES
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 9, '/faq', NULL, NULL);
+
+statement ok
+CALL scenario_freeze('legacy_frozen');
+
+# --- read paths work on the legacy layout before anything upgrades it ------------------
+
+# scenario_diff never attaches: old rows count once each
+query ITTT rowsort
+SELECT session_id, url, referrer, change_type FROM scenario_diff('legacy', 'web_events');
+----
+1	/home	google	added
+2	/pricing	NULL	added
+5	/signup	newsletter	added
+5	/signup	newsletter	added
+6	NULL	NULL	added
+
+query ITTT rowsort
+SELECT session_id, url, referrer, change_type FROM scenario_diff('main', 'legacy', 'web_events');
+----
+1	/home	google	added
+2	/pricing	NULL	added
+5	/signup	newsletter	added
+5	/signup	newsletter	added
+6	NULL	NULL	added
+
+query TIII rowsort
+SELECT table_name, rows_added, rows_modified, rows_removed FROM scenario_diff_summary('legacy');
+----
+devices	3	0	0
+web_events	5	0	0
+
+# still legacy: nothing above wrote anything
+query I
+SELECT count(*) FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_web_events' AND column_name = '_count';
+----
+0
+
+# --- ATTACH upgrades the scenario's keyless deltas in place -----------------------------
+
+statement ok
+ATTACH 'legacy' AS s (TYPE scenario);
+
+# _count is the trailing column, every old row carries multiplicity 1
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_web_events' ORDER BY column_index DESC LIMIT 1;
+----
+_count
+
+query TII
+SELECT _op, _count, count(*) FROM __anofox_scenario.s1_delta_web_events GROUP BY ALL;
+----
+I	1	5
+
+# old timestamps are preserved
+query I
+SELECT count(*) FROM __anofox_scenario.s1_delta_web_events WHERE _ts = TIMESTAMP '2026-06-01 08:00:00';
+----
+5
+
+# the mirrored secondary UNIQUE is gone (bag deltas hold D rows next to I rows)
+query I
+SELECT count(*) FROM duckdb_constraints() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_devices' AND constraint_type = 'UNIQUE';
+----
+0
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_devices' ORDER BY column_index DESC LIMIT 1;
+----
+_count
+
+# merged view = base + every old row, as a bag
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s.web_events
+     EXCEPT ALL
+     (SELECT * FROM web_events UNION ALL VALUES
+        (5, '/signup',  TIMESTAMP '2026-07-02 09:00:00', 'newsletter'),
+        (5, '/signup',  TIMESTAMP '2026-07-02 09:00:00', 'newsletter'),
+        (1, '/home',    TIMESTAMP '2026-07-01 10:00:00', 'google'),
+        (6, NULL,       NULL,                            NULL),
+        (2, '/pricing', TIMESTAMP '2026-07-01 10:05:00', NULL)))
+    UNION ALL
+    ((SELECT * FROM web_events UNION ALL VALUES
+        (5, '/signup',  TIMESTAMP '2026-07-02 09:00:00', 'newsletter'),
+        (5, '/signup',  TIMESTAMP '2026-07-02 09:00:00', 'newsletter'),
+        (1, '/home',    TIMESTAMP '2026-07-01 10:00:00', 'google'),
+        (6, NULL,       NULL,                            NULL),
+        (2, '/pricing', TIMESTAMP '2026-07-01 10:05:00', NULL))
+     EXCEPT ALL
+     SELECT * FROM s.web_events));
+----
+0
+
+query I
+SELECT count(*) FROM s.web_events;
+----
+10
+
+# --- full keyless DML on the upgraded scenario ------------------------------------------
+
+# DELETE removes base copies and legacy copies alike
+query I
+DELETE FROM s.web_events WHERE session_id = 1;
+----
+3
+
+query I
+UPDATE s.web_events SET referrer = 'direct' WHERE session_id = 2 AND referrer IS NULL;
+----
+2
+
+statement ok
+INSERT INTO s.web_events VALUES (7, '/blog', TIMESTAMP '2026-07-04 08:30:00', NULL);
+
+query ITTT rowsort
+SELECT session_id, url, ts, referrer FROM s.web_events;
+----
+2	/pricing	2026-07-01 10:05:00	direct
+2	/pricing	2026-07-01 10:05:00	direct
+3	NULL	2026-07-01 10:07:00	NULL
+4	/docs	2026-07-01 11:00:00	twitter
+5	/signup	2026-07-02 09:00:00	newsletter
+5	/signup	2026-07-02 09:00:00	newsletter
+6	NULL	NULL	NULL
+7	/blog	2026-07-04 08:30:00	NULL
+
+# base untouched
+query I
+SELECT count(*) FROM web_events;
+----
+5
+
+# UPDATE on the formerly UNIQUE-mirrored delta (D + I of the same serial)
+query I
+UPDATE s.devices SET owner = 'carla' WHERE serial = 'SN-3';
+----
+1
+
+query I
+DELETE FROM s.devices WHERE owner = 'dave';
+----
+1
+
+query TT rowsort
+SELECT serial, owner FROM s.devices;
+----
+NULL	erin
+SN-1	alice
+SN-2	bob
+SN-3	carla
+
+# UNIQUE is still enforced against the merged relation
+statement error
+INSERT INTO s.devices VALUES ('SN-3', 'mallory');
+----
+<REGEX>:.*(unique|UNIQUE|Duplicate|constraint).*
+
+statement error
+INSERT INTO s.devices VALUES ('SN-1', 'mallory');
+----
+<REGEX>:.*(unique|UNIQUE|Duplicate|constraint).*
+
+# --- diff and summary over the upgraded bag ---------------------------------------------
+
+query ITTT rowsort
+SELECT session_id, url, referrer, change_type FROM scenario_diff('legacy', 'web_events');
+----
+1	/home	google	removed
+1	/home	google	removed
+2	/pricing	NULL	removed
+2	/pricing	direct	added
+2	/pricing	direct	added
+5	/signup	newsletter	added
+5	/signup	newsletter	added
+6	NULL	NULL	added
+7	/blog	NULL	added
+
+query TIII rowsort
+SELECT table_name, rows_added, rows_modified, rows_removed FROM scenario_diff_summary('legacy');
+----
+devices	2	0	0
+web_events	6	0	3
+
+# --- branching from the upgraded scenario -----------------------------------------------
+
+statement ok
+CALL scenario_create('legacy_child', from_scenario := 'legacy');
+
+statement ok
+ATTACH 'legacy_child' AS c (TYPE scenario);
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM c.web_events EXCEPT ALL SELECT * FROM s.web_events)
+    UNION ALL
+    (SELECT * FROM s.web_events EXCEPT ALL SELECT * FROM c.web_events));
+----
+0
+
+query I
+DELETE FROM c.web_events WHERE session_id = 5;
+----
+2
+
+query I
+SELECT count(*) FROM s.web_events WHERE session_id = 5;
+----
+2
+
+statement ok
+DETACH c;
+
+# --- branching from a legacy parent that was never attached ------------------------------
+
+statement ok
+CALL scenario_create('legacy_parent_child', from_scenario := 'legacy_parent');
+
+# the parent was upgraded in the create transaction, then copied verbatim
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's2_delta_web_events' ORDER BY column_index DESC LIMIT 1;
+----
+_count
+
+statement ok
+ATTACH 'legacy_parent_child' AS pc (TYPE scenario);
+
+query I
+SELECT count(*) FROM pc.web_events WHERE session_id = 8;
+----
+2
+
+query I
+UPDATE pc.web_events SET referrer = 'organic' WHERE session_id = 8;
+----
+2
+
+query IT rowsort
+SELECT session_id, referrer FROM pc.web_events WHERE session_id = 8;
+----
+8	organic
+8	organic
+
+statement ok
+DETACH pc;
+
+statement ok
+ATTACH 'legacy_parent' AS p (TYPE scenario);
+
+query IT rowsort
+SELECT session_id, referrer FROM p.web_events WHERE session_id = 8;
+----
+8	ads
+8	ads
+
+statement ok
+DETACH p;
+
+# --- frozen legacy scenario: upgraded (a storage-format change), still read-only ---------
+
+statement ok
+ATTACH 'legacy_frozen' AS f (TYPE scenario);
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's3_delta_web_events' ORDER BY column_index DESC LIMIT 1;
+----
+_count
+
+query I
+SELECT count(*) FROM f.web_events;
+----
+6
+
+statement error
+DELETE FROM f.web_events WHERE session_id = 9;
+----
+frozen
+
+statement ok
+DETACH f;
+
+# --- the upgrade is durable ---------------------------------------------------------------
+
+statement ok
+DETACH s;
+
+restart
+
+statement ok
+ATTACH 'legacy' AS s (TYPE scenario);
+
+query ITTT rowsort
+SELECT session_id, url, ts, referrer FROM s.web_events;
+----
+2	/pricing	2026-07-01 10:05:00	direct
+2	/pricing	2026-07-01 10:05:00	direct
+3	NULL	2026-07-01 10:07:00	NULL
+4	/docs	2026-07-01 11:00:00	twitter
+5	/signup	2026-07-02 09:00:00	newsletter
+5	/signup	2026-07-02 09:00:00	newsletter
+6	NULL	NULL	NULL
+7	/blog	2026-07-04 08:30:00	NULL
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_web_events' ORDER BY column_index DESC LIMIT 1;
+----
+_count
+
+# --- merge-back of the upgraded scenario --------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('legacy_child');
+
+query I
+SELECT rows_applied > 0 FROM scenario_merge('legacy');
+----
+true
+
+query ITTT rowsort
+SELECT session_id, url, ts, referrer FROM web_events;
+----
+2	/pricing	2026-07-01 10:05:00	direct
+2	/pricing	2026-07-01 10:05:00	direct
+3	NULL	2026-07-01 10:07:00	NULL
+4	/docs	2026-07-01 11:00:00	twitter
+5	/signup	2026-07-02 09:00:00	newsletter
+5	/signup	2026-07-02 09:00:00	newsletter
+6	NULL	NULL	NULL
+7	/blog	2026-07-04 08:30:00	NULL
+
+query TT rowsort
+SELECT serial, owner FROM devices;
+----
+NULL	erin
+SN-1	alice
+SN-2	bob
+SN-3	carla
+
+# --- merge-back of a legacy scenario that was never attached ------------------------------
+
+statement ok
+CREATE TABLE clicks (page VARCHAR, campaign VARCHAR);
+
+statement ok
+INSERT INTO clicks VALUES ('/home', 'spring'), ('/home', 'spring'), ('/docs', NULL);
+
+statement ok
+CALL scenario_create('legacy_merge');
+
+query I
+SELECT scenario_id FROM scenario_list() WHERE name = 'legacy_merge';
+----
+6
+
+statement ok
+DROP TABLE __anofox_scenario.s6_delta_clicks;
+
+statement ok
+CREATE TABLE __anofox_scenario.s6_delta_clicks (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    page VARCHAR, campaign VARCHAR);
+
+statement ok
+INSERT INTO __anofox_scenario.s6_delta_clicks VALUES
+    ('I', TIMESTAMP '2026-06-01 08:00:00', '/home', 'spring'),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', '/pricing', NULL);
+
+query I
+SELECT rows_applied FROM scenario_merge('legacy_merge');
+----
+2
+
+query TT rowsort
+SELECT page, campaign FROM clicks;
+----
+/docs	NULL
+/home	spring
+/home	spring
+/home	spring
+/pricing	NULL
+
+# --- read-only host: reads work on the legacy layout without writing ------------------------
+
+statement ok
+ATTACH '__TEST_DIR__/keyless_upgrade_ro.db' AS ro;
+
+statement ok
+USE ro;
+
+statement ok
+CREATE TABLE web_events (session_id INTEGER, url VARCHAR, ts TIMESTAMP, referrer VARCHAR);
+
+statement ok
+INSERT INTO web_events VALUES (1, '/home', NULL, NULL), (1, '/home', NULL, NULL);
+
+statement ok
+CALL scenario_create('ro_legacy');
+
+statement ok
+DROP TABLE __anofox_scenario.s1_delta_web_events;
+
+statement ok
+CREATE TABLE __anofox_scenario.s1_delta_web_events (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    session_id INTEGER, url VARCHAR, ts TIMESTAMP, referrer VARCHAR);
+
+statement ok
+INSERT INTO __anofox_scenario.s1_delta_web_events VALUES
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 1, '/home', NULL, NULL),
+    ('I', TIMESTAMP '2026-06-01 08:00:00', 2, NULL, NULL, 'x');
+
+statement ok
+USE keyless_upgrade;
+
+statement ok
+DETACH ro;
+
+statement ok
+ATTACH '__TEST_DIR__/keyless_upgrade_ro.db' AS ro (READ_ONLY);
+
+statement ok
+USE ro;
+
+statement ok
+ATTACH 'ro_legacy' AS r (TYPE scenario);
+
+query ITT rowsort
+SELECT session_id, url, referrer FROM r.web_events;
+----
+1	/home	NULL
+1	/home	NULL
+1	/home	NULL
+2	NULL	x
+
+query ITTT rowsort
+SELECT session_id, url, referrer, change_type FROM scenario_diff('ro_legacy', 'web_events');
+----
+1	/home	NULL	added
+2	NULL	x	added
+
+# nothing could be written: the delta keeps its legacy layout
+query I
+SELECT count(*) FROM duckdb_columns() WHERE database_name = 'ro' AND table_name = 's1_delta_web_events' AND column_name = '_count';
+----
+0
+
+statement error
+DELETE FROM r.web_events WHERE session_id = 1;
+----
+read-only
+
+statement ok
+DETACH r;
+
+statement ok
+USE keyless_upgrade;
+
+statement ok
+DETACH ro;
+
+# --- large generated variant: 150k legacy rows over a 60k-row base --------------------------
+
+statement ok
+CREATE TABLE big_events AS
+SELECT (i % 5000)::INTEGER AS session_id,
+       CASE WHEN i % 11 = 0 THEN NULL ELSE '/p/' || (i % 97) END AS url,
+       TIMESTAMP '2026-07-01 00:00:00' + to_seconds(i % 3600) AS ts,
+       CASE WHEN i % 3 = 0 THEN NULL ELSE 'ref' || (i % 7) END AS referrer
+FROM range(60000) t(i);
+
+statement ok
+CALL scenario_create('legacy_big');
+
+query I
+SELECT scenario_id FROM scenario_list() WHERE name = 'legacy_big';
+----
+7
+
+statement ok
+DROP TABLE __anofox_scenario.s7_delta_big_events;
+
+statement ok
+CREATE TABLE __anofox_scenario.s7_delta_big_events (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    session_id INTEGER, url VARCHAR, ts TIMESTAMP, referrer VARCHAR);
+
+# 150k old inserts, heavily duplicated (and overlapping base values)
+statement ok
+INSERT INTO __anofox_scenario.s7_delta_big_events
+SELECT 'I', TIMESTAMP '2026-06-01 08:00:00',
+       (i % 7000)::INTEGER,
+       CASE WHEN i % 13 = 0 THEN NULL ELSE '/p/' || (i % 97) END,
+       TIMESTAMP '2026-07-01 00:00:00' + to_seconds(i % 3600),
+       CASE WHEN i % 5 = 0 THEN NULL ELSE 'ref' || (i % 7) END
+FROM range(150000) t(i);
+
+# the expected merged relation, maintained alongside as a plain table
+statement ok
+CREATE TABLE big_expected AS
+SELECT * FROM big_events
+UNION ALL
+SELECT session_id, url, ts, referrer FROM __anofox_scenario.s7_delta_big_events;
+
+statement ok
+ATTACH 'legacy_big' AS b (TYPE scenario);
+
+query II
+SELECT count(*), min(_count) = max(_count) AND min(_count) = 1 FROM __anofox_scenario.s7_delta_big_events;
+----
+150000	true
+
+query I
+SELECT count(*) FROM b.big_events;
+----
+210000
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM b.big_events EXCEPT ALL SELECT * FROM big_expected)
+    UNION ALL
+    (SELECT * FROM big_expected EXCEPT ALL SELECT * FROM b.big_events));
+----
+0
+
+# the same DML on both sides keeps them equal
+statement ok
+DELETE FROM b.big_events WHERE session_id % 17 = 0;
+
+statement ok
+DELETE FROM big_expected WHERE session_id % 17 = 0;
+
+statement ok
+UPDATE b.big_events SET referrer = 'rewritten' WHERE session_id % 101 = 3 AND referrer IS NULL;
+
+statement ok
+UPDATE big_expected SET referrer = 'rewritten' WHERE session_id % 101 = 3 AND referrer IS NULL;
+
+statement ok
+INSERT INTO b.big_events SELECT (i % 50)::INTEGER, '/new', NULL, NULL FROM range(1000) t(i);
+
+statement ok
+INSERT INTO big_expected SELECT (i % 50)::INTEGER, '/new', NULL, NULL FROM range(1000) t(i);
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM b.big_events EXCEPT ALL SELECT * FROM big_expected)
+    UNION ALL
+    (SELECT * FROM big_expected EXCEPT ALL SELECT * FROM b.big_events));
+----
+0
+
+# the diff accounts for every row the scenario adds or removes
+query I
+SELECT (SELECT count(*) FROM big_events) + sum(CASE WHEN change_type = 'added' THEN 1 ELSE -1 END) = (SELECT count(*) FROM big_expected)
+FROM scenario_diff('legacy_big', 'big_events');
+----
+true
+
+statement ok
+DETACH b;
+
+query I
+SELECT rows_applied > 0 FROM scenario_merge('legacy_big');
+----
+true
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM big_events EXCEPT ALL SELECT * FROM big_expected)
+    UNION ALL
+    (SELECT * FROM big_expected EXCEPT ALL SELECT * FROM big_events));
+----
+0
+
+# --- ATTACH inside a transaction that already wrote another database ------------------------
+
+statement ok
+CALL scenario_create('legacy_txn');
+
+query I
+SELECT scenario_id FROM scenario_list() WHERE name = 'legacy_txn';
+----
+8
+
+statement ok
+DROP TABLE __anofox_scenario.s8_delta_clicks;
+
+statement ok
+CREATE TABLE __anofox_scenario.s8_delta_clicks (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,
+    page VARCHAR, campaign VARCHAR);
+
+statement ok
+INSERT INTO __anofox_scenario.s8_delta_clicks VALUES ('I', TIMESTAMP '2026-06-01 08:00:00', '/txn', NULL);
+
+statement ok
+ATTACH '__TEST_DIR__/keyless_upgrade_other.db' AS other;
+
+statement ok
+CREATE TABLE other.audit (note VARCHAR);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO other.audit VALUES ('busy');
+
+# single-writer rule: the upgrade cannot write the host here, so it is skipped...
+statement ok
+ATTACH 'legacy_txn' AS t (TYPE scenario);
+
+# ...and reads still see every legacy row
+query I
+SELECT count(*) FROM t.clicks WHERE page = '/txn';
+----
+1
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's8_delta_clicks' AND column_name = '_count';
+----
+0
+
+statement error
+DELETE FROM t.clicks WHERE page = '/txn';
+----
+re-ATTACH
+
+# a plain re-ATTACH upgrades and unlocks keyless DML
+statement ok
+DETACH t;
+
+statement ok
+ATTACH 'legacy_txn' AS t (TYPE scenario);
+
+query I
+DELETE FROM t.clicks WHERE page = '/txn';
+----
+1
+
+query I
+SELECT count(*) FROM t.clicks WHERE page = '/txn';
+----
+0
+
+statement ok
+DETACH t;
+
+statement ok
+DETACH other;

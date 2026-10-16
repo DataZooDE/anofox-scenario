@@ -54,7 +54,27 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   may exist only in the scenario. `scenario_merge` enforces them against the base and rolls back
   atomically on a violation. Materialized copies don't carry the FKs, so introspection through a
   materialized scenario doesn't list them. Overlay scenarios mirror the base's FKs.
-- **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it.
+- **Keyless tables** (no PK, no `key_columns`) have bag semantics for every DML form,
+  matching DuckDB on a plain table:
+  - `UPDATE` / `DELETE` / `MERGE INTO` act on *every* matching visible copy of a row. A
+    `MERGE` matched update writes `D(old) + I(new)` per copy, a matched delete `D(old)`, and
+    `WHEN NOT MATCHED [BY SOURCE]` works as usual.
+  - `INSERT ... ON CONFLICT (cols) DO NOTHING / DO UPDATE` and `INSERT OR REPLACE` need a
+    `UNIQUE` constraint on the conflict target. Conflicts are checked against the merged state:
+    base rows the scenario deleted or changed don't conflict, scenario rows do, and NULLs never
+    do. Without a `UNIQUE` constraint to target you get DuckDB's own binder error (`There are
+    no UNIQUE/PRIMARY KEY constraints ...`).
+  - One difference from a plain table: if several source rows match the *same* target copy,
+    the statement fails with `modified the same row twice` (plain DuckDB silently applies one
+    of the matches). This is the same rule keyed scenario tables follow.
+- **Transactions:** scenario DML runs in the caller's transaction; `ROLLBACK` undoes it. Host
+  writes and scenario writes may share one explicit transaction, in any order and across any
+  number of scenarios on the same host: every scenario row physically lands in the host
+  database, so `BEGIN; INSERT INTO main.orders ...; UPDATE s.orders ...; COMMIT;` commits (or
+  rolls back) both sides atomically. Writing to a genuinely different attached database in the
+  same transaction is still refused by DuckDB's single-writer rule. Writes in a
+  `READ ONLY` transaction or through a scenario attached `READ_ONLY` fail before execution,
+  even when they would touch zero rows.
 - **DDL:** not permitted inside scenarios (one canonical error).
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time.
@@ -63,11 +83,8 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 
 | Limitation | Notes |
 | --- | --- |
-| Host writes and scenario writes in the *same explicit transaction* | single-writer rule; documented restriction |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
-| `MERGE INTO` / `ON CONFLICT` on keyless tables (no PK, no `key_columns`) | UPDATE/DELETE work (bag semantics); declare `key_columns :=` for keyed matching |
-| DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC); keyless lake deletes are refused | documented protocol |
-| Scenarios created before v0.4.1 keep the old keyless gate (their deltas lack `_count`) | recreate the scenario |
+| DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC) | documented protocol |
 
 ## Function Reference
 
@@ -80,8 +97,8 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | `SELECT * FROM scenario_diff(scenario, table)` | table | Compare to origin: `<pk cols>` (native types), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value`. Streams through the engine. Keyless tables (no PK, no `key_columns`) get a bag diff: every column is the identity, a changed row is `removed` + `added`, and duplicates appear once per copy. |
 | `SELECT * FROM scenario_diff(a, b, table)` | table | Generic diff between two merged relations (`'main'` or any scenario). `old` = side a, `new` = side b. `'main'` is the origin table of the scenario on the other side, in its base catalog: pinned to the scenario's creation snapshot for DuckLake bases, live otherwise. DuckLake-based scenarios are always diffed at their snapshot, so later lake changes never show as scenario changes. |
 | `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog. For keyless tables these are the net counts per distinct row (`rows_modified` is 0). |
-| `SELECT * FROM scenario_merge_preview(scenario)` | table | Planned merge-back actions: `table_name, key, action, conflict`. Streaming; no side effects. Overlay conflicts: an `insert` whose key now exists in base, an `update` whose key vanished. Scenarios with a creation snapshot (materialized, DuckLake) additionally flag 3-way *drift* conflicts: the base row changed since the snapshot on a touched key. |
-| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). On success the scenario ends `frozen` with `merged_at` set and an empty delta. Refuses while branches exist. |
+| `SELECT * FROM scenario_merge_preview(scenario)` | table | Planned merge-back actions: `table_name, key, action, conflict`. Streaming; no side effects. Overlay conflicts: an `insert` whose key now exists in base, an `update` whose key vanished. Scenarios with a creation snapshot (materialized, DuckLake) additionally flag 3-way *drift* conflicts: the base row changed since the snapshot on a touched key. For keyless DuckLake tables a `delete` conflicts when the lake's number of copies of that row differs from the snapshot's. |
+| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). Keyless tables merge as bags: per distinct row (NULL-safe whole-row match) the net delete count `n` removes exactly `n` copies and a net insert count adds that many; on a drifted DuckLake row `theirs` keeps the lake's copies and `ours` sets the lake to the scenario's count. On success the scenario ends `frozen` with `merged_at` set and an empty delta. Refuses while branches exist. |
 | `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | verb | Create delta tables for base tables added after `scenario_create`, making them writable. `key_columns` declares identity for new keyless tables (rejected once a table is already tracked). Returns `refreshed_tables`. Idempotent; refuses materialized scenarios. |
 | `SELECT * FROM scenario_migrate()` | verb | One-way migration of a legacy v0.1 database (`_scenario_registry`, `_scen_*`, `_snap_*`) into the v2 layout. Archived -> frozen; snapshots -> materialized+frozen; multi-op delta rows folded to net effects; `_scenario_base_rowids` dropped; `_scenario_protocols` preserved. |
 | `ATTACH 'name' AS alias (TYPE scenario)` / `DETACH alias` | SQL | The entire read/write UX. |
@@ -96,7 +113,9 @@ __anofox_scenario.registry              -- scenario_id, name, mode, frozen, pare
 __anofox_scenario.registry_seq          -- id sequence
 __anofox_scenario.s<id>_delta_<table>   -- (_op 'I'|'U'|'D', _ts, <base columns>) PK = base PK
                                         --   or the declared key_columns; keyless tables append
-                                        --   _count BIGINT (bag changelog, no PK) instead
+                                        --   _count BIGINT (bag changelog, no PK) instead;
+                                        --   pre-v0.4.1 keyless deltas (no _count) are
+                                        --   upgraded in place on ATTACH / branching
 __anofox_scenario.s<id>_mat_<table>     -- materialized base copies (mode = 'materialized');
                                         --   FOREIGN KEY constraints are not copied
 ```

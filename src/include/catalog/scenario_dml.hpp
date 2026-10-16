@@ -25,6 +25,14 @@ class TableCatalogEntry;
 //! __scenario_key_<k>: the k-th PK column value of the row.
 static constexpr column_t SCENARIO_ORIGIN_COLUMN_ID = UINT64_C(9223372036854775808) /*VIRTUAL_COLUMN_START*/ + 4096;
 static constexpr column_t SCENARIO_KEY_COLUMN_START = SCENARIO_ORIGIN_COLUMN_ID + 1;
+//! Keyless tables only: __scenario_rowno, a per-scan unique row number. The
+//! whole-row identity cannot tell duplicate copies apart from one copy that a
+//! join (MERGE / UPDATE ... FROM) emits twice; the row number can.
+static constexpr column_t SCENARIO_ROWNO_COLUMN_ID = SCENARIO_ORIGIN_COLUMN_ID - 1;
+
+//! Row numbers of keyless target rows already modified by this statement,
+//! shared by all action sinks of one MERGE INTO
+using ScenarioTouchedRows = unordered_set<int64_t>;
 
 //! State of one PK in the delta table
 struct ScenarioDeltaKeyInfo {
@@ -102,10 +110,16 @@ PhysicalOperator &MakeScenarioUpdateOperator(PhysicalPlanGenerator &planner, vec
                                              vector<unique_ptr<Expression>> bound_defaults,
                                              vector<unique_ptr<BoundConstraint>> bound_constraints,
                                              idx_t estimated_cardinality, bool return_chunk,
-                                             optional_idx row_id_start);
+                                             optional_idx row_id_start,
+                                             shared_ptr<ScenarioTouchedRows> shared_touched = nullptr);
 PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vector<LogicalType> types,
                                              ScenarioTableEntry &entry, idx_t row_id_start,
-                                             idx_t estimated_cardinality, bool return_chunk);
+                                             idx_t estimated_cardinality, bool return_chunk,
+                                             shared_ptr<ScenarioTouchedRows> shared_touched = nullptr);
+
+//! Keyless tables need a v0.4.1+ bag delta (with _count) for UPDATE, DELETE
+//! and MERGE INTO; throws otherwise
+void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry);
 
 //! Source-side state for DML operators: emits either the affected-count row
 //! or, with RETURNING, the collected result rows

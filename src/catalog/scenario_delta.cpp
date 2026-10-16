@@ -7,6 +7,9 @@
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/constraints/unique_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
+#include "duckdb/common/types/column/column_data_collection.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -28,6 +31,151 @@ optional_idx ScenarioDelta::CountColumnIndex(const TableCatalogEntry &delta_tabl
 		return optional_idx(count - 1);
 	}
 	return optional_idx();
+}
+
+static optional_ptr<DuckTableEntry> TryGetInternalTable(ClientContext &context, Catalog &host_catalog,
+                                                        const string &table_name);
+
+bool ScenarioDelta::IsLegacyKeylessDelta(const TableCatalogEntry &delta_table) {
+	return !delta_table.HasPrimaryKey() && !CountColumnIndex(delta_table).IsValid();
+}
+
+//! The scenario's delta tables (exact prefix match on the naming contract)
+static vector<reference<DuckTableEntry>> ScenarioDeltaTables(ClientContext &context, Catalog &host_catalog,
+                                                             int64_t scenario_id) {
+	vector<reference<DuckTableEntry>> result;
+	auto schema = host_catalog.GetSchema(context, ScenarioRegistry::SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
+	if (!schema) {
+		return result;
+	}
+	auto prefix = "s" + to_string(scenario_id) + "_delta_";
+	schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+		if (entry.type == CatalogType::TABLE_ENTRY && StringUtil::StartsWith(entry.name, prefix)) {
+			result.push_back(entry.Cast<DuckTableEntry>());
+		}
+	});
+	return result;
+}
+
+bool ScenarioDelta::HasLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {
+	for (auto &delta : ScenarioDeltaTables(context, host_catalog, scenario_id)) {
+		if (IsLegacyKeylessDelta(delta.get())) {
+			return true;
+		}
+	}
+	return false;
+}
+
+idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {
+	vector<string> legacy_names;
+	for (auto &delta : ScenarioDeltaTables(context, host_catalog, scenario_id)) {
+		if (IsLegacyKeylessDelta(delta.get())) {
+			legacy_names.push_back(delta.get().name);
+		}
+	}
+	for (auto &table_name : legacy_names) {
+		auto old_table = TryGetInternalTable(context, host_catalog, table_name);
+		if (!old_table) {
+			continue;
+		}
+		// The new layout: the old columns (_op, _ts, payload) plus a trailing
+		// _count, NOT NULL on the metadata columns, and no UNIQUE mirror (a
+		// bag delta holds D rows next to the I rows they cancel)
+		auto info = make_uniq<CreateTableInfo>();
+		info->catalog = host_catalog.GetName();
+		info->schema = ScenarioRegistry::SCHEMA_NAME;
+		info->table = table_name;
+		info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
+		vector<LogicalType> old_types;
+		for (auto &col : old_table->GetColumns().Physical()) {
+			info->columns.AddColumn(ColumnDefinition(col.Name(), col.Type()));
+			old_types.push_back(col.Type());
+		}
+		auto count_index = info->columns.LogicalColumnCount();
+		info->columns.AddColumn(ColumnDefinition(COUNT_COLUMN, LogicalType::BIGINT));
+		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(OP_COL)));
+		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TS_COL)));
+		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(count_index)));
+
+		// Buffer the old rows (deltas are small by invariant), then swap the
+		// table: drop the old one with its indexes, recreate it under the
+		// same name - no rename, so nothing depends on index-free renames
+		ColumnDataCollection rows(context, old_types);
+		{
+			vector<StorageIndex> column_ids;
+			for (idx_t i = 0; i < old_types.size(); i++) {
+				column_ids.emplace_back(i);
+			}
+			auto &storage = old_table->GetStorage();
+			auto &transaction = DuckTransaction::Get(context, old_table->catalog);
+			ParallelTableScanState parallel_state;
+			storage.InitializeParallelScan(context, parallel_state, {});
+			TableScanState state;
+			state.Initialize(std::move(column_ids), context);
+			DataChunk chunk;
+			chunk.Initialize(Allocator::Get(context), old_types);
+			while (storage.NextParallelScan(context, parallel_state, state) > 0) {
+				while (true) {
+					chunk.Reset();
+					storage.Scan(transaction, chunk, state);
+					if (chunk.size() == 0) {
+						break;
+					}
+					rows.Append(chunk);
+				}
+			}
+		}
+
+		DropInfo drop;
+		drop.type = CatalogType::TABLE_ENTRY;
+		drop.catalog = host_catalog.GetName();
+		drop.schema = ScenarioRegistry::SCHEMA_NAME;
+		drop.name = table_name;
+		drop.if_not_found = OnEntryNotFound::THROW_EXCEPTION;
+		host_catalog.DropEntry(context, drop);
+		host_catalog.CreateTable(context, std::move(info));
+
+		auto new_table = TryGetInternalTable(context, host_catalog, table_name);
+		if (!new_table) {
+			throw InternalException("anofox_scenario: failed to recreate delta table '%s'", table_name);
+		}
+		auto binder = Binder::CreateBinder(context);
+		auto constraints = binder->BindConstraints(*new_table);
+		auto new_types = new_table->GetStorage().GetTypes();
+		DataChunk append_chunk;
+		append_chunk.Initialize(Allocator::Get(context), new_types);
+		for (auto &chunk : rows.Chunks()) {
+			append_chunk.Reset();
+			for (idx_t col = 0; col < old_types.size(); col++) {
+				append_chunk.data[col].Reference(chunk.data[col]);
+			}
+			// every pre-v0.4.1 row is exactly one inserted copy
+			append_chunk.data[count_index].Reference(Value::BIGINT(1));
+			append_chunk.SetCardinality(chunk.size());
+			new_table->GetStorage().LocalAppend(*new_table, context, append_chunk, constraints);
+		}
+	}
+	return legacy_names.size();
+}
+
+bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog,
+                                                  int64_t scenario_id) {
+	if (!HasLegacyKeylessDeltas(context, host_catalog, scenario_id)) {
+		return true;
+	}
+	auto &host_db = host_catalog.GetAttached();
+	auto &meta = MetaTransaction::Get(context);
+	auto modified = meta.ModifiedDatabase();
+	if (host_db.IsReadOnly() || meta.IsReadOnly() || (modified && modified.get() != &host_db)) {
+		// not writable here: readers cope with the legacy layout, and the
+		// next ATTACH from a writable transaction upgrades
+		return false;
+	}
+	meta.ModifyDatabase(host_db, DatabaseModificationType::DROP_CATALOG_ENTRY |
+	                                 DatabaseModificationType::CREATE_CATALOG_ENTRY |
+	                                 DatabaseModificationType::INSERT_DATA);
+	UpgradeLegacyKeylessDeltas(context, host_catalog, scenario_id);
+	return true;
 }
 
 string ScenarioDelta::DeltaTableName(int64_t scenario_id, const string &table_name) {

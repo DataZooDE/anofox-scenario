@@ -1,0 +1,640 @@
+# name: test/sql/attach_keyless_merge.test
+# description: MERGE INTO and INSERT ... ON CONFLICT on keyless tables (no PK, no key_columns), bag semantics
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# Oracle: every statement that runs through the scenario also runs on a plain
+# copy of the table in a separate in-memory database. The merged scenario
+# relation must equal the plain copy as a bag (EXCEPT ALL both ways = 0 rows).
+
+statement ok
+ATTACH ':memory:' AS oracle;
+
+# =============================================================================
+# 1. inventory_events: keyless event log with duplicate rows and NULLs
+# =============================================================================
+
+statement ok
+CREATE TABLE inventory_events (sku VARCHAR, warehouse VARCHAR, qty INTEGER, note VARCHAR);
+
+statement ok
+INSERT INTO inventory_events VALUES
+    ('A1', 'north', 10, 'recv'), ('A1', 'north', 10, 'recv'),
+    ('A1', 'south', 5, NULL),
+    ('B2', 'north', 3, 'recv'),
+    ('B2', NULL, 7, 'adj'),
+    (NULL, 'north', 1, 'orphan'),
+    ('C3', 'east', 0, 'zero'), ('C3', 'east', 0, 'zero'), ('C3', 'east', 0, 'zero'),
+    ('E5', 'west', 4, 'recv');
+
+statement ok
+CREATE TABLE oracle.inventory_events AS SELECT * FROM inventory_events;
+
+statement ok
+CREATE TABLE adjustments (sku VARCHAR, warehouse VARCHAR, delta_qty INTEGER, action VARCHAR);
+
+# distinct on (sku, warehouse): every target row is matched by at most one source row
+statement ok
+INSERT INTO adjustments VALUES
+    ('A1', 'north', 2, 'add'),
+    ('A1', 'south', -5, 'drop'),
+    ('B2', NULL, 1, 'add'),
+    ('C3', 'east', 6, 'add'),
+    ('D4', 'west', 9, 'add'),
+    ('F6', 'south', 1, 'add'),
+    (NULL, 'north', 3, 'add');
+
+statement ok
+CALL scenario_create('inv');
+
+statement ok
+ATTACH 'inv' AS s (TYPE scenario);
+
+# scenario-side history first, so the MERGE sees delta rows too: a third copy
+# of a base duplicate, a scenario-only row and a bag UPDATE
+statement ok
+INSERT INTO s.inventory_events VALUES ('A1', 'north', 10, 'recv'), ('D4', 'west', 2, 'new');
+
+statement ok
+INSERT INTO oracle.inventory_events VALUES ('A1', 'north', 10, 'recv'), ('D4', 'west', 2, 'new');
+
+statement ok
+UPDATE s.inventory_events SET note = 'checked' WHERE sku = 'B2' AND warehouse = 'north';
+
+statement ok
+UPDATE oracle.inventory_events SET note = 'checked' WHERE sku = 'B2' AND warehouse = 'north';
+
+# MERGE: every matching copy is updated / deleted, unmatched sources inserted
+query I
+MERGE INTO s.inventory_events t USING adjustments a
+    ON t.sku = a.sku AND t.warehouse = a.warehouse
+    WHEN MATCHED AND a.action = 'drop' THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = t.qty + a.delta_qty, note = 'merged'
+    WHEN NOT MATCHED THEN INSERT VALUES (a.sku, a.warehouse, a.delta_qty, 'merged-new');
+----
+11
+
+query I
+MERGE INTO oracle.inventory_events t USING adjustments a
+    ON t.sku = a.sku AND t.warehouse = a.warehouse
+    WHEN MATCHED AND a.action = 'drop' THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = t.qty + a.delta_qty, note = 'merged'
+    WHEN NOT MATCHED THEN INSERT VALUES (a.sku, a.warehouse, a.delta_qty, 'merged-new');
+----
+11
+
+query TTIT
+SELECT * FROM s.inventory_events ORDER BY ALL;
+----
+A1	north	12	merged
+A1	north	12	merged
+A1	north	12	merged
+B2	north	3	checked
+B2	NULL	1	merged-new
+B2	NULL	7	adj
+C3	east	6	merged
+C3	east	6	merged
+C3	east	6	merged
+D4	west	11	merged
+E5	west	4	recv
+F6	south	1	merged-new
+NULL	north	1	orphan
+NULL	north	3	merged-new
+
+query I
+SELECT count(*) FROM (SELECT * FROM s.inventory_events EXCEPT ALL SELECT * FROM oracle.inventory_events);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.inventory_events EXCEPT ALL SELECT * FROM s.inventory_events);
+----
+0
+
+# the base is untouched
+query IIT
+SELECT count(*), sum(qty), string_agg(DISTINCT note, ',' ORDER BY note) FROM inventory_events;
+----
+10	40	adj,orphan,recv,zero
+
+# WHEN NOT MATCHED BY SOURCE reaches every unmatched copy (NULL keys included)
+statement ok
+CREATE TABLE recount (sku VARCHAR, warehouse VARCHAR, counted INTEGER);
+
+statement ok
+INSERT INTO recount VALUES ('A1', 'north', 30), ('C3', 'east', 18);
+
+query I
+MERGE INTO s.inventory_events t USING recount r
+    ON t.sku = r.sku AND t.warehouse = r.warehouse
+    WHEN MATCHED THEN UPDATE SET qty = r.counted // 3
+    WHEN NOT MATCHED BY SOURCE AND t.note = 'merged-new' THEN DELETE
+    WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = coalesce(t.note, '') || '/stale';
+----
+14
+
+query I
+MERGE INTO oracle.inventory_events t USING recount r
+    ON t.sku = r.sku AND t.warehouse = r.warehouse
+    WHEN MATCHED THEN UPDATE SET qty = r.counted // 3
+    WHEN NOT MATCHED BY SOURCE AND t.note = 'merged-new' THEN DELETE
+    WHEN NOT MATCHED BY SOURCE THEN UPDATE SET note = coalesce(t.note, '') || '/stale';
+----
+14
+
+query I
+SELECT count(*) FROM (SELECT * FROM s.inventory_events EXCEPT ALL SELECT * FROM oracle.inventory_events);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.inventory_events EXCEPT ALL SELECT * FROM s.inventory_events);
+----
+0
+
+# RETURNING reports one row per affected copy
+query TTIT rowsort
+MERGE INTO s.inventory_events t USING (SELECT 'C3' AS sku, 'east' AS warehouse) r
+    ON t.sku = r.sku AND t.warehouse = r.warehouse
+    WHEN MATCHED THEN UPDATE SET note = 'audited'
+    RETURNING sku, warehouse, qty, merge_action;
+----
+C3	east	6	UPDATE
+C3	east	6	UPDATE
+C3	east	6	UPDATE
+
+statement ok
+UPDATE oracle.inventory_events SET note = 'audited' WHERE sku = 'C3' AND warehouse = 'east';
+
+# one target copy matched by two source rows: rejected, like on keyed scenario
+# tables (plain DuckDB silently applies only one of the matches)
+statement error
+MERGE INTO s.inventory_events t USING (VALUES ('E5', 'west', 1), ('E5', 'west', 2)) v(sku, warehouse, q)
+    ON t.sku = v.sku AND t.warehouse = v.warehouse
+    WHEN MATCHED THEN UPDATE SET qty = v.q;
+----
+same row twice
+
+statement error
+MERGE INTO s.inventory_events t USING (VALUES ('E5', 'west', 1), ('E5', 'west', 2)) v(sku, warehouse, q)
+    ON t.sku = v.sku AND t.warehouse = v.warehouse
+    WHEN MATCHED AND v.q = 1 THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = v.q;
+----
+same row twice
+
+# the same rule covers UPDATE ... FROM / DELETE ... USING joins
+statement error
+UPDATE s.inventory_events SET qty = 0 FROM (VALUES ('E5'), ('E5')) v(sku) WHERE inventory_events.sku = v.sku;
+----
+same row twice
+
+statement error
+DELETE FROM s.inventory_events USING (VALUES ('E5'), ('E5')) v(sku) WHERE inventory_events.sku = v.sku;
+----
+same row twice
+
+# __scenario_rowno is a per-scan unique row number (delta rows first); filters on it work
+query I
+SELECT count(DISTINCT __scenario_rowno) = count(*) FROM s.inventory_events;
+----
+true
+
+query I
+SELECT count(*) FROM s.inventory_events WHERE __scenario_rowno >= 0 AND sku IS NOT NULL;
+----
+10
+
+# ...and the failed statements left nothing behind
+query I
+SELECT count(*) FROM (SELECT * FROM s.inventory_events EXCEPT ALL SELECT * FROM oracle.inventory_events);
+----
+0
+
+# ON CONFLICT needs a UNIQUE constraint to target - same binder errors as plain DuckDB
+statement error
+INSERT INTO s.inventory_events VALUES ('A1', 'north', 1, 'x') ON CONFLICT DO NOTHING;
+----
+There are no UNIQUE/PRIMARY KEY constraints that refer to this table
+
+statement error
+INSERT INTO s.inventory_events VALUES ('A1', 'north', 1, 'x') ON CONFLICT (sku, warehouse) DO NOTHING;
+----
+not referenced by a UNIQUE/PRIMARY KEY CONSTRAINT or INDEX
+
+statement error
+INSERT INTO oracle.inventory_events VALUES ('A1', 'north', 1, 'x') ON CONFLICT DO NOTHING;
+----
+There are no UNIQUE/PRIMARY KEY constraints that refer to this table
+
+# merge-back applies the bag delta to the base
+query I
+SELECT tables_changed FROM scenario_merge('inv');
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT * FROM inventory_events EXCEPT ALL SELECT * FROM oracle.inventory_events);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.inventory_events EXCEPT ALL SELECT * FROM inventory_events);
+----
+0
+
+statement ok
+DETACH s;
+
+# =============================================================================
+# 2. customer_emails: keyless table with a UNIQUE(email) conflict target
+# =============================================================================
+
+statement ok
+CREATE TABLE customer_emails (email VARCHAR UNIQUE, name VARCHAR, visits INTEGER);
+
+statement ok
+INSERT INTO customer_emails VALUES
+    ('ada@corp.com', 'Ada', 1), ('alan@corp.com', 'Alan', 2), ('grace@corp.com', 'Grace', 3),
+    (NULL, 'walk-in', 1), (NULL, 'walk-in', 1);
+
+statement ok
+CREATE TABLE oracle.customer_emails (email VARCHAR UNIQUE, name VARCHAR, visits INTEGER);
+
+statement ok
+INSERT INTO oracle.customer_emails SELECT * FROM customer_emails;
+
+statement ok
+CALL scenario_create('crm');
+
+statement ok
+ATTACH 'crm' AS c (TYPE scenario);
+
+# scenario history: a scenario-only customer, and a base customer deleted in the scenario
+statement ok
+INSERT INTO c.customer_emails VALUES ('linus@corp.com', 'Linus', 1);
+
+statement ok
+INSERT INTO oracle.customer_emails VALUES ('linus@corp.com', 'Linus', 1);
+
+statement ok
+DELETE FROM c.customer_emails WHERE email = 'alan@corp.com';
+
+statement ok
+DELETE FROM oracle.customer_emails WHERE email = 'alan@corp.com';
+
+# DO NOTHING: conflicts against a base row and a scenario row are skipped; the
+# value vacated by the scenario DELETE is free again; NULLs never conflict
+query I
+INSERT INTO c.customer_emails VALUES
+    ('ada@corp.com', 'Ada Lovelace', 9), ('linus@corp.com', 'Linus T', 9),
+    ('alan@corp.com', 'Alan Turing', 9), ('edsger@corp.com', 'Edsger', 1),
+    (NULL, 'anon', 1)
+    ON CONFLICT (email) DO NOTHING;
+----
+3
+
+query I
+INSERT INTO oracle.customer_emails VALUES
+    ('ada@corp.com', 'Ada Lovelace', 9), ('linus@corp.com', 'Linus T', 9),
+    ('alan@corp.com', 'Alan Turing', 9), ('edsger@corp.com', 'Edsger', 1),
+    (NULL, 'anon', 1)
+    ON CONFLICT (email) DO NOTHING;
+----
+3
+
+query TTI
+SELECT * FROM c.customer_emails ORDER BY ALL;
+----
+ada@corp.com	Ada	1
+alan@corp.com	Alan Turing	9
+edsger@corp.com	Edsger	1
+grace@corp.com	Grace	3
+linus@corp.com	Linus	1
+NULL	anon	1
+NULL	walk-in	1
+NULL	walk-in	1
+
+# DO UPDATE (upsert) against base and scenario rows, with excluded.* and a WHERE
+query I
+INSERT INTO c.customer_emails VALUES
+    ('ada@corp.com', 'Ada L.', 1), ('grace@corp.com', 'Grace H.', 1),
+    ('edsger@corp.com', 'E. W. Dijkstra', 1), ('barbara@corp.com', 'Barbara', 1)
+    ON CONFLICT (email) DO UPDATE SET name = excluded.name, visits = customer_emails.visits + excluded.visits
+    WHERE customer_emails.visits < 3;
+----
+3
+
+query I
+INSERT INTO oracle.customer_emails VALUES
+    ('ada@corp.com', 'Ada L.', 1), ('grace@corp.com', 'Grace H.', 1),
+    ('edsger@corp.com', 'E. W. Dijkstra', 1), ('barbara@corp.com', 'Barbara', 1)
+    ON CONFLICT (email) DO UPDATE SET name = excluded.name, visits = customer_emails.visits + excluded.visits
+    WHERE customer_emails.visits < 3;
+----
+3
+
+# no conflict target: derived from the single UNIQUE constraint
+statement ok
+INSERT INTO c.customer_emails VALUES ('ada@corp.com', 'nobody', 0), ('ken@corp.com', 'Ken', 1) ON CONFLICT DO NOTHING;
+
+statement ok
+INSERT INTO oracle.customer_emails VALUES ('ada@corp.com', 'nobody', 0), ('ken@corp.com', 'Ken', 1) ON CONFLICT DO NOTHING;
+
+# INSERT OR REPLACE
+statement ok
+INSERT OR REPLACE INTO c.customer_emails VALUES ('ken@corp.com', 'Ken Thompson', 5), ('dennis@corp.com', 'Dennis', 1);
+
+statement ok
+INSERT OR REPLACE INTO oracle.customer_emails VALUES ('ken@corp.com', 'Ken Thompson', 5), ('dennis@corp.com', 'Dennis', 1);
+
+query TTI
+SELECT * FROM c.customer_emails ORDER BY ALL;
+----
+ada@corp.com	Ada L.	2
+alan@corp.com	Alan Turing	9
+barbara@corp.com	Barbara	1
+dennis@corp.com	Dennis	1
+edsger@corp.com	E. W. Dijkstra	2
+grace@corp.com	Grace	3
+ken@corp.com	Ken Thompson	5
+linus@corp.com	Linus	1
+NULL	anon	1
+NULL	walk-in	1
+NULL	walk-in	1
+
+query I
+SELECT count(*) FROM (SELECT * FROM c.customer_emails EXCEPT ALL SELECT * FROM oracle.customer_emails);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.customer_emails EXCEPT ALL SELECT * FROM c.customer_emails);
+----
+0
+
+# an upsert that moves a value onto an existing one still violates UNIQUE
+statement error
+MERGE INTO c.customer_emails t USING (SELECT 'barbara@corp.com' AS email) src ON t.email = src.email
+    WHEN MATCHED THEN UPDATE SET email = 'ada@corp.com';
+----
+<REGEX>:.*(unique|Duplicate|constraint).*
+
+# a plain MERGE on the unique column works too
+statement ok
+MERGE INTO c.customer_emails t USING (VALUES ('dennis@corp.com'), ('nobody@corp.com')) v(email) ON t.email = v.email
+    WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (v.email, 'nobody', 0);
+
+statement ok
+MERGE INTO oracle.customer_emails t USING (VALUES ('dennis@corp.com'), ('nobody@corp.com')) v(email) ON t.email = v.email
+    WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT VALUES (v.email, 'nobody', 0);
+
+query I
+SELECT count(*) FROM (SELECT * FROM c.customer_emails EXCEPT ALL SELECT * FROM oracle.customer_emails);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.customer_emails EXCEPT ALL SELECT * FROM c.customer_emails);
+----
+0
+
+# ROLLBACK discards a keyless upsert
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO c.customer_emails VALUES ('ada@corp.com', 'rolled back', 0) ON CONFLICT (email) DO UPDATE SET name = excluded.name;
+
+statement ok
+ROLLBACK;
+
+query T
+SELECT name FROM c.customer_emails WHERE email = 'ada@corp.com';
+----
+Ada L.
+
+# merge-back
+statement ok
+SELECT * FROM scenario_merge('crm');
+
+query I
+SELECT count(*) FROM (SELECT * FROM customer_emails EXCEPT ALL SELECT * FROM oracle.customer_emails);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.customer_emails EXCEPT ALL SELECT * FROM customer_emails);
+----
+0
+
+statement ok
+DETACH c;
+
+# =============================================================================
+# 3. materialized scenario
+# =============================================================================
+
+statement ok
+CALL scenario_create('inv_mat', mode := 'materialized');
+
+statement ok
+ATTACH 'inv_mat' AS m (TYPE scenario);
+
+statement ok
+MERGE INTO m.inventory_events t USING adjustments a
+    ON t.sku = a.sku AND t.warehouse = a.warehouse
+    WHEN MATCHED AND a.action = 'drop' THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = t.qty - a.delta_qty
+    WHEN NOT MATCHED THEN INSERT VALUES (a.sku, a.warehouse, a.delta_qty, 'mat-new');
+
+statement ok
+MERGE INTO oracle.inventory_events t USING adjustments a
+    ON t.sku = a.sku AND t.warehouse = a.warehouse
+    WHEN MATCHED AND a.action = 'drop' THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = t.qty - a.delta_qty
+    WHEN NOT MATCHED THEN INSERT VALUES (a.sku, a.warehouse, a.delta_qty, 'mat-new');
+
+statement ok
+INSERT INTO m.customer_emails VALUES ('ada@corp.com', 'Mat Ada', 1), ('mat@corp.com', 'Mat', 1)
+    ON CONFLICT (email) DO UPDATE SET name = excluded.name;
+
+statement ok
+INSERT INTO oracle.customer_emails VALUES ('ada@corp.com', 'Mat Ada', 1), ('mat@corp.com', 'Mat', 1)
+    ON CONFLICT (email) DO UPDATE SET name = excluded.name;
+
+query I
+SELECT count(*) FROM (SELECT * FROM m.inventory_events EXCEPT ALL SELECT * FROM oracle.inventory_events);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.inventory_events EXCEPT ALL SELECT * FROM m.inventory_events);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM m.customer_emails EXCEPT ALL SELECT * FROM oracle.customer_emails);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.customer_emails EXCEPT ALL SELECT * FROM m.customer_emails);
+----
+0
+
+statement ok
+SELECT * FROM scenario_merge('inv_mat');
+
+query I
+SELECT count(*) FROM (SELECT * FROM inventory_events EXCEPT ALL SELECT * FROM oracle.inventory_events)
+    UNION ALL
+    SELECT count(*) FROM (SELECT * FROM oracle.inventory_events EXCEPT ALL SELECT * FROM inventory_events)
+    UNION ALL
+    SELECT count(*) FROM (SELECT * FROM customer_emails EXCEPT ALL SELECT * FROM oracle.customer_emails)
+    UNION ALL
+    SELECT count(*) FROM (SELECT * FROM oracle.customer_emails EXCEPT ALL SELECT * FROM customer_emails);
+----
+0
+0
+0
+0
+
+statement ok
+DETACH m;
+
+# =============================================================================
+# 4. large generated variant: 120k keyless rows, every row present 3 times
+# =============================================================================
+
+statement ok
+CREATE TABLE stock_moves AS
+SELECT 'S' || (i % 40000) AS sku, 'W' || (i % 4) AS warehouse, (i % 100)::INTEGER AS qty,
+       CASE WHEN i % 40000 % 11 = 0 THEN NULL ELSE 'n' || (i % 5) END AS note
+FROM range(120000) t(i);
+
+statement ok
+CREATE TABLE oracle.stock_moves AS SELECT * FROM stock_moves;
+
+# 30k distinct (sku, warehouse) sources: half match (3 copies each), half are new
+statement ok
+CREATE TABLE stock_adj AS
+SELECT 'S' || (j * 2) AS sku, 'W' || (j * 2 % 4) AS warehouse, (j % 13)::INTEGER AS dq,
+       CASE WHEN j % 10 = 0 THEN 'drop' ELSE 'add' END AS action
+FROM range(30000) t(j);
+
+statement ok
+CALL scenario_create('big');
+
+statement ok
+ATTACH 'big' AS b (TYPE scenario);
+
+statement ok
+UPDATE b.stock_moves SET qty = qty + 1000 WHERE sku LIKE 'S1%';
+
+statement ok
+UPDATE oracle.stock_moves SET qty = qty + 1000 WHERE sku LIKE 'S1%';
+
+query I
+MERGE INTO b.stock_moves t USING stock_adj a
+    ON t.sku = a.sku AND t.warehouse = a.warehouse
+    WHEN MATCHED AND a.action = 'drop' THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = t.qty + a.dq, note = 'adj'
+    WHEN NOT MATCHED THEN INSERT VALUES (a.sku, a.warehouse, a.dq, 'adj-new');
+----
+70000
+
+query I
+MERGE INTO oracle.stock_moves t USING stock_adj a
+    ON t.sku = a.sku AND t.warehouse = a.warehouse
+    WHEN MATCHED AND a.action = 'drop' THEN DELETE
+    WHEN MATCHED THEN UPDATE SET qty = t.qty + a.dq, note = 'adj'
+    WHEN NOT MATCHED THEN INSERT VALUES (a.sku, a.warehouse, a.dq, 'adj-new');
+----
+70000
+
+query I
+SELECT count(*) FROM b.stock_moves;
+----
+124000
+
+query I
+SELECT count(*) FROM (SELECT * FROM b.stock_moves EXCEPT ALL SELECT * FROM oracle.stock_moves);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.stock_moves EXCEPT ALL SELECT * FROM b.stock_moves);
+----
+0
+
+statement ok
+SELECT * FROM scenario_merge('big');
+
+query I
+SELECT count(*) FROM (SELECT * FROM stock_moves EXCEPT ALL SELECT * FROM oracle.stock_moves);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.stock_moves EXCEPT ALL SELECT * FROM stock_moves);
+----
+0
+
+# large keyless upsert: 100k customers, 50k incoming with half conflicting
+statement ok
+CREATE TABLE bulk_emails (email VARCHAR UNIQUE, name VARCHAR, visits INTEGER);
+
+statement ok
+INSERT INTO bulk_emails
+SELECT CASE WHEN i % 1000 = 0 THEN NULL ELSE 'u' || i || '@corp.com' END AS email, 'user ' || i AS name,
+       (i % 7)::INTEGER AS visits
+FROM range(100000) t(i);
+
+statement ok
+CREATE TABLE oracle.bulk_emails (email VARCHAR UNIQUE, name VARCHAR, visits INTEGER);
+
+statement ok
+INSERT INTO oracle.bulk_emails SELECT * FROM bulk_emails;
+
+statement ok
+CREATE TABLE incoming AS
+SELECT 'u' || (i * 3) || '@corp.com' AS email, 'renamed ' || i AS name, 1 AS visits FROM range(50000) t(i);
+
+statement ok
+CALL scenario_create('bulk');
+
+statement ok
+ATTACH 'bulk' AS u (TYPE scenario);
+
+statement ok
+INSERT INTO u.bulk_emails SELECT * FROM incoming
+    ON CONFLICT (email) DO UPDATE SET name = excluded.name, visits = bulk_emails.visits + excluded.visits;
+
+statement ok
+INSERT INTO oracle.bulk_emails SELECT * FROM incoming
+    ON CONFLICT (email) DO UPDATE SET name = excluded.name, visits = bulk_emails.visits + excluded.visits;
+
+query I
+SELECT count(*) FROM (SELECT * FROM u.bulk_emails EXCEPT ALL SELECT * FROM oracle.bulk_emails);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.bulk_emails EXCEPT ALL SELECT * FROM u.bulk_emails);
+----
+0
+
+statement ok
+SELECT * FROM scenario_merge('bulk');
+
+query I
+SELECT count(*) FROM (SELECT * FROM bulk_emails EXCEPT ALL SELECT * FROM oracle.bulk_emails);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM oracle.bulk_emails EXCEPT ALL SELECT * FROM bulk_emails);
+----
+0

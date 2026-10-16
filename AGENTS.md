@@ -274,6 +274,7 @@ test/sql/
   attach_constraints.test         # NOT NULL/CHECK/PK vs merged state; no-PK limits
   attach_ddl.test                 # canonical DDL rejection
   attach_txn.test                 # caller-transaction semantics (ROLLBACK/COMMIT)
+  attach_mixed_txn.test           # host + scenario writes in one transaction (#31)
   attach_freeze.test              # freeze/unfreeze enforcement
   attach_hardening.test           # re-attach, double attach, introspection
   attach_persistence.test         # durability across restart
@@ -284,10 +285,13 @@ test/sql/
   scenario_diff_v2.test           # streaming diff engine (2- and 3-arg)
   scenario_migrate.test           # legacy v0.1 -> v2 migration
   attach_keyless_unique.test      # UNIQUE on keyless (bag) tables vs the merged relation (#27)
+  attach_keyless_merge.test       # MERGE INTO / ON CONFLICT on keyless tables vs a plain-table oracle (#31)
   scenario_diff_keyless.test      # bag diff/summary on keyless tables (#27)
   attach_dotted_names.test        # table/schema names containing . (quote-aware logical names, #27)
   attach_insert_constraint_order.test # base PK probe vs constraint declaration order (#22)
   scenario_materialized_fk.test   # materialized copies over FK schemas; merge-back enforces FKs (#24)
+  scenario_keyless_upgrade.test   # pre-v0.4.1 keyless deltas (no _count) upgraded in place (#31)
+  scenario_ducklake_keyless_merge.test # keyless bag merge-back into DuckLake bases: exact copies, drift (#31)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
 ```

@@ -59,6 +59,9 @@ struct DiffTarget {
 	//! Keyless table (bag delta with _count): every column is the identity
 	//! (pk_columns), payload_columns is empty, and changes are net I/D counts
 	bool keyless = false;
+	//! Keyless multiplicity per delta row: the _count column, or 1 for a
+	//! pre-v0.4.1 delta not yet upgraded (each old row is one inserted copy)
+	string count_expr = "_count";
 };
 
 //! FROM-clause reference to the base side under an alias (AT follows the alias)
@@ -79,7 +82,7 @@ string ColumnList(const vector<string> &columns, const string &prefix = "") {
 //! multiplicity expanded)
 string ExpandedDeltaRows(const DiffTarget &target, const char *op) {
 	auto cols = ColumnList(target.pk_columns);
-	return "SELECT " + cols + " FROM (SELECT " + cols + ", unnest(range(_count)) AS __anofox_copy FROM " +
+	return "SELECT " + cols + " FROM (SELECT " + cols + ", unnest(range(" + target.count_expr + ")) AS __anofox_copy FROM " +
 	       target.delta_name + " WHERE _op = '" + op + "')";
 }
 
@@ -159,10 +162,7 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	if (pk_columns.empty()) {
 		// keyless: a bag diff over whole rows, netting the delta's I/D counts
 		if (!ScenarioDelta::CountColumnIndex(*delta).IsValid()) {
-			throw NotImplementedException(
-			    "scenario_diff on keyless table '%s' requires a scenario created with v0.4.1+ (its delta lacks "
-			    "the _count column). Recreate the scenario, or declare key_columns at scenario_create",
-			    table_name);
+			target.count_expr = "1";
 		}
 		target.keyless = true;
 	}
@@ -305,7 +305,8 @@ unique_ptr<TableRef> ScenarioDiffBindReplace(ClientContext &context, TableFuncti
 		             "CAST(NULL AS VARCHAR) AS column_name, CAST(NULL AS VARCHAR) AS old_value, CAST(NULL AS "
 		             "VARCHAR) AS new_value FROM (SELECT " +
 		             cols + ", __anofox_net, unnest(range(abs(__anofox_net))) AS __anofox_copy FROM (SELECT " + cols +
-		             ", CAST(sum(CASE WHEN _op = 'I' THEN _count ELSE -_count END) AS BIGINT) AS __anofox_net FROM " +
+		             ", CAST(sum(CASE WHEN _op = 'I' THEN " + target.count_expr + " ELSE -" + target.count_expr +
+		             " END) AS BIGINT) AS __anofox_net FROM " +
 		             target.delta_name + " GROUP BY ALL) WHERE __anofox_net <> 0)";
 		return SQLToSubquery(context, sql);
 	}

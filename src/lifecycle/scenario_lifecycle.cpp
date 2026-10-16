@@ -256,6 +256,11 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 			throw InvalidInputException("key_columns declared for unknown table '%s'", declared.first);
 		}
 	}
+	if (parent) {
+		// the parent's rows are copied verbatim below, so a pre-v0.4.1 keyless
+		// parent delta (no _count) is brought to the current layout first
+		ScenarioDelta::UpgradeLegacyKeylessDeltas(context, host_catalog, parent->scenario_id);
+	}
 	for (auto &base_table : base_tables) {
 		auto logical_name = ScenarioDelta::LogicalName(base_table.get());
 		auto declared = bind_data.key_columns.find(logical_name);
