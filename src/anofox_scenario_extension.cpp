@@ -39,6 +39,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// scenario_merge_preview + CALL scenario_merge (merge-back)
 	ScenarioMergeBack::RegisterFunctions(loader);
 
+	// Merge-on-read tuning: up to this many updated/deleted keys, base rows
+	// are matched against an in-memory hash set of those keys (lock-free,
+	// scales with scan threads); above it, every base row probes the delta's
+	// key index instead (bounded memory, serialized on the index lock)
+	config.AddExtensionOption("anofox_scenario_suppression_hash_limit",
+	                          "Maximum number of updated/deleted scenario keys per table for which scans suppress base "
+	                          "rows through an in-memory hash set instead of per-row delta index probes",
+	                          LogicalType::UBIGINT, Value::UBIGINT(4194304));
+
 	// PostHog telemetry (schema 2): envelope-only extension_loaded event.
 	// Respects DATAZOO_DISABLE_TELEMETRY and the opt-out setting below.
 #ifdef HAS_POSTHOG_TELEMETRY

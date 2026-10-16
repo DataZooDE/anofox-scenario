@@ -75,6 +75,16 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   same transaction is still refused by DuckDB's single-writer rule. Writes in a
   `READ ONLY` transaction or through a scenario attached `READ_ONLY` fail before execution,
   even when they would touch zero rows.
+- **Reads under concurrency:** a transaction keeps reading its own snapshot of a scenario even
+  after another connection commits changes to the same keys. A write from that older snapshot to
+  a key someone else changed since fails with DuckDB's normal write-write conflict.
+- **Read performance:** a scan hides base rows replaced by the scenario through an in-memory hash
+  of the updated or deleted keys, so it stays parallel however large the base is. A filter that
+  pins the key (`WHERE id = 42`, `WHERE id IN (...)`, or every column of a composite key) reads
+  only those keys from the delta. Setting:
+  | Setting | Default | Meaning |
+  | --- | --- | --- |
+  | `anofox_scenario_suppression_hash_limit` | `4194304` | The most updated/deleted keys per table that are hashed in memory (about 16 bytes each). Above it, each base row is looked up in the delta's key index instead: less memory, but scans of that table no longer run in parallel. `0` always uses the index. |
 - **DDL:** not permitted inside scenarios (one canonical error).
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time.
