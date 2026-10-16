@@ -179,7 +179,10 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 				match_b += "b." + name + " IS NOT DISTINCT FROM d." + name;
 				match_m += "m." + name + " IS NOT DISTINCT FROM d." + name;
 			}
-			drift_clause = "((SELECT sum(CASE WHEN d2._op = 'I' THEN d2._count ELSE -d2._count END) FROM " +
+			auto delta_entry = ScenarioDelta::TryGetDeltaTable(context, host, entry->scenario_id, logical_name);
+			auto count_name = delta_entry ? ScenarioDelta::CountColumnName(*delta_entry) : string();
+			auto count_ref = count_name.empty() ? string("1") : "d2." + QM(count_name);
+			drift_clause = "((SELECT sum(CASE WHEN d2._op = 'I' THEN " + count_ref + " ELSE -" + count_ref + " END) FROM " +
 			               internal_prefix + QM(delta_pair.first) + " d2 WHERE " + match_d2 +
 			               ") < 0 AND (SELECT count(*) FROM " + base_name + " b WHERE " + match_b +
 			               ") <> (SELECT count(*) FROM " + snapshot_ref + " WHERE " + match_m + "))";
@@ -347,8 +350,11 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 			}
 			// per-value nets + lake/snapshot counts, captured before the lake
 			// is touched
+			auto delta_entry = ScenarioDelta::TryGetDeltaTable(context, host, entry.scenario_id, logical_name);
+			auto count_name = delta_entry ? ScenarioDelta::CountColumnName(*delta_entry) : string();
+			auto count_ref = count_name.empty() ? string("1") : "d." + QM(count_name);
 			run("CREATE OR REPLACE TEMP TABLE __anofox_merge_bag AS WITH net AS (SELECT " + payload_cols +
-			    ", CAST(sum(CASE WHEN d._op = 'I' THEN d._count ELSE -d._count END) AS BIGINT) AS __anofox_net FROM " + delta_ref +
+			    ", CAST(sum(CASE WHEN d._op = 'I' THEN " + count_ref + " ELSE -" + count_ref + " END) AS BIGINT) AS __anofox_net FROM " + delta_ref +
 			    " d GROUP BY ALL) SELECT " + n_cols + ", n.__anofox_net, CASE WHEN n.__anofox_net < 0 THEN (SELECT "
 			    "count(*) FROM " + base_ref + " b WHERE " + match_b + ") END AS __anofox_now, CASE WHEN "
 			    "n.__anofox_net < 0 THEN (SELECT count(*) FROM " + snapshot_ref + " WHERE " + match_m +

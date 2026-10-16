@@ -21,6 +21,7 @@
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 #include "duckdb/transaction/local_storage.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -33,12 +34,43 @@ constexpr idx_t ScenarioDelta::PAYLOAD_START;
 constexpr const char *ScenarioDelta::COUNT_COLUMN;
 
 optional_idx ScenarioDelta::CountColumnIndex(const TableCatalogEntry &delta_table) {
+	if (delta_table.HasPrimaryKey()) {
+		return optional_idx();
+	}
 	auto &columns = delta_table.GetColumns();
 	auto count = columns.LogicalColumnCount();
-	if (count > PAYLOAD_START && columns.GetColumn(LogicalIndex(count - 1)).Name() == COUNT_COLUMN) {
-		return optional_idx(count - 1);
+	if (count <= PAYLOAD_START + 1) {
+		return optional_idx();
+	}
+	auto last = count - 1;
+	if (columns.GetColumn(LogicalIndex(last)).Type() != LogicalType::BIGINT) {
+		return optional_idx();
+	}
+	// the structural marker: only the multiplicity column of a bag delta
+	// carries NOT NULL besides _op/_ts
+	for (auto &constraint : delta_table.GetConstraints()) {
+		if (constraint->type == ConstraintType::NOT_NULL &&
+		    constraint->Cast<NotNullConstraint>().index.index == last) {
+			return optional_idx(last);
+		}
 	}
 	return optional_idx();
+}
+
+string ScenarioDelta::CountColumnName(const TableCatalogEntry &delta_table) {
+	auto index = CountColumnIndex(delta_table);
+	if (!index.IsValid()) {
+		return string();
+	}
+	return delta_table.GetColumn(LogicalIndex(index.GetIndex())).Name();
+}
+
+string ScenarioDelta::NewCountColumnName(const ColumnList &payload_columns) {
+	string name = COUNT_COLUMN;
+	while (payload_columns.ColumnExists(name)) {
+		name = "_" + name;
+	}
+	return name;
 }
 
 static optional_ptr<DuckTableEntry> TryGetInternalTable(ClientContext &context, Catalog &host_catalog,
@@ -100,7 +132,8 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 			old_types.push_back(col.Type());
 		}
 		auto count_index = info->columns.LogicalColumnCount();
-		info->columns.AddColumn(ColumnDefinition(COUNT_COLUMN, LogicalType::BIGINT));
+		auto count_name = NewCountColumnName(info->columns);
+		info->columns.AddColumn(ColumnDefinition(count_name, LogicalType::BIGINT));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(OP_COL)));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TS_COL)));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(count_index)));
@@ -166,23 +199,50 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 	return legacy_names.size();
 }
 
-bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog,
-                                                  int64_t scenario_id) {
+bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                                  bool read_only_attach) {
 	if (!HasLegacyKeylessDeltas(context, host_catalog, scenario_id)) {
 		return true;
 	}
+	// Every skip below is safe: readers handle the legacy layout as
+	// _count = 1, and the next ATTACH that is allowed to write upgrades.
+	if (read_only_attach) {
+		return false; // READ_ONLY promises not to write the host
+	}
 	auto &host_db = host_catalog.GetAttached();
 	auto &meta = MetaTransaction::Get(context);
-	auto modified = meta.ModifiedDatabase();
-	if (host_db.IsReadOnly() || meta.IsReadOnly() || (modified && modified.get() != &host_db)) {
-		// not writable here: readers cope with the legacy layout, and the
-		// next ATTACH from a writable transaction upgrades
+	if (host_db.IsReadOnly() || meta.IsReadOnly()) {
 		return false;
+	}
+	auto modified = meta.ModifiedDatabase();
+	if (modified ? modified.get() != &host_db : !context.transaction.IsAutoCommit()) {
+		// inside an explicit transaction the upgrade would make the host the
+		// transaction's single writer behind the user's back (and block a
+		// later write to another database); only ride along when the
+		// transaction already writes the host
+		return false;
+	}
+	// another, older transaction on the host may hold uncommitted writes to
+	// the legacy delta: dropping it now would fail that transaction's commit
+	auto &transaction_manager = host_db.GetTransactionManager();
+	if (transaction_manager.IsDuckTransactionManager()) {
+		auto &duck_manager = DuckTransactionManager::Get(host_db);
+		auto &transaction = DuckTransaction::Get(context, host_db);
+		if (duck_manager.LowestActiveStart() < transaction.start_time) {
+			return false;
+		}
 	}
 	meta.ModifyDatabase(host_db, DatabaseModificationType::DROP_CATALOG_ENTRY |
 	                                 DatabaseModificationType::CREATE_CATALOG_ENTRY |
 	                                 DatabaseModificationType::INSERT_DATA);
-	UpgradeLegacyKeylessDeltas(context, host_catalog, scenario_id);
+	try {
+		UpgradeLegacyKeylessDeltas(context, host_catalog, scenario_id);
+	} catch (TransactionException &) {
+		// a catalog conflict with a concurrent transaction: keep the legacy
+		// layout rather than fail the ATTACH (each table's swap is
+		// self-contained, so tables upgraded before the conflict stay valid)
+		return false;
+	}
 	return true;
 }
 
@@ -341,8 +401,11 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 
 	DataChunk scan_chunk;
 	scan_chunk.Initialize(Allocator::Get(context), from_types);
+	// a legacy keyless delta into a bag delta: append each row with _count = 1
+	bool fill_count = target_column_offset == 0 && to_types.size() == from_types.size() + 1 &&
+	                  IsLegacyKeylessDelta(from_table) && CountColumnIndex(to_table).IsValid();
 	DataChunk append_chunk;
-	if (target_column_offset > 0) {
+	if (target_column_offset > 0 || fill_count) {
 		append_chunk.Initialize(Allocator::Get(context), to_types);
 	}
 	while (from_storage.NextParallelScan(context, parallel_state, state) > 0) {
@@ -352,7 +415,15 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 			if (scan_chunk.size() == 0) {
 				break;
 			}
-			if (target_column_offset == 0) {
+			if (fill_count) {
+				append_chunk.Reset();
+				for (idx_t col = 0; col < from_types.size(); col++) {
+					append_chunk.data[col].Reference(scan_chunk.data[col]);
+				}
+				append_chunk.data[from_types.size()].Reference(Value::BIGINT(1));
+				append_chunk.SetCardinality(scan_chunk.size());
+				to_storage.LocalAppend(to_table, context, append_chunk, to_constraints);
+			} else if (target_column_offset == 0) {
 				to_storage.LocalAppend(to_table, context, scan_chunk, to_constraints);
 			} else {
 				append_chunk.Reset();
@@ -411,7 +482,10 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 		// rows carry a multiplicity instead and readers aggregate. Secondary
 		// UNIQUE constraints are not mirrored here (D rows carry real
 		// payloads and would collide with their replacements).
-		info->columns.AddColumn(ColumnDefinition(COUNT_COLUMN, LogicalType::BIGINT));
+		// (named _count unless a base column already is - readers find it
+		// by position and its NOT NULL, see CountColumnIndex)
+		info->columns.AddColumn(
+		    ColumnDefinition(NewCountColumnName(base_entry.GetColumns()), LogicalType::BIGINT));
 		info->constraints.push_back(
 		    make_uniq<NotNullConstraint>(LogicalIndex(PAYLOAD_START + base_entry.GetColumns().LogicalColumnCount())));
 	} else {

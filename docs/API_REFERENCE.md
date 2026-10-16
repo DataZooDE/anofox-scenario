@@ -110,6 +110,7 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 | --- | --- |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC) | documented protocol |
+| Keyless scenarios written before v0.4.1: keyless `UPDATE`/`DELETE` needs the delta upgraded first, which happens on a plain `ATTACH` (autocommit or a transaction already writing the host, not `READ_ONLY`, no other transaction active on the host). Otherwise ATTACH succeeds, reads are correct, and the DML error asks to re-`ATTACH` | reads and `INSERT` are unaffected |
 
 ## Function Reference
 
@@ -138,9 +139,15 @@ __anofox_scenario.registry              -- scenario_id, name, mode, frozen, pare
 __anofox_scenario.registry_seq          -- id sequence
 __anofox_scenario.s<id>_delta_<table>   -- (_op 'I'|'U'|'D', _ts, <base columns>) PK = base PK
                                         --   or the declared key_columns; keyless tables append
-                                        --   _count BIGINT (bag changelog, no PK) instead;
+                                        --   _count BIGINT NOT NULL (bag changelog, no PK)
+                                        --   instead - named __count (more underscores as
+                                        --   needed) when the table has its own _count;
                                         --   pre-v0.4.1 keyless deltas (no _count) are
-                                        --   upgraded in place on ATTACH / branching
+                                        --   upgraded in place on a plain ATTACH (not
+                                        --   READ_ONLY, not inside a transaction that does
+                                        --   not write the host, not while another
+                                        --   transaction is active); until then they read
+                                        --   as _count = 1
 __anofox_scenario.s<id>_mat_<table>     -- materialized base copies (mode = 'materialized');
                                         --   FOREIGN KEY constraints are not copied
 ```

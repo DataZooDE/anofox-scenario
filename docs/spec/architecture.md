@@ -114,8 +114,17 @@ per-value suppression budget instead (below).
 ### Keyless tables
 
 Without a PK or declared `key_columns` there is nothing to match on, so the delta becomes a
-**bag changelog**: no PK, plus a trailing `_count BIGINT` multiplicity, with readers aggregating
-inserts and deletes per distinct value.
+**bag changelog**: no PK, plus a trailing `_count BIGINT NOT NULL` multiplicity, with readers
+aggregating inserts and deletes per distinct value.
+
+Readers find the multiplicity column structurally, never by name: `ScenarioDelta::CountColumnIndex`
+accepts a delta with no PK whose last column is a `BIGINT` carrying a `NOT NULL` constraint. A
+delta never mirrors the base's `NOT NULL`s, so no payload column - and no column of a pre-v0.4.1
+delta - matches. Every reader (scan, insert/update/delete sinks, UNIQUE probe, `scenario_diff`,
+`scenario_diff_summary`, merge-back) goes through that helper, and SQL that names the column uses
+`CountColumnName`. The column is called `_count` unless a base column already is: then
+`NewCountColumnName` prefixes underscores until the name is free (`__count`), so a keyless table
+with its own `_count` column works.
 
 This supports `INSERT`/`UPDATE`/`DELETE`/`MERGE INTO` with bag semantics. Keyless row identity
 is the whole row: `GetRowIdColumns()` is `__scenario_origin`, one `__scenario_key_<k>` per
@@ -178,17 +187,29 @@ below).
 `(_op, _ts, <base columns>)` with no PK, no `_count`, the base's secondary `UNIQUE`s mirrored,
 and only `I` rows (UPDATE/DELETE were gated). Each old row is therefore exactly one inserted
 copy, i.e. `_count = 1`. `ScenarioDelta::UpgradeLegacyKeylessDeltas` rebuilds such a delta
-(no PK and no trailing `_count`) into the current layout: rows are buffered, the old table
-(and its mirrored `UNIQUE` indexes) is dropped, the table is recreated with `_count BIGINT NOT
-NULL` as the trailing column, and the rows are re-appended with `_count = 1`, timestamps kept.
-It runs in the caller's transaction at two hooks where a host write is safe:
+(no PK and no trailing multiplicity column) into the current layout: rows are buffered, the old
+table (and its mirrored `UNIQUE` indexes) is dropped, the table is recreated with `_count BIGINT
+NOT NULL` (or the collision-free name above) as the trailing column, and the rows are re-appended
+with `_count = 1`, timestamps kept. Dropping the table is not a logical write, but it does
+conflict with other transactions using the delta, so it only runs at `ATTACH ... (TYPE
+scenario)`, before any statement binds against the scenario, and only when
+`TryUpgradeLegacyKeylessDeltas` finds it safe. It is skipped, leaving the legacy layout, when:
 
-- `ATTACH ... (TYPE scenario)`, before any statement binds against the scenario. It is skipped
-  when it cannot write the host: a read-only host database, a `READ ONLY` transaction, or an
-  explicit transaction that already wrote another database (single-writer rule). Freezing does
-  not block it - the logical content is unchanged.
-- `scenario_create(..., from_scenario := p)`, which copies the parent's delta verbatim and so
-  upgrades the parent first (the create already writes the host).
+- the host database is read-only, the transaction is `READ ONLY`, or the attach itself is
+  `READ_ONLY` (it promises not to write the host);
+- the ATTACH runs inside an explicit transaction that does not already write the host. The
+  upgrade would otherwise make the host the transaction's single writer behind the user's back,
+  and a later write to another database would fail. A transaction that already writes the host
+  upgrades along the way;
+- an older transaction is active on the host (`DuckTransactionManager::LowestActiveStart()`
+  is before ours): it may hold uncommitted writes to the legacy delta, whose commit would fail
+  once the table is dropped;
+- the drop hits a catalog conflict (`TransactionException`): caught, so ATTACH never fails on
+  account of the upgrade.
+
+Freezing does not block it - the logical content is unchanged. `scenario_create(...,
+from_scenario := p)` never rewrites the parent: `CopyTableData` copies a legacy parent delta into
+the child's bag delta with `_count = 1` per row.
 
 Scan-time and DML-time upgrades are deliberately avoided: bound plans hold the delta table
 entry, and a SELECT must not turn into a host write. Readers instead accept the legacy layout

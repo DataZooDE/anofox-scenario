@@ -256,11 +256,6 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 			throw InvalidInputException("key_columns declared for unknown table '%s'", declared.first);
 		}
 	}
-	if (parent) {
-		// the parent's rows are copied verbatim below, so a pre-v0.4.1 keyless
-		// parent delta (no _count) is brought to the current layout first
-		ScenarioDelta::UpgradeLegacyKeylessDeltas(context, host_catalog, parent->scenario_id);
-	}
 	for (auto &base_table : base_tables) {
 		auto logical_name = ScenarioDelta::LogicalName(base_table.get());
 		auto declared = bind_data.key_columns.find(logical_name);
@@ -294,7 +289,10 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		}
 		if (parent_delta) {
 			// inherit the parent's modifications by copying its delta rows
-			// (cheap - deltas are small by invariant)
+			// (cheap - deltas are small by invariant). A pre-v0.4.1 keyless
+			// parent delta (no _count) is copied with _count = 1 per row and
+			// itself left as is: rewriting it here could break a concurrent
+			// writer of the parent
 			ScenarioDelta::CopyTableData(context, *parent_delta, delta);
 		}
 	}
