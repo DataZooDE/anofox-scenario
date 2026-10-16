@@ -11,7 +11,7 @@
 namespace duckdb {
 
 ScenarioTableEntry::ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-                                       TableCatalogEntry &base_entry_p)
+                                       TableCatalogEntry &base_entry_p, bool for_binding)
     : TableCatalogEntry(catalog, schema, info), base_entry(base_entry_p) {
 	// Write attribution (#31). The binder registers DML against a non-temporary
 	// table as a modification of the table's catalog (bind_insert/update/delete/
@@ -24,9 +24,12 @@ ScenarioTableEntry::ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &sch
 	// makes the binder skip that registration (INSERT registers a read instead,
 	// keeping prepared-statement rebinding intact); the sinks then register the
 	// host via ScenarioCatalog::MarkHostWrite before their first physical write.
-	// The flag has no other effect here: it only matters for entries stored in
-	// a CatalogSet / the WAL, and scenario entries live in neither.
-	temporary = true;
+	// The flag has no other effect on the binder's entry: it only matters for
+	// entries stored in a CatalogSet / the WAL, and scenario entries live in
+	// neither. Introspection reads the flag too (duckdb_tables.temporary,
+	// information_schema.tables.table_type), so catalog enumeration
+	// (ScenarioSchemaEntry::Scan) gets a variant without it.
+	temporary = for_binding;
 }
 
 unique_ptr<CreateInfo> ScenarioTableEntry::GetInfo() const {

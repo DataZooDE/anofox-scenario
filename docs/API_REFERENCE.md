@@ -72,9 +72,9 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   number of scenarios on the same host: every scenario row physically lands in the host
   database, so `BEGIN; INSERT INTO main.orders ...; UPDATE s.orders ...; COMMIT;` commits (or
   rolls back) both sides atomically. Writing to a genuinely different attached database in the
-  same transaction is still refused by DuckDB's single-writer rule. Side effect: scenario
-  tables report `temporary = true` in `duckdb_tables()` (their `sql` stays a plain
-  `CREATE TABLE`).
+  same transaction is still refused by DuckDB's single-writer rule. Writes in a
+  `READ ONLY` transaction or through a scenario attached `READ_ONLY` fail before execution,
+  even when they would touch zero rows.
 - **DDL:** not permitted inside scenarios (one canonical error).
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time.

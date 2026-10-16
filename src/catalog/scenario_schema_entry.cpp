@@ -59,17 +59,23 @@ string ScenarioSchemaEntry::QualifiedName(const string &table_name) const {
 	return ScenarioDelta::EncodeLogicalName(name, table_name);
 }
 
-CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table) {
-	return GetOrCreateTableEntryAs(context, base_table, base_table.name);
+CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table,
+                                                         bool for_binding) {
+	return GetOrCreateTableEntryAs(context, base_table, base_table.name, for_binding);
 }
 
 CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &context, TableCatalogEntry &base_table,
-                                                           const string &table_name) {
+                                                           const string &table_name, bool for_binding) {
 	auto &scenario_catalog = GetScenarioCatalog();
 	auto &transaction = scenario_catalog.GetScenarioTransaction(context);
 	auto qualified = QualifiedName(table_name);
+	// Two entries per table and transaction: the binder's (LookupEntry,
+	// temporary-flagged, see ScenarioTableEntry) and the enumeration one
+	// (Scan, a plain base table for introspection). The enumeration entry is
+	// cached under a key no logical name can produce (leading \x01).
+	auto cache_key = for_binding ? qualified : string(1, '\x01') + qualified;
 
-	auto cached = transaction.FindEntry(qualified);
+	auto cached = transaction.FindEntry(cache_key);
 	if (cached) {
 		return *cached;
 	}
@@ -82,14 +88,21 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	table_info.schema = name;
 	table_info.table = table_name;
 
-	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table);
+	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table, for_binding);
 	entry->key_columns = ScenarioDelta::GetKeyColumns(context, scenario_catalog.GetHostCatalog(context),
 	                                                  scenario_catalog.scenario_id, qualified, base_table);
-	return transaction.PublishEntry(qualified, std::move(entry));
+	return transaction.PublishEntry(cache_key, std::move(entry));
 }
 
 void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
                                const std::function<void(CatalogEntry &)> &callback) {
+	// Enumeration (duckdb_tables/duckdb_columns/duckdb_constraints, hence
+	// information_schema and SHOW TABLES; EXPORT DATABASE) receives the
+	// non-temporary entry variant. DuckDB binds DML targets through
+	// Catalog::GetEntry -> LookupEntry, never through Scan, so the binder
+	// still sees the temporary-flagged entry. Should a DML ever bind an
+	// enumerated entry, it would only fall back to naming the scenario
+	// database as the writer (MarkHostWrite handles that case).
 	auto &scenario_catalog = GetScenarioCatalog();
 	if (type == CatalogType::VIEW_ENTRY) {
 		// Views are mirrored live from the base in both modes (their SQL
@@ -137,7 +150,7 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			mat_tables.emplace_back(mat_entry.Cast<TableCatalogEntry>(), std::move(table_name));
 		});
 		for (auto &mat_table : mat_tables) {
-			callback(GetOrCreateTableEntryAs(context, mat_table.first.get(), mat_table.second));
+			callback(GetOrCreateTableEntryAs(context, mat_table.first.get(), mat_table.second, false));
 		}
 		return;
 	}
@@ -152,7 +165,7 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		if (base_entry.type != CatalogType::TABLE_ENTRY || !ShouldExpose(base_entry)) {
 			return;
 		}
-		callback(GetOrCreateTableEntry(context, base_entry.Cast<TableCatalogEntry>()));
+		callback(GetOrCreateTableEntry(context, base_entry.Cast<TableCatalogEntry>(), false));
 	});
 }
 

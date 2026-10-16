@@ -209,17 +209,33 @@ in `bind_insert/update/delete/merge_into.cpp`) unless the table entry is `tempor
 *scenario* database the transaction's writer, and a host write (or a write to a second scenario)
 in the same transaction would fail, although only the host is ever physically modified.
 
-`ScenarioTableEntry` therefore sets `temporary = true`. The binder then skips the
-registration (INSERT registers a read instead, so prepared statements still re-bind on catalog
-changes), and every sink calls `MarkHostWrite` before its first physical write, which calls
-`ModifyDatabase(host)`. Host and scenario writes thus name the same writer; a write to an
-unrelated database still trips DuckDB's check. Because the binder-time checks no longer see the
-scenario catalog, `MarkHostWrite` mirrors them: read-only transaction, scenario attached
-`READ_ONLY`, host attached read-only. The flag has no other effect on scenario entries -
-`temporary` only matters for entries stored in a `CatalogSet` and logged to the WAL, and
-scenario entries live in neither - except that `duckdb_tables()` reports it (`GetInfo` resets
-it, so the `sql` column stays a plain `CREATE TABLE`). Commit, WAL, checkpoint and
-write-write conflict detection are the host `DuckTransaction`'s, unchanged.
+`ScenarioTableEntry` therefore sets `temporary = true` on the entry the binder resolves. The
+binder then skips the registration (INSERT registers a read instead, so prepared statements still
+re-bind on catalog changes), and every sink calls `MarkHostWrite` before its first physical
+write, which calls `ModifyDatabase(host)`. Host and scenario writes thus name the same writer; a
+write to an unrelated database still trips DuckDB's check. The flag has no storage effect on
+scenario entries - `temporary` only matters for entries stored in a `CatalogSet` and logged to
+the WAL, and scenario entries live in neither.
+
+Because the binder-time checks no longer see the scenario catalog, the plan hooks (`PlanInsert`,
+`PlanUpdate`, `PlanDelete`, `PlanMergeInto`) restore them in `ThrowIfNotWritable`, next to the
+frozen check and with DuckDB's own wording: read-only transaction, scenario attached `READ_ONLY`,
+host attached read-only. They run before execution, so zero-row writes fail too, and prepared
+statements re-plan per transaction (see *Entries are per transaction*). `MarkHostWrite` repeats
+them as a backstop.
+
+Introspection reads the flag as well (`duckdb_tables().temporary`, and from it
+`information_schema.tables.table_type` / `commit_action` and `SHOW [ALL] TABLES`). So each
+transaction caches *two* entries per table in `ScenarioTransaction`: the binder's, from
+`LookupEntry`, flagged temporary; and the enumeration one, from `ScenarioSchemaEntry::Scan`,
+which is a plain `BASE TABLE` (cache key prefixed with `\x01`). This split holds because DuckDB
+resolves DML targets only through `Catalog::GetEntry` -> `SchemaCatalogEntry::LookupEntry`
+(`bind_insert.cpp:538`, `bind_basetableref.cpp:163/229` for UPDATE/DELETE/MERGE). `Scan` feeds
+only enumeration: `duckdb_tables.cpp:83`, `duckdb_columns.cpp:91`, `duckdb_constraints`, and
+`bind_export.cpp:171`, which reads. If a DML statement ever bound an enumerated entry, it would
+only fall back to registering the scenario database as the writer; `MarkHostWrite` handles that
+case. `GetInfo` also clears the flag, so `ToSQL` stays a plain `CREATE TABLE`. Commit, WAL,
+checkpoint and write-write conflict detection are the host `DuckTransaction`'s, unchanged.
 
 ---
 

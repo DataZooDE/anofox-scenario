@@ -968,7 +968,7 @@ void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry
 
 PhysicalOperator &ScenarioCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalUpdate &op, PhysicalOperator &plan) {
-	ThrowIfFrozen(context, "UPDATE");
+	ThrowIfNotWritable(context, "UPDATE");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
 	ThrowIfKeylessUnsupported(context, entry);
 	auto &update = planner.Make<PhysicalScenarioUpdate>(
@@ -980,7 +980,7 @@ PhysicalOperator &ScenarioCatalog::PlanUpdate(ClientContext &context, PhysicalPl
 
 PhysicalOperator &ScenarioCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                               LogicalDelete &op, PhysicalOperator &plan) {
-	ThrowIfFrozen(context, "DELETE");
+	ThrowIfNotWritable(context, "DELETE");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
 	if (op.return_chunk && !entry.base_entry.IsDuckTable() && !entry.key_columns.empty()) {
 		// keyless tables carry the whole row in their identity columns, so

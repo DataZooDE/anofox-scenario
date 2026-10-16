@@ -398,7 +398,29 @@ PhysicalOperator &MakeScenarioInsertOperator(PhysicalPlanGenerator &planner, vec
 // ScenarioCatalog::PlanInsert
 //===----------------------------------------------------------------------===//
 
-void ScenarioCatalog::ThrowIfFrozen(ClientContext &context, const char *operation) {
+void ScenarioCatalog::ThrowIfNotWritable(ClientContext &context, const char *operation) {
+	// Scenario table entries are flagged temporary so the binder does not
+	// register this catalog as the statement's write target (see
+	// ScenarioTableEntry). That also skips DuckDB's pre-execution checks in
+	// ClientContext::CheckIfPreparedStatementIsExecutable /
+	// MetaTransaction::ModifyDatabase; they are restored here with DuckDB's
+	// own wording. Prepared statements re-bind (and re-plan) per transaction,
+	// so these run on every execution.
+	if (MetaTransaction::Get(context).IsReadOnly()) {
+		throw TransactionException("Cannot write to database \"%s\" - transaction is launched in read-only mode",
+		                           GetAttached().GetName());
+	}
+	if (GetAttached().IsReadOnly()) {
+		throw InvalidInputException(
+		    "Cannot execute statement of type \"%s\" on database \"%s\" which is attached in read-only mode!",
+		    operation, GetAttached().GetName());
+	}
+	auto &host_db = GetHostCatalog(context).GetAttached();
+	if (host_db.IsReadOnly()) {
+		throw InvalidInputException(
+		    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode", scenario_name,
+		    host_db.GetName());
+	}
 	auto entry = ScenarioRegistry::LookupById(context, GetHostCatalog(context), scenario_id);
 	if (entry && entry->frozen) {
 		throw InvalidInputException(
@@ -412,7 +434,7 @@ PhysicalOperator &ScenarioCatalog::PlanInsert(ClientContext &context, PhysicalPl
 	if (!plan) {
 		throw NotImplementedException("INSERT without a source is not supported for scenario tables");
 	}
-	ThrowIfFrozen(context, "INSERT");
+	ThrowIfNotWritable(context, "INSERT");
 	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
 		throw NotImplementedException(
 		    "ON CONFLICT clauses on scenario tables are not supported yet (planned for v0.4)");

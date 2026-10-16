@@ -79,8 +79,11 @@ private:
 //! delta for this table (merge-on-read, WP2).
 class ScenarioTableEntry : public TableCatalogEntry {
 public:
+	//! for_binding: the entry handed to the binder (LookupEntry) carries
+	//! DuckDB's temporary flag; the one handed to catalog enumeration (Scan:
+	//! duckdb_tables, information_schema, SHOW TABLES) does not
 	ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-	                   TableCatalogEntry &base_entry);
+	                   TableCatalogEntry &base_entry, bool for_binding = true);
 
 	//! The base table in the host catalog this entry mirrors
 	TableCatalogEntry &base_entry;
@@ -151,11 +154,12 @@ private:
 	//! True if the base entry should be exposed inside the scenario
 	bool ShouldExpose(CatalogEntry &base_entry);
 	//! Wrap a base table in a ScenarioTableEntry cached on the scenario transaction
-	CatalogEntry &GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table);
+	CatalogEntry &GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table,
+	                                    bool for_binding = true);
 	//! Same, exposing the entry under a different (logical) name than the
 	//! physical base table's (materialized copies)
 	CatalogEntry &GetOrCreateTableEntryAs(ClientContext &context, TableCatalogEntry &base_table,
-	                                      const string &logical_name);
+	                                      const string &logical_name, bool for_binding = true);
 	//! Mirror a base view so its SQL rebinds against the scenario's tables
 	CatalogEntry &GetOrCreateViewEntry(ClientContext &context, ViewCatalogEntry &base_view);
 	//! The delta/mat naming key (ScenarioDelta::LogicalName): plain for main,
@@ -229,12 +233,15 @@ public:
 	Catalog &GetBaseCatalog(ClientContext &context);
 	//! The scenario transaction for this catalog in the current context
 	ScenarioTransaction &GetScenarioTransaction(ClientContext &context);
-	//! Throws when the scenario is frozen (single chokepoint for all writes)
-	void ThrowIfFrozen(ClientContext &context, const char *operation);
+	//! Plan-time chokepoint for every write (INSERT/UPDATE/DELETE/MERGE): throws
+	//! when the transaction is read-only, the scenario or its host is attached
+	//! read-only, or the scenario is frozen. Runs before execution, so a
+	//! statement that would write zero rows fails too.
+	void ThrowIfNotWritable(ClientContext &context, const char *operation);
 	//! Register a physical write to the host database from a scenario DML
-	//! statement. The scenario catalog is the meta-transaction's registered
-	//! write target (bind-time), so the host transaction is marked read-write
-	//! directly instead of claiming a second modified database.
+	//! sink, before its first physical write. Attributes the write to the HOST
+	//! database (the scenario catalog is never the registered write target),
+	//! so host DML and scenario DML can share one transaction.
 	void MarkHostWrite(ClientContext &context, DatabaseModificationType type);
 
 private:

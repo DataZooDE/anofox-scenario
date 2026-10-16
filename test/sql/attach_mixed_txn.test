@@ -269,7 +269,7 @@ SELECT count(*) FROM s.orders WHERE order_id = 60;
 statement ok
 DETACH other;
 
-# --- read-only transactions still refuse scenario writes ------------------------
+# --- read-only transactions still refuse scenario writes, up front -------------
 
 statement ok
 BEGIN TRANSACTION READ ONLY;
@@ -282,8 +282,41 @@ INSERT INTO s.orders VALUES (61, 'ro', 1.00, 'open');
 statement ok
 ROLLBACK;
 
-# --- a scenario attached READ_ONLY refuses writes (the check moved from the
-# binder to the sinks together with the write attribution)
+# zero-row writes too: the check runs at plan time, not at the first written row
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+UPDATE s.orders SET amount = 0 WHERE order_id = -1;
+----
+<REGEX>:.*read-only mode.*
+
+statement ok
+ROLLBACK;
+
+# prepared statements re-plan per transaction, so the check follows the
+# transaction the statement executes in
+statement ok
+PREPARE zero_update AS UPDATE s.orders SET amount = 0 WHERE order_id = -1;
+
+statement ok
+EXECUTE zero_update;
+
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+EXECUTE zero_update;
+----
+<REGEX>:.*read-only mode.*
+
+statement ok
+ROLLBACK;
+
+statement ok
+DEALLOCATE zero_update;
+
+# --- a scenario attached READ_ONLY refuses writes up front ----------------------
 
 statement ok
 ATTACH 'whatif' AS ro (TYPE scenario, READ_ONLY);
@@ -298,18 +331,138 @@ UPDATE ro.orders SET amount = 0 WHERE order_id = 1;
 ----
 <REGEX>:.*attached in read-only mode.*
 
+# zero-row statements fail as well
+statement error
+UPDATE ro.orders SET amount = 0 WHERE order_id = -1;
+----
+<REGEX>:.*attached in read-only mode.*
+
+statement error
+DELETE FROM ro.orders WHERE order_id = -1;
+----
+<REGEX>:.*attached in read-only mode.*
+
+statement error
+INSERT INTO ro.orders SELECT * FROM orders WHERE order_id = -1;
+----
+<REGEX>:.*attached in read-only mode.*
+
+statement error
+MERGE INTO ro.orders USING (SELECT -1 AS order_id) src ON ro.orders.order_id = src.order_id
+WHEN MATCHED THEN DELETE;
+----
+<REGEX>:.*attached in read-only mode.*
+
+# reads keep working
+query I
+SELECT count(*) FROM ro.orders;
+----
+4
+
 statement ok
 DETACH ro;
 
-# introspection: scenario tables carry DuckDB's temporary flag (it is what keeps
-# the binder from naming the scenario database as the write target); their DDL
-# stays the persistent CREATE TABLE
+# --- introspection: scenario tables are plain base tables -----------------------
+# (the binder sees a temporary-flagged entry so it does not name the scenario
+# database as the write target; enumeration hands out a non-temporary one)
+
 query TTT
 SELECT database_name, temporary, sql FROM duckdb_tables() WHERE table_name = 'orders' ORDER BY database_name;
 ----
 memory	false	CREATE TABLE orders(order_id INTEGER PRIMARY KEY, customer VARCHAR NOT NULL, amount DECIMAL(10,2), status VARCHAR);
-p	true	CREATE TABLE orders(order_id INTEGER PRIMARY KEY, customer VARCHAR NOT NULL, amount DECIMAL(10,2), status VARCHAR);
-s	true	CREATE TABLE orders(order_id INTEGER PRIMARY KEY, customer VARCHAR NOT NULL, amount DECIMAL(10,2), status VARCHAR);
+p	false	CREATE TABLE orders(order_id INTEGER PRIMARY KEY, customer VARCHAR NOT NULL, amount DECIMAL(10,2), status VARCHAR);
+s	false	CREATE TABLE orders(order_id INTEGER PRIMARY KEY, customer VARCHAR NOT NULL, amount DECIMAL(10,2), status VARCHAR);
+
+query TTTT
+SELECT table_catalog, table_name, table_type, commit_action FROM information_schema.tables
+WHERE table_catalog IN ('s', 'p') ORDER BY table_catalog, table_name;
+----
+p	order_audit	BASE TABLE	NULL
+p	orders	BASE TABLE	NULL
+s	order_audit	BASE TABLE	NULL
+s	orders	BASE TABLE	NULL
+
+query TTT
+SELECT database, name, temporary FROM (SHOW ALL TABLES) WHERE database = 's' ORDER BY name;
+----
+s	order_audit	false
+s	orders	false
+
+query T
+SELECT name FROM (SHOW TABLES FROM s) ORDER BY name;
+----
+order_audit
+orders
+
+query II
+SELECT count(*), count(*) FILTER (WHERE column_name = 'amount') FROM duckdb_columns() WHERE database_name = 's' AND table_name = 'orders';
+----
+4	1
+
+# introspection and mixed writes in one transaction: the enumerated entries and
+# the bound entries coexist in the per-transaction cache
+statement ok
+BEGIN;
+
+query T
+SELECT table_type FROM information_schema.tables WHERE table_catalog = 's' AND table_name = 'orders';
+----
+BASE TABLE
+
+statement ok
+INSERT INTO orders VALUES (8, 'tyrell', 8.00, 'open');
+
+statement ok
+INSERT INTO s.orders VALUES (80, 'scenario-tyrell', 8.00, 'open');
+
+query T
+SELECT table_type FROM information_schema.tables WHERE table_catalog = 's' AND table_name = 'orders';
+----
+BASE TABLE
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM s.orders WHERE order_id IN (8, 80);
+----
+2
+
+# materialized scenarios enumerate their frozen copies as base tables too
+statement ok
+CALL scenario_create('snap', mode := 'materialized');
+
+statement ok
+ATTACH 'snap' AS m (TYPE scenario);
+
+query TT
+SELECT table_name, table_type FROM information_schema.tables WHERE table_catalog = 'm' ORDER BY table_name;
+----
+order_audit	BASE TABLE
+orders	BASE TABLE
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE m.orders SET amount = 1 WHERE order_id = 8;
+
+statement ok
+INSERT INTO order_audit VALUES (4, 8, 'note', 'host + materialized scenario');
+
+statement ok
+COMMIT;
+
+query R
+SELECT amount FROM m.orders WHERE order_id = 8;
+----
+1.00
+
+statement ok
+DETACH m;
+
+statement ok
+CALL scenario_drop('snap');
 
 # --- generated variant: 100k host rows + 100k scenario rows in one transaction --
 

@@ -97,7 +97,7 @@ unique_ptr<MergeIntoOperator> PlanScenarioMergeAction(ClientContext &context, Lo
 
 PhysicalOperator &ScenarioCatalog::PlanMergeInto(ClientContext &context, PhysicalPlanGenerator &planner,
                                                  LogicalMergeInto &op, PhysicalOperator &plan) {
-	ThrowIfFrozen(context, "MERGE INTO");
+	ThrowIfNotWritable(context, "MERGE INTO");
 	auto &entry = op.table.Cast<ScenarioTableEntry>();
 	ThrowIfKeylessUnsupported(context, entry);
 	if (op.return_chunk && !entry.base_entry.IsDuckTable()) {
