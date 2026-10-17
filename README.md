@@ -209,7 +209,7 @@ Delta tables live in the host database under the internal `__anofox_scenario` sc
 carries its scenarios with it — copy the file and the branches come along.
 
 **Benefits:**
-- **Cheap scenario creation** — delta mode stores O(#tables) metadata and copies no rows
+- **Cheap scenario creation** — delta mode writes one registry row, whatever the size of the schema; a table's delta is created by its first write
 - **Storage proportional to changes** — only deltas stored
 - **Full analytical performance** — DuckDB columnar scans on unchanged data
 
@@ -267,7 +267,7 @@ scenario_create()                      Register a scenario
 | `CALL scenario_drop(name)` | Remove the scenario and its delta/materialized tables. Refuses while attached or while branches exist |
 | `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | Reject/allow writes; reads keep working. A frozen materialized scenario is a snapshot |
 | `SELECT * FROM scenario_list()` | `scenario_id, name, mode, frozen, parent, created_at, description` |
-| `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | Create delta tables for base tables added after `scenario_create` |
+| `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | Deprecated: tables added to the base after `scenario_create` are writable without it. Only declares `key_columns` for keyless tables the scenario does not track yet |
 | `SELECT * FROM scenario_migrate()` | One-way migration of a legacy v0.1 database into the v2 layout |
 
 ### Comparison

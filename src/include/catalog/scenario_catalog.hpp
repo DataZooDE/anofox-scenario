@@ -19,6 +19,7 @@
 
 namespace duckdb {
 
+class DuckTableEntry;
 class ScenarioCatalog;
 class ScenarioSchemaEntry;
 class ViewCatalogEntry;
@@ -245,6 +246,15 @@ public:
 	//! database as the transaction's write target (MarkHostWrite). Serialized
 	//! process-wide: sibling sinks of one plan initialize on worker threads.
 	void BeginWrite(ClientContext &context, const char *operation, DatabaseModificationType type);
+	//! The delta a write sink appends to, created on the scenario table's
+	//! first write (#34) - in the caller's transaction (ROLLBACK removes it),
+	//! at execution, after BeginWrite. Sinks call it with their first chunk,
+	//! so a write that touches no rows creates nothing. The delta's identity
+	//! is the entry's (ScenarioDelta::GetKeyColumns). A concurrent first
+	//! write of the same table by another transaction surfaces as a
+	//! retryable TransactionException; a table of a DuckLake base that is not
+	//! in the scenario's pinned snapshot cannot be written.
+	DuckTableEntry &GetOrCreateWriteDelta(ClientContext &context, ScenarioTableEntry &entry);
 
 private:
 	//! The checks of BeginWrite

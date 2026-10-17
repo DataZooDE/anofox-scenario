@@ -40,9 +40,9 @@ SELECT count(*) FROM s.forecast;
 ----
 3
 
-# --- a keyless table created in the base after the scenario (#39) ---------------
-# It has no delta at all: every write names the real cause, not a delta upgrade
-# that re-attaching cannot perform.
+# --- a keyless table created in the base after the scenario (#39, #34) ----------
+# It has no delta yet. Since #34 that is no error: the first write creates a
+# bag delta, for every kind of DML (this section used to pin the #39 error).
 
 statement ok
 CREATE TABLE late_events (sku VARCHAR, qty INTEGER);
@@ -56,37 +56,40 @@ SELECT * FROM s.late_events ORDER BY sku;
 A1	1
 B2	2
 
-statement error
+statement ok
 INSERT INTO s.late_events VALUES ('C3', 3);
-----
-<REGEX>:.*created in the base after scenario 'u'.*
 
-statement error
+statement ok
 UPDATE s.late_events SET qty = 9 WHERE sku = 'A1';
-----
-<REGEX>:.*created in the base after scenario 'u'.*
 
-statement error
-DELETE FROM s.late_events WHERE sku = 'A1';
-----
-<REGEX>:.*created in the base after scenario 'u'.*
+statement ok
+DELETE FROM s.late_events WHERE sku = 'B2';
 
-statement error
-MERGE INTO s.late_events t USING (SELECT 'A1' AS sku) v ON t.sku = v.sku WHEN MATCHED THEN DELETE;
-----
-<REGEX>:.*created in the base after scenario 'u'.*
+statement ok
+MERGE INTO s.late_events t USING (SELECT 'C3' AS sku) v ON t.sku = v.sku WHEN MATCHED THEN DELETE;
 
-# re-attaching does not change that (it is not an upgrade problem)
+query TI
+SELECT * FROM s.late_events ORDER BY sku;
+----
+A1	9
+
+# the base is untouched, and the writes survive a re-attach
 statement ok
 DETACH s;
 
 statement ok
 ATTACH 'u' AS s (TYPE scenario);
 
-statement error
-UPDATE s.late_events SET qty = 9 WHERE sku = 'A1';
+query TI
+SELECT * FROM s.late_events ORDER BY sku;
 ----
-<REGEX>:.*created in the base after scenario 'u'.*
+A1	9
+
+query TI
+SELECT * FROM late_events ORDER BY sku;
+----
+A1	1
+B2	2
 
 statement ok
 DETACH s;

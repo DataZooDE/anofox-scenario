@@ -286,6 +286,115 @@ CALL scenario_drop('lpc');
 statement ok
 CALL scenario_drop('lp');
 
+# --- lazy deltas over a lake (#34) --------------------------------------------------
+# The delta lives in the host and is created by the table's first write; only
+# tables in the pinned snapshot belong to the scenario's base.
+
+statement ok
+CREATE TABLE lake.targets (region VARCHAR, goal INTEGER);
+
+statement ok
+INSERT INTO lake.targets VALUES ('EU', 10), ('US', 20);
+
+statement ok
+CREATE TABLE lake.headcount (team VARCHAR, fte INTEGER);
+
+statement ok
+INSERT INTO lake.headcount VALUES ('data', 4), ('web', 3);
+
+statement ok
+CALL scenario_create('lazylake', base := 'lake', key_columns := MAP {'targets': ['region'], 'headcount': ['team']});
+
+query I
+SELECT count(*) FROM duckdb_tables() t, __anofox_scenario.registry r WHERE r.name = 'lazylake' AND t.schema_name = '__anofox_scenario' AND t.table_name LIKE 's' || r.scenario_id || '\_delta\_%' ESCAPE '\';
+----
+0
+
+statement ok
+ATTACH 'lazylake' AS ll (TYPE scenario);
+
+# a table in the snapshot: the first write creates its (keyed) delta
+statement ok
+UPDATE ll.targets SET goal = 11 WHERE region = 'EU';
+
+query TI
+SELECT region, goal FROM ll.targets ORDER BY region;
+----
+EU	11
+US	20
+
+query TTTT
+SELECT region, change_type, old_value, new_value FROM scenario_diff('lazylake', 'targets');
+----
+EU	modified	10	11
+
+# a table created in the lake after the snapshot is not part of the base
+statement ok
+CREATE TABLE lake.late_targets (region VARCHAR, goal INTEGER);
+
+statement ok
+INSERT INTO lake.late_targets VALUES ('EU', 5);
+
+statement error
+INSERT INTO ll.late_targets VALUES ('EU', 1);
+----
+<REGEX>:.*Cannot write to table 'late_targets' of scenario 'lazylake': the table is not in the scenario's base snapshot.*create a new scenario over the lake's current state.*a branch keeps its parent's snapshot.*
+
+# it diffs like any table the scenario does not have (2- and 3-argument)
+statement error
+SELECT * FROM scenario_diff('lazylake', 'late_targets');
+----
+Table 'late_targets' not found in scenario 'lazylake'
+
+statement error
+SELECT * FROM scenario_diff('main', 'lazylake', 'late_targets');
+----
+Table 'late_targets' not found in scenario 'lazylake'
+
+# keys cannot be declared for it: neither by scenario_refresh nor by a branch,
+# which keeps the parent's snapshot
+statement error
+SELECT * FROM scenario_refresh('lazylake', key_columns := MAP {'late_targets': ['region']});
+----
+<REGEX>:.*key_columns declared for table 'late_targets', but it is not in the base snapshot of scenario 'lazylake'.*
+
+statement error
+CALL scenario_create('lazybranch', from_scenario := 'lazylake', key_columns := MAP {'late_targets': ['region']});
+----
+<REGEX>:.*key_columns declared for table 'late_targets', but it is not in the base snapshot of scenario 'lazylake'.*
+
+query I
+SELECT count(*) FROM __anofox_scenario.registry WHERE name = 'lazybranch';
+----
+0
+
+# a table whose columns changed in the lake after the snapshot cannot get its
+# first write either: the delta would not match the pinned base it overlays
+statement ok
+ALTER TABLE lake.headcount ADD COLUMN cost INTEGER;
+
+statement error
+UPDATE ll.headcount SET fte = 5 WHERE team = 'data';
+----
+<REGEX>:.*Cannot write to table 'headcount' of scenario 'lazylake': its columns in DuckLake 'lake' changed after the scenario's base snapshot.*
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%\_delta\_headcount' ESCAPE '\';
+----
+0
+
+# ...and nothing was created for it
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%\_delta\_late\_targets' ESCAPE '\';
+----
+0
+
+statement ok
+DETACH ll;
+
+statement ok
+CALL scenario_drop('lazylake');
+
 # --- cleanup ------------------------------------------------------------------------
 
 statement ok

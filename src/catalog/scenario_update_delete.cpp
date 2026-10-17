@@ -97,14 +97,6 @@ bool ScenarioChildCanRepeatRows(const PhysicalOperator &child) {
 	return false;
 }
 
-[[noreturn]] void ThrowTableCreatedAfterScenario(ScenarioTableEntry &entry) {
-	auto &scenario_catalog = entry.GetScenarioCatalog();
-	throw InvalidInputException(
-	    "Table '%s' was created in the base after scenario '%s': it is readable but not writable in "
-	    "this scenario (v1 limitation). Create a fresh scenario to modify it",
-	    entry.name, scenario_catalog.scenario_name);
-}
-
 namespace {
 
 //===----------------------------------------------------------------------===//
@@ -139,13 +131,8 @@ public:
 		if (delta_table) {
 			return;
 		}
-		auto &scenario_catalog = entry.GetScenarioCatalog();
-		auto &host_catalog = scenario_catalog.GetHostCatalog(client);
-		auto delta_ptr =
-		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
-		if (!delta_ptr) {
-			ThrowTableCreatedAfterScenario(entry);
-		}
+		// the first chunk: created by the table's first write (#34)
+		auto delta_ptr = &entry.GetScenarioCatalog().GetOrCreateWriteDelta(client, entry);
 		delta_table = delta_ptr;
 		auto binder = Binder::CreateBinder(client);
 		delta_constraints = binder->BindConstraints(*delta_ptr);
@@ -451,6 +438,9 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
                                             OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<ScenarioDMLGlobalState>();
 	auto &client = context.client;
+	if (chunk.size() == 0) {
+		return SinkResultType::NEED_MORE_INPUT; // no row, no delta
+	}
 	gstate.LazyInit(client, entry);
 	chunk.Flatten();
 
@@ -818,6 +808,9 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
                                             OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<ScenarioDMLGlobalState>();
 	auto &client = context.client;
+	if (chunk.size() == 0) {
+		return SinkResultType::NEED_MORE_INPUT; // no row, no delta
+	}
 	gstate.LazyInit(client, entry);
 	chunk.Flatten();
 
@@ -1048,9 +1041,8 @@ void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry
 	auto delta = ScenarioDelta::TryGetDeltaTable(context, scenario_catalog.GetHostCatalog(context),
 	                                             scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
 	if (!delta) {
-		// no delta at all: the table was created in the base after the
-		// scenario - re-attaching cannot help
-		ThrowTableCreatedAfterScenario(entry);
+		// not written yet: the first write creates a bag delta (#34)
+		return;
 	}
 	if (!ScenarioDelta::CountColumnIndex(*delta).IsValid()) {
 		auto &host_db = scenario_catalog.GetHostCatalog(context).GetAttached();

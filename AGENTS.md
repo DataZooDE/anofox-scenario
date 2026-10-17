@@ -290,6 +290,8 @@ test/sql/
   attach_dotted_names.test        # table/schema names containing . (quote-aware logical names, #27)
   attach_insert_constraint_order.test # base PK probe vs constraint declaration order (#22)
   scenario_materialized_fk.test   # materialized copies over FK schemas; merge-back enforces FKs (#24)
+  attach_lazy_delta.test          # deltas created by the first write; scenario_tables identity; races (#34)
+  attach_lazy_delta_identity.test # row identity of lazy deltas: refresh/first-write races, base schema changes, key validation, diff names (#34)
   scenario_keyless_upgrade.test   # pre-v0.4.1 keyless deltas (no _count) upgraded in place (#31)
   scenario_ducklake_keyless_merge.test # keyless bag merge-back into DuckLake bases: exact copies, drift (#31)
   attach_delta_key_probe.test     # single-row DML over a 100k-row delta resolves keys via the delta PK index, vs an oracle (#36)
@@ -460,7 +462,13 @@ __anofox_scenario.registry(
     merged_at TIMESTAMP,                 -- Phase 6: merge-back
     description VARCHAR)
 
--- One delta table per (scenario, base table); the changelog contract.
+-- Declared keys (key_columns :=), created lazily like the registry (#34)
+__anofox_scenario.scenario_tables(scenario_id BIGINT, table_name VARCHAR, key_columns VARCHAR[],
+                                  PRIMARY KEY (scenario_id, table_name))
+
+-- One delta table per (scenario, base table), created by the table's FIRST WRITE
+-- (not by scenario_create, #34); the changelog contract. Identity: scenario_tables
+-- row, else the existing delta's PK, else the base PK, else keyless.
 -- <table> is the logical name: plain for main, '<schema>.<table>' otherwise; a part
 -- containing '.' is double-quoted ('"a.b"' = main table a.b).
 __anofox_scenario.s<id>_delta_<table>(_op VARCHAR, _ts TIMESTAMP, <base columns>,
@@ -492,7 +500,7 @@ __anofox_scenario.s<id>_mat_<table>     -- schema (minus FOREIGN KEYs) + data co
 | Function not found | Verify `ExtensionLoader::RegisterFunction` called |
 | Test fails unexpectedly | Check type indicators match actual return types |
 | Linker errors | Verify dependencies in CMakeLists.txt |
-| Keyless table rejected | Table has no PK; declare `key_columns :=` at `scenario_create` |
+| Keyless table needs a key | Table has no PK; declare `key_columns :=` at `scenario_create` (or `scenario_refresh` before its first write) |
 
 ---
 

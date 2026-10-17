@@ -39,6 +39,37 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 
 - **Copy-on-write:** modifications are stored per scenario in delta tables under the internal
   `__anofox_scenario` schema of the host database; base tables are never written.
+- **Lazy deltas (#34):** `scenario_create` in the default delta mode writes one registry row (plus
+  one row per declared `key_columns` table) and creates no tables, so its cost does not grow with
+  the schema. A table's delta is created by its first write (`INSERT`, `UPDATE`, `DELETE`,
+  `MERGE INTO`, `INSERT ... ON CONFLICT`, `COPY FROM DATABASE`), at execution, in the caller's
+  transaction: `ROLLBACK` removes it again, and the rest of the transaction sees it. A write that
+  touches no rows creates nothing. Everything that reads a scenario treats a table without a
+  delta as unchanged.
+- **Tables added to the base later** are readable *and writable* in an overlay scenario without
+  any extra step (`scenario_refresh` is no longer needed). To give a keyless table added later a
+  row identity, declare it with `scenario_refresh(name, key_columns := ...)` before its first
+  write. Materialized scenarios don't see tables added after their creation. For DuckLake bases
+  only tables in the pinned snapshot belong to the scenario (a branch keeps its parent's
+  snapshot): writing a table the lake created later fails with `the table is not in the
+  scenario's base snapshot`, and so does a first write to a table whose lake columns changed
+  after the snapshot. `scenario_diff` reports such a table as not found, and `key_columns` for it
+  are refused. To work with it, create a new scenario over the lake's current state.
+- **Row identity of a table** is fixed by its first write: the declared `key_columns` (also when
+  the base gains a PRIMARY KEY afterwards), else the base PRIMARY KEY, else keyless. Once the
+  delta exists, its shape decides, even if a `scenario_refresh` declaration raced the first
+  write and committed alongside it. If a declared key column is renamed or dropped in the base
+  before the table's first write, reads and introspection keep working, while writes and
+  `scenario_diff` fail with `declared key column '...' no longer exists in the base table`;
+  re-declare the key with `scenario_refresh(name, key_columns := ...)`.
+- **Declaring keys concurrently:** the first `key_columns` declaration on a database creates
+  `__anofox_scenario.scenario_tables`. If two transactions do that at the same time, the second
+  gets a retryable `TransactionException` naming its scenario.
+- **First writes under concurrency:** when two transactions make the first write to the same
+  scenario table at the same time, both try to create its delta. The one that comes second gets a
+  `TransactionException` (`another transaction concurrently made the first write to table ...
+  ROLLBACK and retry the transaction`); after the first one commits, a retry succeeds. Later
+  writes to the table only conflict on the same rows, as before.
 - **Isolation tiers** (all shipped):
   | Tier | How | Isolation from base changes |
   | --- | --- | --- |
@@ -100,7 +131,8 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   filtered on, but they are not part of the table and not stable identifiers: `__scenario_rowno`
   is numbered afresh by every scan (scenario rows first), so a value read by one statement may
   name a different row in the next. Don't store or page by it.
-- **DDL:** not permitted inside scenarios (one canonical error).
+- **DDL:** not permitted inside scenarios (one canonical error). Change the base schema instead;
+  new base tables show up in overlay scenarios automatically.
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time.
 
@@ -116,16 +148,16 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 
 | Function | Kind | Description |
 | --- | --- | --- |
-| `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog], [key_columns := MAP {'table': ['col', ...]}])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes; `base` uses another attached catalog's tables as the base (DuckLake bases are pinned to creation time - true snapshot isolation); `key_columns` declares row identity for tables without a PRIMARY KEY, unlocking UPDATE/DELETE/MERGE on them. O(#tables) metadata for delta mode. |
-| `CALL scenario_drop(name)` | verb | Remove the scenario and its delta/materialized tables. Refuses while attached or while branches exist. |
+| `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog], [key_columns := MAP {'table': ['col', ...]}])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes; `base` uses another attached catalog's tables as the base (DuckLake bases are pinned to creation time - true snapshot isolation); `key_columns` declares row identity for tables without a PRIMARY KEY (validated up front - unknown or repeated columns are refused, errors name the table as `schema.table` - and recorded in `__anofox_scenario.scenario_tables`). Delta mode is O(1): no delta tables are created until a table's first write. A branch copies only the parent deltas that exist, plus the parent's declared keys, and may not change an inherited identity. |
+| `CALL scenario_drop(name)` | verb | Remove the scenario, its delta/materialized tables and its declared keys. Refuses while attached or while branches exist. |
 | `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | verb | Reject/allow writes through any attached handle (reads keep working). A frozen materialized scenario is a snapshot. |
 | `SELECT * FROM scenario_list()` | table | `scenario_id, name, mode, frozen, parent, created_at, description`. |
-| `SELECT * FROM scenario_diff(scenario, table)` | table | Compare to origin: `<pk cols>` (native types), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value`. Streams through the engine. Keyless tables (no PK, no `key_columns`) get a bag diff: every column is the identity, a changed row is `removed` + `added`, and duplicates appear once per copy. |
+| `SELECT * FROM scenario_diff(scenario, table)` | table | Compare to origin (`table` is matched like a scenario table: `main.t` and `t` are the same): `<pk cols>` (native types), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value`. Streams through the engine. Keyless tables (no PK, no `key_columns`) get a bag diff: every column is the identity, a changed row is `removed` + `added`, and duplicates appear once per copy. |
 | `SELECT * FROM scenario_diff(a, b, table)` | table | Generic diff between two merged relations (`'main'` or any scenario). `old` = side a, `new` = side b. `'main'` is the origin table of the scenario on the other side, in its base catalog: pinned to the scenario's creation snapshot for DuckLake bases, live otherwise. DuckLake-based scenarios are always diffed at their snapshot, so later lake changes never show as scenario changes. |
-| `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog. For keyless tables these are the net counts per distinct row (`rows_modified` is 0). |
+| `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog, one row per table the scenario has written (a table never written has no delta and no row). For keyless tables these are the net counts per distinct row (`rows_modified` is 0). |
 | `SELECT * FROM scenario_merge_preview(scenario)` | table | Planned merge-back actions: `table_name, key, action, conflict`. Streaming; no side effects. Overlay conflicts: an `insert` whose key now exists in base, an `update` whose key vanished. Scenarios with a creation snapshot (materialized, DuckLake) additionally flag 3-way *drift* conflicts: the base row changed since the snapshot on a touched key. Keyless tables list the per-value net plan the merge applies: one row per copy deleted or inserted, `key` = the whole row as text, e.g. `(A, 1)`. For keyless tables of snapshot scenarios (materialized, DuckLake) a `delete` conflicts when the base's number of copies of that row differs from the snapshot's. |
 | `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). Keyless tables merge as bags: per distinct row (NULL-safe whole-row match) the net delete count `n` removes exactly `n` copies and a net insert count adds that many; on a drifted row of a snapshot scenario (materialized or DuckLake) `theirs` keeps the base's copies and `ours` sets the base to the scenario's count. On a DuckLake base the lake commit is tagged (`commit_extra_info`), so a merge whose host bookkeeping failed can simply be re-run. On success the scenario ends `frozen` with `merged_at` set and an empty delta. Refuses while branches exist. |
-| `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | verb | Create delta tables for base tables added after `scenario_create`, making them writable. `key_columns` declares identity for new keyless tables (rejected once a table is already tracked). Returns `refreshed_tables`. Idempotent; refuses materialized scenarios. |
+| `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | verb | **Deprecated (#34).** Tables added to the base after `scenario_create` are writable without it, and it no longer creates delta tables. What remains: `key_columns` declares the row identity of keyless tables the scenario does not track yet (no declared key, never written); rejected once a table is tracked, except to replace a declared key whose column was renamed or dropped in the base before the table's first write. For DuckLake bases the table must be in the scenario's snapshot. Returns `refreshed_tables`, the number of keys declared (`0` without `key_columns`). Refuses frozen and materialized scenarios. |
 | `SELECT * FROM scenario_migrate()` | verb | One-way migration of a legacy v0.1 database (`_scenario_registry`, `_scen_*`, `_snap_*`) into the v2 layout. Archived -> frozen; snapshots -> materialized+frozen; multi-op delta rows folded to net effects; `_scenario_base_rowids` dropped; `_scenario_protocols` preserved. |
 | `ATTACH 'name' AS alias (TYPE scenario)` / `DETACH alias` | SQL | The entire read/write UX. |
 
@@ -137,7 +169,11 @@ All state lives in the host database (single-file portability):
 __anofox_scenario.registry              -- scenario_id, name, mode, frozen, parent_id,
                                         --   base_snapshot_id (v0.3), created_at, merged_at (v0.5), description
 __anofox_scenario.registry_seq          -- id sequence
-__anofox_scenario.s<id>_delta_<table>   -- (_op 'I'|'U'|'D', _ts, <base columns>) PK = base PK
+__anofox_scenario.scenario_tables       -- (scenario_id, table_name, key_columns VARCHAR[]):
+                                        --   declared keys (key_columns :=), created by the
+                                        --   first declaration
+__anofox_scenario.s<id>_delta_<table>   -- created by the table's first write;
+                                        --   (_op 'I'|'U'|'D', _ts, <base columns>) PK = base PK
                                         --   or the declared key_columns; keyless tables append
                                         --   _count BIGINT NOT NULL (bag changelog, no PK)
                                         --   instead - named __count (more underscores as

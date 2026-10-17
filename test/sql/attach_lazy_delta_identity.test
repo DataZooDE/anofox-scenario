@@ -1,0 +1,438 @@
+# name: test/sql/attach_lazy_delta_identity.test
+# description: #34 review: row identity of lazily created deltas - races, base schema changes, key validation, diff names
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+load __TEST_DIR__/attach_lazy_delta_identity.db
+
+# --- the key registry is created lazily: concurrent first declarations ----------
+# The registry exists, scenario_tables does not yet. Two planners declare the
+# first keys on this host at the same time: the loser gets a retryable error.
+
+statement ok
+CREATE TABLE cost_centers (cc VARCHAR, owner VARCHAR);
+
+statement ok
+INSERT INTO cost_centers VALUES ('CC1', 'ana'), ('CC2', 'ben');
+
+statement ok
+CALL scenario_create('warmup');
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+CALL scenario_create('budget_a', key_columns := MAP {'cost_centers': ['cc']});
+
+statement error con2
+CALL scenario_create('budget_b', key_columns := MAP {'cost_centers': ['cc']});
+----
+<REGEX>:.*TransactionContext Error.*scenario 'budget_b'.*concurrently.*retry.*
+
+statement ok con1
+COMMIT;
+
+# the retry succeeds
+statement ok con2
+CALL scenario_create('budget_b', key_columns := MAP {'cost_centers': ['cc']});
+
+query TT
+SELECT r.name, t.key_columns::VARCHAR FROM __anofox_scenario.scenario_tables t JOIN __anofox_scenario.registry r USING (scenario_id) ORDER BY r.name;
+----
+budget_a	[cc]
+budget_b	[cc]
+
+# --- key declarations are validated up front -------------------------------------
+
+statement ok
+CREATE TABLE items (sku VARCHAR, qty INTEGER);
+
+statement error
+CALL scenario_create('dup_key', key_columns := MAP {'items': ['sku', 'SKU']});
+----
+key_columns for table 'items': column 'SKU' is listed twice
+
+statement ok
+CREATE SCHEMA finance;
+
+statement ok
+CREATE TABLE finance.invoices (invoice_no VARCHAR, amount INTEGER);
+
+statement ok
+CREATE TABLE invoices (invoice_no VARCHAR, amount INTEGER);
+
+# the message names the table the way it was declared (schema-qualified)
+statement error
+CALL scenario_create('bad_col', key_columns := MAP {'finance.invoices': ['nope']});
+----
+key_columns for table 'finance.invoices': column 'nope' does not exist
+
+statement ok
+CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER);
+
+statement error
+CALL scenario_create('bad_pk', key_columns := MAP {'ledger': ['amount']});
+----
+key_columns declared for table 'ledger', but it already has a PRIMARY KEY
+
+# nothing was registered by the failed creates
+query I
+SELECT count(*) FROM __anofox_scenario.registry WHERE name IN ('dup_key', 'bad_col', 'bad_pk');
+----
+0
+
+# scenario_refresh validates the same way
+statement ok
+CALL scenario_create('later');
+
+statement error
+SELECT * FROM scenario_refresh('later', key_columns := MAP {'items': ['qty', 'qty']});
+----
+key_columns for table 'items': column 'qty' is listed twice
+
+# --- a key declaration racing a first write: the delta's shape decides ----------
+# con1 binds the keyless table (no declared key yet), con2 declares a key with
+# the deprecated scenario_refresh and commits, then con1's first write creates
+# a bag delta and commits too. The delta's shape is authoritative: the table
+# stays keyless, so readers and writers agree.
+
+statement ok
+CREATE TABLE sensor_feed (k INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO sensor_feed VALUES (1, 'a');
+
+statement ok
+CALL scenario_create('feed_plan');
+
+statement ok
+ATTACH 'feed_plan' AS fp (TYPE scenario);
+
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT count(*) FROM fp.sensor_feed;
+----
+1
+
+query I con2
+SELECT * FROM scenario_refresh('feed_plan', key_columns := MAP {'sensor_feed': ['k']});
+----
+1
+
+statement ok con1
+INSERT INTO fp.sensor_feed VALUES (3, 'x'), (3, 'y');
+
+statement ok con1
+COMMIT;
+
+# the delta is a bag delta (no PRIMARY KEY, a _count column)...
+query I
+SELECT count(*) FROM duckdb_constraints() c JOIN __anofox_scenario.registry r ON c.table_name = 's' || r.scenario_id || '_delta_sensor_feed' WHERE r.name = 'feed_plan' AND c.constraint_type = 'PRIMARY KEY';
+----
+0
+
+# ...and every reader and writer treats the table as keyless (bag semantics)
+statement ok
+INSERT INTO fp.sensor_feed VALUES (3, 'w');
+
+statement ok
+UPDATE fp.sensor_feed SET v = 'z' WHERE k = 3;
+
+query IT
+SELECT k, v FROM fp.sensor_feed ORDER BY k, v;
+----
+1	a
+3	z
+3	z
+3	z
+
+query ITI rowsort
+SELECT k, v, change_type = 'added' FROM scenario_diff('feed_plan', 'sensor_feed');
+----
+3	z	true
+3	z	true
+3	z	true
+
+query III
+SELECT rows_added, rows_removed, rows_modified FROM scenario_diff_summary('feed_plan');
+----
+3	0	0
+
+query I
+SELECT count(*) FROM scenario_merge_preview('feed_plan');
+----
+3
+
+# the table is tracked: its identity cannot be re-declared
+statement error
+SELECT * FROM scenario_refresh('feed_plan', key_columns := MAP {'sensor_feed': ['k']});
+----
+already tracks it
+
+# the reverse order: the declaration is still uncommitted when the first write
+# of another connection commits
+statement ok
+CREATE TABLE sensor_feed2 (k INTEGER, v VARCHAR);
+
+statement ok con1
+BEGIN;
+
+query I con1
+SELECT * FROM scenario_refresh('feed_plan', key_columns := MAP {'sensor_feed2': ['k']});
+----
+1
+
+statement ok con2
+INSERT INTO fp.sensor_feed2 VALUES (5, 'p'), (5, 'q');
+
+statement ok con1
+COMMIT;
+
+statement ok
+INSERT INTO fp.sensor_feed2 VALUES (5, 'r');
+
+query IT
+SELECT k, v FROM fp.sensor_feed2 ORDER BY v;
+----
+5	p
+5	q
+5	r
+
+statement ok
+DETACH fp;
+
+# --- a key declared in the same transaction is seen by the next write ----------
+
+statement ok
+CREATE TABLE shifts (crew VARCHAR, slot INTEGER);
+
+statement ok
+ATTACH 'later' AS lt (TYPE scenario);
+
+statement ok
+BEGIN;
+
+query I
+SELECT count(*) FROM lt.items;
+----
+0
+
+query I
+SELECT * FROM scenario_refresh('later', key_columns := MAP {'shifts': ['crew']});
+----
+1
+
+statement ok
+INSERT INTO lt.shifts VALUES ('red', 1);
+
+statement error
+INSERT INTO lt.shifts VALUES ('red', 2);
+----
+<REGEX>:.*Constraint Error.*
+
+statement ok
+ROLLBACK;
+
+statement ok
+DETACH lt;
+
+# --- a declared key column renamed in the base ------------------------------------
+# Reads and introspection keep working; writes and the diff name the problem,
+# and scenario_refresh re-declares the key (the table was never written).
+
+statement ok
+CREATE TABLE tags (id INTEGER, code VARCHAR, label VARCHAR);
+
+statement ok
+INSERT INTO tags VALUES (1, 'a', 'alpha'), (2, 'b', 'beta');
+
+statement ok
+CALL scenario_create('tag_plan', key_columns := MAP {'tags': ['code']});
+
+statement ok
+ALTER TABLE tags RENAME COLUMN code TO tag_code;
+
+statement ok
+ATTACH 'tag_plan' AS tp (TYPE scenario);
+
+query ITT
+SELECT * FROM tp.tags ORDER BY id;
+----
+1	a	alpha
+2	b	beta
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'tp' AND table_name = 'tags';
+----
+1
+
+statement ok
+SHOW TABLES FROM tp;
+
+statement error
+INSERT INTO tp.tags VALUES (3, 'c', 'gamma');
+----
+<REGEX>:.*declared key column 'code' no longer exists in the base table.*scenario_refresh.*
+
+statement error
+SELECT * FROM scenario_diff('tag_plan', 'tags');
+----
+<REGEX>:.*declared key column 'code' no longer exists in the base table.*
+
+# nothing was created by the failed write
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN __anofox_scenario.registry r ON t.table_name = 's' || r.scenario_id || '_delta_tags' WHERE r.name = 'tag_plan';
+----
+0
+
+query I
+SELECT * FROM scenario_refresh('tag_plan', key_columns := MAP {'tags': ['tag_code']});
+----
+1
+
+statement ok
+INSERT INTO tp.tags VALUES (3, 'c', 'gamma');
+
+statement error
+INSERT INTO tp.tags VALUES (4, 'c', 'again');
+----
+<REGEX>:.*Constraint Error.*
+
+query TT
+SELECT tag_code, change_type FROM scenario_diff('tag_plan', 'tags');
+----
+c	added
+
+# a key that is intact cannot be re-declared, written or not
+statement error
+SELECT * FROM scenario_refresh('tag_plan', key_columns := MAP {'tags': ['label']});
+----
+already tracks it
+
+statement ok
+DETACH tp;
+
+# --- the base gains a PRIMARY KEY after the key was declared ----------------------
+# The declared key stays the identity: the lazily created delta is keyed on it.
+
+statement ok
+CREATE TABLE stock (id INTEGER NOT NULL, bin INTEGER, qty INTEGER);
+
+statement ok
+INSERT INTO stock VALUES (1, 10, 5), (2, 20, 7);
+
+statement ok
+CALL scenario_create('stock_plan', key_columns := MAP {'stock': ['bin']});
+
+statement ok
+ALTER TABLE stock ADD PRIMARY KEY (id);
+
+statement ok
+ATTACH 'stock_plan' AS sp (TYPE scenario);
+
+statement ok
+UPDATE sp.stock SET qty = 6 WHERE bin = 10;
+
+query T
+SELECT c.constraint_column_names::VARCHAR FROM duckdb_constraints() c JOIN __anofox_scenario.registry r ON c.table_name = 's' || r.scenario_id || '_delta_stock' WHERE r.name = 'stock_plan' AND c.constraint_type = 'PRIMARY KEY';
+----
+[bin]
+
+# a key-moving update is a D + I on the declared key
+statement ok
+UPDATE sp.stock SET bin = 11 WHERE bin = 10;
+
+query III
+SELECT id, bin, qty FROM sp.stock ORDER BY id;
+----
+1	11	6
+2	20	7
+
+query IT rowsort
+SELECT bin, change_type FROM scenario_diff('stock_plan', 'stock');
+----
+10	removed
+11	added
+
+statement ok
+DETACH sp;
+
+query III
+SELECT id, bin, qty FROM stock ORDER BY id;
+----
+1	10	5
+2	20	7
+
+# --- scenario_diff canonicalizes the table name ------------------------------------
+
+statement ok
+CREATE TABLE price_list (sku VARCHAR, tier VARCHAR, price INTEGER);
+
+statement ok
+INSERT INTO price_list VALUES ('A', 'retail', 10), ('B', 'retail', 20);
+
+statement ok
+CALL scenario_create('pricing', key_columns := MAP {'price_list': ['sku', 'tier']});
+
+statement ok
+ATTACH 'pricing' AS pr (TYPE scenario);
+
+# never written: the qualified name diffs as an empty keyed changelog
+query TTTT
+SELECT sku, tier, change_type, column_name FROM scenario_diff('pricing', 'main.price_list');
+----
+
+statement ok
+UPDATE pr.price_list SET price = 99 WHERE sku = 'A';
+
+query TTTTII
+SELECT sku, tier, change_type, column_name, old_value::INTEGER, new_value::INTEGER FROM scenario_diff('pricing', 'main.price_list');
+----
+A	retail	modified	price	10	99
+
+query TTTTII
+SELECT sku, tier, change_type, column_name, old_value::INTEGER, new_value::INTEGER FROM scenario_diff('pricing', 'MAIN.Price_List');
+----
+A	retail	modified	price	10	99
+
+query TTTTII
+SELECT sku, tier, change_type, column_name, old_value::INTEGER, new_value::INTEGER FROM scenario_diff('main', 'pricing', 'main.price_list');
+----
+A	retail	modified	price	10	99
+
+statement ok
+DETACH pr;
+
+# --- cleanup --------------------------------------------------------------------
+
+statement ok
+CALL scenario_drop('pricing');
+
+statement ok
+CALL scenario_drop('stock_plan');
+
+statement ok
+CALL scenario_drop('tag_plan');
+
+statement ok
+CALL scenario_drop('feed_plan');
+
+statement ok
+CALL scenario_drop('later');
+
+statement ok
+CALL scenario_drop('budget_a');
+
+statement ok
+CALL scenario_drop('budget_b');
+
+statement ok
+CALL scenario_drop('warmup');
+
+query I
+SELECT count(*) FROM __anofox_scenario.scenario_tables;
+----
+0

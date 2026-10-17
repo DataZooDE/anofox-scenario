@@ -86,15 +86,19 @@ string ExpandedDeltaRows(const DiffTarget &target, const char *op) {
 	       target.delta_name + " WHERE _op = '" + op + "')";
 }
 
-DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name, const string &table_name) {
+DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name, const string &table_name_p) {
 	auto &host_catalog = GetHostCatalogForDiff(context);
 	auto entry = ScenarioRegistry::Lookup(context, host_catalog, scenario_name);
 	if (!entry) {
 		throw InvalidInputException("Scenario '%s' not found", scenario_name);
 	}
-	auto delta = ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, table_name);
-	if (!delta) {
-		throw InvalidInputException("Table '%s' not found in scenario '%s'", table_name, scenario_name);
+	// the canonical logical name ('main.t' is 't'); re-derived from the base
+	// entry below, which also fixes its case
+	string table_name;
+	{
+		string schema_part, table_part;
+		ScenarioDelta::SplitLogicalName(table_name_p, schema_part, table_part);
+		table_name = ScenarioDelta::EncodeLogicalName(schema_part, table_part);
 	}
 
 	// Base side: nearest materialized ancestor or the live host table
@@ -113,8 +117,6 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 
 	DiffTarget target;
 	auto host_prefix = Q(host_catalog.GetName()) + ".";
-	target.delta_name = host_prefix + Q(ScenarioRegistry::SCHEMA_NAME) + "." +
-	                    Q(ScenarioDelta::DeltaTableName(entry->scenario_id, table_name));
 
 	// Origin: the base catalog the scenario reads, pinned when versioned. A
 	// materialized side reads its copy instead, so it needs the catalog only
@@ -150,18 +152,42 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 		// Phase 4: the base may live in another attached catalog
 		base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, schema_name, plain_name,
 		                                                       OnEntryNotFound::RETURN_NULL);
+		if (base_entry && base_catalog->GetCatalogType() == "ducklake") {
+			// the scenario's base is the lake AT its creation time: a table
+			// created later is not part of it, and the diff reads the
+			// snapshot's columns
+			base_entry = ScenarioDelta::GetPinnedBaseEntry(context, *base_catalog, schema_name, plain_name,
+			                                               entry->created_at);
+		}
 		if (!base_entry) {
+			if (!ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, table_name)) {
+				throw InvalidInputException("Table '%s' not found in scenario '%s'", table_name, scenario_name);
+			}
 			throw InvalidInputException("Table '%s' not found in the base schema", table_name);
 		}
+		table_name = ScenarioDelta::LogicalName(*base_entry);
+		target.origin_name = Q(base_catalog->GetName()) + "." + Q(base_entry->ParentSchema().name) + "." +
+		                     Q(base_entry->name);
 		target.base_name = target.origin_name;
 		target.base_at = origin_at;
 	}
+	// a table the scenario never wrote has no delta yet (#34): it diffs as
+	// an empty changelog, provided the scenario has the table at all
+	auto delta = ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, table_name);
+	target.delta_name = host_prefix + Q(ScenarioRegistry::SCHEMA_NAME) + "." +
+	                    Q(ScenarioDelta::DeltaTableName(entry->scenario_id, table_name));
 
 	auto pk_columns =
 	    ScenarioDelta::GetKeyColumns(context, host_catalog, entry->scenario_id, table_name, *base_entry);
+	if (!delta) {
+		// the empty changelog in the delta layout (_op, _ts, base columns),
+		// typed after the base side it overlays
+		target.delta_name = "(SELECT CAST(NULL AS VARCHAR) AS _op, CAST(NULL AS TIMESTAMP) AS _ts, __anofox_e.* FROM " +
+		                    BaseFrom(target, "__anofox_e") + " WHERE false)";
+	}
 	if (pk_columns.empty()) {
 		// keyless: a bag diff over whole rows, netting the delta's I/D counts
-		auto count_name = ScenarioDelta::CountColumnName(*delta);
+		auto count_name = delta ? ScenarioDelta::CountColumnName(*delta) : string();
 		target.count_expr = count_name.empty() ? "1" : Q(count_name);
 		target.keyless = true;
 	}

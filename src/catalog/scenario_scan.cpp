@@ -318,6 +318,12 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			result->key_positions.push_back(find_or_add_scan_column(ColumnIndex(pk_col)));
 		}
 	}
+	if (scan_columns.empty()) {
+		// only synthesized columns projected (__scenario_rowno/origin) and no
+		// delta whose keys would be scanned - a table never written (#34):
+		// storage still needs a column to count rows by
+		find_or_add_scan_column(ColumnIndex(0));
+	}
 	// --- remap pushed filters onto the base scan list ------------------------
 	// input.filters are keyed by *output* position (input.column_indexes).
 	// The base scan list diverges from the output layout whenever virtual

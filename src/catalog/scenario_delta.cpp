@@ -4,6 +4,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/common/types/conflict_manager.hpp"
 #include "duckdb/common/types/constraint_conflict_info.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -17,6 +19,7 @@
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/parsed_data/bound_create_table_info.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -438,8 +441,8 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 }
 
 DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-                                                TableCatalogEntry &base_entry, const vector<string> *declared_keys,
-                                                const string *logical_name_override) {
+                                                TableCatalogEntry &base_entry, const vector<string> *identity_keys,
+                                                const string *logical_name_override, bool host_is_not_writer) {
 	auto logical_name = logical_name_override ? *logical_name_override : LogicalName(base_entry);
 	auto existing = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (existing) {
@@ -461,22 +464,23 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(OP_COL)));
 	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TS_COL)));
 
-	// The base PK becomes the delta PK: one delta row per user-visible key.
-	// Tables without a PK may declare one via key_columns := at create;
-	// otherwise they stay insert-only.
-	auto pk_columns = GetPKColumns(base_entry);
-	if (!pk_columns.empty()) {
-		vector<string> pk_names;
-		for (auto col_id : pk_columns) {
+	// The row identity becomes the delta PK: one delta row per user-visible
+	// key. identity_keys, when given, is the identity exactly (a declared
+	// key, or an inherited delta's shape; empty = keyless); otherwise the
+	// base PK is. Keyless tables get a bag changelog (below).
+	vector<string> pk_names;
+	if (identity_keys) {
+		pk_names = *identity_keys;
+	} else {
+		for (auto col_id : GetPKColumns(base_entry)) {
 			pk_names.push_back(base_entry.GetColumn(LogicalIndex(col_id)).Name());
 		}
-		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
-	} else if (declared_keys && !declared_keys->empty()) {
-		vector<string> pk_names = *declared_keys;
+	}
+	bool keyless = pk_names.empty();
+	if (!keyless) {
 		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
 	}
 
-	bool keyless = pk_columns.empty() && (!declared_keys || declared_keys->empty());
 	if (keyless) {
 		// Bag changelog: whole-row identity cannot be a PK (NULLs), so I/D
 		// rows carry a multiplicity instead and readers aggregate. Secondary
@@ -509,7 +513,24 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 			info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(unique_names), false));
 		}
 	}
-	host_catalog.CreateTable(context, std::move(info));
+	if (!host_is_not_writer) {
+		host_catalog.CreateTable(context, std::move(info));
+	} else {
+		// The statement registered the scenario catalog itself as the
+		// transaction's writer (COPY FROM DATABASE ... TO <scenario>), and a
+		// transaction has exactly one: the host's transaction is flagged
+		// read-write (MarkHostWrite) but cannot become the writer. DuckDB's
+		// schema refuses entries for a database that is not the registered
+		// writer when it sees a client context, so create the entry in the
+		// host transaction without one. Everything else is unchanged: the
+		// entry goes into the host transaction's undo buffer, so ROLLBACK
+		// removes it and COMMIT writes it to the host's WAL.
+		auto binder = Binder::CreateBinder(context);
+		auto bound_info = binder->BindCreateTableInfo(std::move(info));
+		auto catalog_transaction = host_catalog.GetCatalogTransaction(context);
+		catalog_transaction.context = nullptr;
+		host_catalog.CreateTable(catalog_transaction, *bound_info);
+	}
 
 	auto created = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (!created) {
@@ -538,24 +559,58 @@ vector<idx_t> ScenarioDelta::GetPKColumns(const TableCatalogEntry &base_entry) {
 
 vector<idx_t> ScenarioDelta::GetKeyColumns(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
                                            const string &logical_name, TableCatalogEntry &base_entry) {
-	auto pk_columns = GetPKColumns(base_entry);
-	if (!pk_columns.empty()) {
-		return pk_columns;
-	}
-	// no base PK: a declared key lives as the delta table's PRIMARY KEY
+	// Identity resolution (#34). Once a delta exists its shape is the
+	// identity: its PRIMARY KEY (by position), or none for a bag delta. It
+	// was created from the order below, so the two only disagree after a
+	// race (a scenario_refresh declaration committing next to a concurrent
+	// first write) or a base schema change, and readers must follow the rows
+	// that are actually there. Without a delta: (1) a key declared in
+	// scenario_tables, (2) the base PK, (3) none: keyless, a bag delta.
 	auto delta = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
-	if (!delta) {
-		return {};
-	}
-	auto delta_pk = GetPKColumns(*delta);
-	vector<idx_t> result;
-	for (auto delta_col : delta_pk) {
-		if (delta_col < PAYLOAD_START) {
-			throw InternalException("anofox_scenario: delta PK references a metadata column");
+	if (delta) {
+		auto delta_pk = GetPKColumns(*delta);
+		vector<idx_t> result;
+		for (auto delta_col : delta_pk) {
+			if (delta_col < PAYLOAD_START) {
+				throw InternalException("anofox_scenario: delta PK references a metadata column");
+			}
+			result.push_back(delta_col - PAYLOAD_START);
 		}
-		result.push_back(delta_col - PAYLOAD_START);
+		return result;
 	}
-	return result;
+	vector<string> declared;
+	if (ScenarioRegistry::LookupDeclaredKey(context, host_catalog, scenario_id, logical_name, declared)) {
+		vector<idx_t> result;
+		auto &columns = base_entry.GetColumns();
+		for (auto &name : declared) {
+			if (!columns.ColumnExists(name)) {
+				throw InvalidInputException(
+				    "Scenario table '%s': declared key column '%s' no longer exists in the base table. Re-declare "
+				    "the key with scenario_refresh(<scenario>, key_columns := MAP {'%s': [...]})",
+				    logical_name, name, logical_name);
+			}
+			result.push_back(columns.GetColumn(name).Logical().index);
+		}
+		return result;
+	}
+	return GetPKColumns(base_entry);
+}
+
+optional_ptr<TableCatalogEntry> ScenarioDelta::GetPinnedBaseEntry(ClientContext &context, Catalog &base_catalog,
+                                                                 const string &schema_name, const string &table_name,
+                                                                 timestamp_t at) {
+	BoundAtClause at_clause("timestamp", Value::TIMESTAMP(at));
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, &at_clause, QueryErrorContext());
+	optional_ptr<CatalogEntry> pinned;
+	try {
+		pinned = base_catalog.GetEntry(context, schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+	} catch (CatalogException &) {
+		pinned = nullptr; // e.g. the schema is not in the snapshot either
+	}
+	if (!pinned || pinned->type != CatalogType::TABLE_ENTRY) {
+		return nullptr;
+	}
+	return &pinned->Cast<TableCatalogEntry>();
 }
 
 string ScenarioDelta::MakeKey(DataChunk &chunk, idx_t row, const vector<idx_t> &key_positions) {
