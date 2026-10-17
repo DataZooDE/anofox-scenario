@@ -95,14 +95,15 @@ public:
 	static optional_ptr<DuckTableEntry> TryGetMatTable(ClientContext &context, Catalog &host_catalog,
 	                                                   int64_t scenario_id, const string &table_name);
 	//! Create the delta table unless it exists (caller's transaction; the
-	//! caller registers the host write); returns it. declared_keys (tables
-	//! without a PK) become the delta's PRIMARY KEY. Scenario writes create
+	//! caller registers the host write); returns it. identity_keys, when
+	//! given, is the row identity exactly and becomes the delta's PRIMARY KEY
+	//! (empty = keyless: a bag delta); nullptr = the base PK. Scenario writes create
 	//! it through ScenarioCatalog::GetOrCreateWriteDelta (#34).
 	//! host_is_not_writer: the transaction's registered writer is the
 	//! scenario catalog itself (see ScenarioCatalog::MarkHostWrite)
 	static DuckTableEntry &EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
 	                                        TableCatalogEntry &base_entry,
-	                                        const vector<string> *declared_keys = nullptr,
+	                                        const vector<string> *identity_keys = nullptr,
 	                                        const string *logical_name_override = nullptr,
 	                                        bool host_is_not_writer = false);
 	//! Create the materialized copy of a base table (schema incl. PK) and
@@ -119,12 +120,17 @@ public:
 
 	//! Logical column ids of the base table's PRIMARY KEY (empty when none)
 	static vector<idx_t> GetPKColumns(const TableCatalogEntry &base_entry);
-	//! Row identity for a scenario table, resolved in this order (#34): a key
-	//! declared in __anofox_scenario.scenario_tables, the PRIMARY KEY of an
-	//! existing delta (no PK there = keyless), the base PK, else keyless
-	//! (empty result)
+	//! Row identity for a scenario table (#34): an existing delta's shape
+	//! (its PRIMARY KEY; none = keyless) is authoritative; without a delta, a
+	//! key declared in __anofox_scenario.scenario_tables, the base PK, else
+	//! keyless (empty result). Throws when a declared key column is gone.
 	static vector<idx_t> GetKeyColumns(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
 	                                   const string &logical_name, TableCatalogEntry &base_entry);
+	//! The table as of a versioned (DuckLake) base's snapshot at `at`, or
+	//! nullptr when it is not in that snapshot
+	static optional_ptr<TableCatalogEntry> GetPinnedBaseEntry(ClientContext &context, Catalog &base_catalog,
+	                                                          const string &schema_name, const string &table_name,
+	                                                          timestamp_t at);
 
 	//! Serialize the key columns of a row into a canonical comparable string
 	//! (length-prefixed, NULL-tagged). Used for suppression sets and the

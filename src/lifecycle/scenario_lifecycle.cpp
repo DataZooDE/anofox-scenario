@@ -81,15 +81,39 @@ void ParseKeyColumnsParam(const Value &value, map<string, vector<string>> &out) 
 
 //! Shared typo-safety checks for a declared key against its base table
 void ValidateDeclaredKey(const TableCatalogEntry &base_table, const vector<string> &columns) {
+	auto table_name = ScenarioDelta::LogicalName(base_table);
 	if (base_table.HasPrimaryKey()) {
 		throw InvalidInputException("key_columns declared for table '%s', but it already has a PRIMARY KEY",
-		                            base_table.name);
+		                            table_name);
 	}
+	case_insensitive_set_t seen;
 	for (auto &column_name : columns) {
 		if (!base_table.ColumnExists(column_name)) {
-			throw InvalidInputException("key_columns for table '%s': column '%s' does not exist", base_table.name,
+			throw InvalidInputException("key_columns for table '%s': column '%s' does not exist", table_name,
 			                            column_name);
 		}
+		if (!seen.insert(column_name).second) {
+			throw InvalidInputException("key_columns for table '%s': column '%s' is listed twice", table_name,
+			                            column_name);
+		}
+	}
+}
+
+//! A declared key for a table of a scenario pinned to a DuckLake snapshot
+//! must name a table of that snapshot (writes to any other are refused)
+void ValidateDeclaredKeyPinned(ClientContext &context, Catalog &base_catalog, const TableCatalogEntry &base_table,
+                               const string &scenario_name, timestamp_t pinned_at) {
+	if (base_catalog.GetCatalogType() != "ducklake") {
+		return;
+	}
+	if (!ScenarioDelta::GetPinnedBaseEntry(context, base_catalog, base_table.ParentSchema().name, base_table.name,
+	                                       pinned_at)) {
+		throw InvalidInputException(
+		    "key_columns declared for table '%s', but it is not in the base snapshot of scenario '%s' (DuckLake "
+		    "'%s' AT %s) - it was created in the lake later. Create a new scenario over the lake's current state "
+		    "(base := '%s'; a branch keeps its parent's snapshot)",
+		    ScenarioDelta::LogicalName(base_table), scenario_name, base_catalog.GetName(),
+		    Timestamp::ToString(pinned_at), base_catalog.GetName());
 	}
 }
 
@@ -248,6 +272,11 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 			}
 			table_found = true;
 			ValidateDeclaredKey(base_table.get(), declared.second);
+			if (parent && base_catalog) {
+				// a branch of a lake-based parent keeps the parent's pin
+				ValidateDeclaredKeyPinned(context, *base_catalog, base_table.get(), parent->name,
+				                          parent->created_at);
+			}
 		}
 		if (!table_found) {
 			throw InvalidInputException("key_columns declared for unknown table '%s'", declared.first);
@@ -292,7 +321,7 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	entry.base_catalog = effective_base;
 	ScenarioRegistry::Insert(context, host_catalog, entry);
 	for (auto &declared : declared_keys) {
-		ScenarioRegistry::InsertDeclaredKey(context, host_catalog, entry.scenario_id, declared.first,
+		ScenarioRegistry::InsertDeclaredKey(context, host_catalog, entry.scenario_id, entry.name, declared.first,
 		                                    declared.second);
 	}
 	if (bind_data.mode == "materialized" || parent) {
@@ -319,12 +348,10 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		// pre-v0.4.1 keyless parent delta (no _count) is copied with _count =
 		// 1 per row and itself left as is: rewriting it here could break a
 		// concurrent writer of the parent
-		vector<string> inherited_keys;
-		if (ScenarioDelta::GetPKColumns(base_table.get()).empty()) {
-			inherited_keys = DeltaKeyNames(*parent_delta);
-		}
+		// (the parent delta's shape is the identity: its PK, or none for a bag)
+		auto inherited_keys = DeltaKeyNames(*parent_delta);
 		auto &delta = ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry.scenario_id, base_table.get(),
-		                                              inherited_keys.empty() ? nullptr : &inherited_keys);
+		                                              &inherited_keys);
 		ScenarioDelta::CopyTableData(context, *parent_delta, delta);
 	}
 }
@@ -487,7 +514,11 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 		vector<reference<TableCatalogEntry>> base_tables;
 		CollectBaseTables(context, *base_source, base_tables);
 		// validate up front: a declaration must name a base table the scenario
-		// does not track yet (identity cannot change once declared or written)
+		// does not track yet (identity cannot change once declared or written).
+		// The one exception: a declared key whose column has since vanished
+		// from the base (renamed or dropped) and that no delta was built from
+		// may be re-declared - nothing depends on it yet
+		set<string> replaced;
 		for (auto &declared : bind_data.key_columns) {
 			bool table_found = false;
 			for (auto &base_table : base_tables) {
@@ -496,13 +527,25 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 				}
 				table_found = true;
 				ValidateDeclaredKey(base_table.get(), declared.second);
-				vector<string> recorded;
-				if (ScenarioRegistry::LookupDeclaredKey(context, host_catalog, entry->scenario_id, declared.first,
-				                                        recorded) ||
-				    ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, declared.first)) {
+				ValidateDeclaredKeyPinned(context, *base_source, base_table.get(), bind_data.name, entry->created_at);
+				if (ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, declared.first)) {
 					throw InvalidInputException("key_columns declared for table '%s', but scenario '%s' already "
 					                            "tracks it - row identity cannot be changed after the fact",
 					                            declared.first, bind_data.name);
+				}
+				vector<string> recorded;
+				if (ScenarioRegistry::LookupDeclaredKey(context, host_catalog, entry->scenario_id, declared.first,
+				                                        recorded)) {
+					bool broken = false;
+					for (auto &column : recorded) {
+						broken = broken || !base_table.get().ColumnExists(column);
+					}
+					if (!broken) {
+						throw InvalidInputException("key_columns declared for table '%s', but scenario '%s' already "
+						                            "tracks it - row identity cannot be changed after the fact",
+						                            declared.first, bind_data.name);
+					}
+					replaced.insert(declared.first);
 				}
 			}
 			if (!table_found) {
@@ -510,8 +553,13 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 			}
 		}
 		for (auto &declared : bind_data.key_columns) {
-			ScenarioRegistry::InsertDeclaredKey(context, host_catalog, entry->scenario_id, declared.first,
-			                                    declared.second);
+			if (replaced.count(declared.first)) {
+				ScenarioRegistry::ReplaceDeclaredKey(context, host_catalog, entry->scenario_id, declared.first,
+				                                     declared.second);
+			} else {
+				ScenarioRegistry::InsertDeclaredKey(context, host_catalog, entry->scenario_id, bind_data.name,
+				                                    declared.first, declared.second);
+			}
 			refreshed++;
 		}
 	}

@@ -11,6 +11,7 @@
 #pragma once
 
 #include "duckdb.hpp"
+#include "duckdb/main/client_context_state.hpp"
 
 namespace duckdb {
 
@@ -90,18 +91,62 @@ public:
 	static map<string, vector<string>> ListDeclaredKeys(ClientContext &context, Catalog &host_catalog,
 	                                                   int64_t scenario_id);
 	//! Record a declared key (creates scenario_tables on first use); the
-	//! caller has checked that none is recorded for the table yet
+	//! caller has checked that none is recorded for the table yet.
+	//! scenario_name only names the scenario in errors
 	static void InsertDeclaredKey(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-	                              const string &table_name, const vector<string> &key_columns);
+	                              const string &scenario_name, const string &table_name,
+	                              const vector<string> &key_columns);
 	//! Remove every declared key of a scenario (scenario_drop)
 	static void DeleteDeclaredKeys(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+	//! Replace the recorded declared key of one table (re-declaring a key
+	//! whose column vanished from the base)
+	static void ReplaceDeclaredKey(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                               const string &table_name, const vector<string> &key_columns);
 
 private:
 	static optional_ptr<DuckTableEntry> GetRegistryTable(ClientContext &context, Catalog &host_catalog);
 	static DuckTableEntry &GetRegistryTableOrThrow(ClientContext &context, Catalog &host_catalog);
 	static optional_ptr<DuckTableEntry> GetTablesTable(ClientContext &context, Catalog &host_catalog);
 	//! Create scenario_tables if it does not exist yet (caller's transaction)
-	static DuckTableEntry &EnsureTablesTable(ClientContext &context, Catalog &host_catalog);
+	static DuckTableEntry &EnsureTablesTable(ClientContext &context, Catalog &host_catalog,
+	                                         const string &scenario_name);
+	//! The declared keys of a scenario, cached per transaction (ScenarioClientState)
+	static shared_ptr<const map<string, vector<string>>> LoadDeclaredKeys(ClientContext &context,
+	                                                                      Catalog &host_catalog, int64_t scenario_id);
+	//! Delete the given scenario_tables rows (caller's transaction)
+	static void DeleteDeclaredKeyRows(ClientContext &context, Catalog &host_catalog, DuckTableEntry &table,
+	                                  const vector<row_t> &row_ids);
+};
+
+//! Per-connection state of the extension (a ClientContextState)
+class ScenarioClientState : public ClientContextState {
+public:
+	static ScenarioClientState &Get(ClientContext &context);
+
+	//! Serializes the write registrations and delta creations of this
+	//! connection's scenario sinks: their global states initialize on worker
+	//! threads in parallel, and MetaTransaction::ModifyDatabase /
+	//! DuckTransaction::SetModifications are not synchronized. Both are
+	//! per-transaction state, so a lock per connection suffices: first writes
+	//! of different connections (or databases) do not serialize
+	mutex write_lock;
+
+	//! The declared keys of one scenario as this transaction sees them,
+	//! loaded once per (transaction, host, scenario): a table entry is built
+	//! per table and transaction, and scanning scenario_tables for each of
+	//! them would cost O(tables x declarations) per enumeration. A
+	//! transaction's snapshot only changes through its own writes, which
+	//! invalidate the cache (Insert/ReplaceDeclaredKey, DeleteDeclaredKeys)
+	using DeclaredKeys = map<string, vector<string>>;
+	shared_ptr<const DeclaredKeys> GetDeclaredKeys(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                                               const std::function<DeclaredKeys()> &load);
+	void Invalidate(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+
+private:
+	mutex cache_lock;
+	transaction_t cache_transaction = DConstants::INVALID_INDEX;
+	map<pair<idx_t, int64_t>, shared_ptr<const DeclaredKeys>> cache;
+	void ResetIfStale(ClientContext &context);
 };
 
 } // namespace duckdb

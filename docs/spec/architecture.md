@@ -303,8 +303,10 @@ writer. A transaction that already modified an unrelated database is refused by 
 itself, naming the scenario (DuckDB's own check would only name the host). Sink global states
 are created by `PipelineInitializeTask`s, which can run on worker threads in parallel (e.g. the
 UNION of INSERTs `COPY FROM DATABASE` plans), and `ModifyDatabase` / `SetModifications` are not
-synchronized, so `BeginWrite` serializes behind a process-wide mutex; it runs once per sink, not
-per chunk. The flag has no storage effect on
+synchronized, so `BeginWrite` serializes behind a per-connection mutex
+(`ScenarioClientState::write_lock`); it runs once per sink, not per chunk. Both are state of one
+transaction, which belongs to one connection, so writers on other connections or databases never
+wait on it. The flag has no storage effect on
 scenario entries - `temporary` only matters for entries stored in a `CatalogSet` and logged to
 the WAL, and scenario entries live in neither.
 
@@ -346,7 +348,7 @@ database (the single-writer error) fails before anything is created. A statement
 rows never reaches it and creates nothing. The delta is created in the caller's transaction:
 `ROLLBACK` removes it, and the same transaction sees it at once. Creating a catalog entry bumps the
 host catalog version, so prepared statements rebind in that transaction.
-`GetOrCreateWriteDelta` runs under the same process-wide mutex as `BeginWrite`, because sibling
+`GetOrCreateWriteDelta` runs under the same per-connection mutex as `BeginWrite`, because sibling
 sinks of one plan (a `MERGE`'s actions, the INSERTs of `COPY FROM DATABASE`) may reach it together.
 
 `COPY FROM DATABASE ... TO <scenario>` is the one statement that registers the *scenario* catalog
@@ -357,19 +359,38 @@ database that is not the registered writer when the `CatalogTransaction` carries
 `CatalogTransaction` of the host transaction without the context. The entry still lands in the
 host transaction's undo buffer, so rollback, commit and the WAL behave as usual.
 
-**Identity.** `ScenarioDelta::GetKeyColumns` resolves a table's row identity in this order:
+**Identity.** `ScenarioDelta::GetKeyColumns` resolves a table's row identity. The first write
+chooses it in this order and creates the delta with exactly that shape:
 
 1. a row in `__anofox_scenario.scenario_tables` - a key declared with `key_columns :=` at
-   `scenario_create` or `scenario_refresh`;
-2. the `PRIMARY KEY` of an existing delta (no PK there means a bag delta, i.e. keyless).
-   Scenarios created before #34 recorded declared keys only here, so they need no migration;
-3. the base table's `PRIMARY KEY`;
-4. none: keyless, and the first write creates a bag delta.
+   `scenario_create` or `scenario_refresh`. It wins over a base `PRIMARY KEY` added after the
+   declaration;
+2. the base table's `PRIMARY KEY`;
+3. none: keyless, and the first write creates a bag delta.
 
-The table entry resolves its identity once per transaction, and the delta is created with that
-identity. If a key was declared after the transaction bound the table (`scenario_refresh` in the
-same transaction), the shapes would disagree, so the write fails with a retryable
-`TransactionException`.
+Once a delta exists, **its shape is authoritative**: its `PRIMARY KEY` by position, or none for a
+bag delta. Scenarios created before #34 recorded declared keys only there, so they need no
+migration. The declared key and the delta only disagree after a race or a base schema change, and
+then readers follow the rows that are actually stored. Example: con1 binds a keyless table, con2
+commits a `scenario_refresh` key declaration, con1's first write then creates a bag delta and
+commits. The `scenario_tables` insert and the `CREATE TABLE` do not write-conflict, so both commit,
+and the table stays keyless. Its stale `scenario_tables` row is never consulted.
+
+The table entry resolves its identity once per transaction. If a key was declared after the
+transaction bound the table (`scenario_refresh` in the same transaction), the shapes would
+disagree, so the write fails with a retryable `TransactionException`. A declared key column that
+was later renamed or dropped in the base is tolerated while binding (the table reads as a plain
+base passthrough, and introspection keeps working). The first write and `scenario_diff` raise
+the error, and `scenario_refresh` may re-declare such a key as long as no delta was built from it.
+
+The declared keys of a scenario are read once per transaction into `ScenarioClientState`
+(`scenario_registry.cpp`), because a table entry is built per table and transaction and a scan of
+`scenario_tables` per entry would cost O(tables x declarations) per enumeration. The transaction's
+snapshot changes only through its own writes, which invalidate the cache.
+
+`scenario_tables` itself is created by the first key declaration on a host, in the caller's
+transaction. Two transactions declaring the first keys concurrently collide on that `CREATE
+TABLE`: the loser gets a retryable `TransactionException` naming its scenario.
 
 **Concurrency.** Two transactions making the first write to the same table both try to create
 `s<id>_delta_<table>`. DuckDB's catalog lets only one of them create it: the other gets a
@@ -379,16 +400,21 @@ scenario and the table and asks for a retry. The loser's transaction is aborted 
 half-created.
 
 **Bases.** The delta always lives in the host. For a DuckLake base, the scenario's base is the
-lake *at its creation time*. The scenario schema mirrors the live lake catalog, so a table created
-in the lake later is visible by name. Its first write therefore looks the table up `AT (TIMESTAMP
-=> created_at)` and refuses one that isn't in that snapshot. Overlay scenarios pick up tables
+lake *at its creation time* (a branch keeps its parent's). The scenario schema mirrors the live
+lake catalog, so a table created in the lake later is visible by name. Its first write therefore
+looks the table up `AT (TIMESTAMP => created_at)` (`ScenarioDelta::GetPinnedBaseEntry`) and
+refuses one that isn't in that snapshot, or whose columns differ there from the live table (the
+delta is laid out like the live entry while the scan reads the snapshot). `scenario_diff` resolves
+the table the same way, so a later table is "not found in scenario". `scenario_refresh` and a
+branch's `key_columns` must name a table of the snapshot. Overlay scenarios pick up tables
 added to the host base automatically. Materialized scenarios only see their copies.
 
 **Readers.** A missing delta is an empty changelog everywhere:
 
 - The scan binds no delta and passes the base through. Point lookups and the suppression probe
   only run when a delta exists.
-- `scenario_diff` substitutes an empty relation in the delta layout. `scenario_diff_summary`,
+- `scenario_diff` canonicalizes the table name first (`main.t` and `MAIN.T` are `t`), then
+  substitutes an empty relation in the delta layout. `scenario_diff_summary`,
   `scenario_merge_preview` and `scenario_merge` enumerate the deltas that exist.
 - Branching copies only the parent deltas that exist (each into a child delta of the same
   shape), plus the parent's `scenario_tables` rows. A child's declaration that differs from the
@@ -400,7 +426,8 @@ added to the host base automatically. Materialized scenarios only see their copi
 - The keyless legacy upgrade at `ATTACH` rewrites only the deltas that exist.
 
 `scenario_refresh` is deprecated. It no longer creates deltas. It only records `key_columns` for
-keyless tables that are not tracked yet (no `scenario_tables` row and no delta).
+keyless tables that are not tracked yet (no `scenario_tables` row and no delta), or replaces a
+declared key whose column vanished from the base before any delta was built from it.
 
 ---
 

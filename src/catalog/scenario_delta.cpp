@@ -4,6 +4,8 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/common/types/conflict_manager.hpp"
 #include "duckdb/common/types/constraint_conflict_info.hpp"
 #include "duckdb/common/vector_operations/vector_operations.hpp"
@@ -439,7 +441,7 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 }
 
 DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-                                                TableCatalogEntry &base_entry, const vector<string> *declared_keys,
+                                                TableCatalogEntry &base_entry, const vector<string> *identity_keys,
                                                 const string *logical_name_override, bool host_is_not_writer) {
 	auto logical_name = logical_name_override ? *logical_name_override : LogicalName(base_entry);
 	auto existing = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
@@ -462,22 +464,23 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(OP_COL)));
 	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TS_COL)));
 
-	// The base PK becomes the delta PK: one delta row per user-visible key.
-	// Tables without a PK may declare one via key_columns := (recorded in
-	// scenario_tables); otherwise the delta is a bag changelog (below).
-	auto pk_columns = GetPKColumns(base_entry);
-	if (!pk_columns.empty()) {
-		vector<string> pk_names;
-		for (auto col_id : pk_columns) {
+	// The row identity becomes the delta PK: one delta row per user-visible
+	// key. identity_keys, when given, is the identity exactly (a declared
+	// key, or an inherited delta's shape; empty = keyless); otherwise the
+	// base PK is. Keyless tables get a bag changelog (below).
+	vector<string> pk_names;
+	if (identity_keys) {
+		pk_names = *identity_keys;
+	} else {
+		for (auto col_id : GetPKColumns(base_entry)) {
 			pk_names.push_back(base_entry.GetColumn(LogicalIndex(col_id)).Name());
 		}
-		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
-	} else if (declared_keys && !declared_keys->empty()) {
-		vector<string> pk_names = *declared_keys;
+	}
+	bool keyless = pk_names.empty();
+	if (!keyless) {
 		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
 	}
 
-	bool keyless = pk_columns.empty() && (!declared_keys || declared_keys->empty());
 	if (keyless) {
 		// Bag changelog: whole-row identity cannot be a PK (NULLs), so I/D
 		// rows carry a multiplicity instead and readers aggregate. Secondary
@@ -556,24 +559,13 @@ vector<idx_t> ScenarioDelta::GetPKColumns(const TableCatalogEntry &base_entry) {
 
 vector<idx_t> ScenarioDelta::GetKeyColumns(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
                                            const string &logical_name, TableCatalogEntry &base_entry) {
-	// Identity resolution order (#34): (1) a key declared for the table
-	// (scenario_tables), (2) the PRIMARY KEY of an existing delta (scenarios
-	// from before #34 recorded declared keys only there), (3) the base PK,
-	// (4) none: keyless, a bag delta
-	vector<string> declared;
-	if (ScenarioRegistry::LookupDeclaredKey(context, host_catalog, scenario_id, logical_name, declared)) {
-		vector<idx_t> result;
-		auto &columns = base_entry.GetColumns();
-		for (auto &name : declared) {
-			if (!columns.ColumnExists(name)) {
-				throw InvalidInputException(
-				    "Scenario table '%s': declared key column '%s' no longer exists in the base table", logical_name,
-				    name);
-			}
-			result.push_back(columns.GetColumn(name).Logical().index);
-		}
-		return result;
-	}
+	// Identity resolution (#34). Once a delta exists its shape is the
+	// identity: its PRIMARY KEY (by position), or none for a bag delta. It
+	// was created from the order below, so the two only disagree after a
+	// race (a scenario_refresh declaration committing next to a concurrent
+	// first write) or a base schema change, and readers must follow the rows
+	// that are actually there. Without a delta: (1) a key declared in
+	// scenario_tables, (2) the base PK, (3) none: keyless, a bag delta.
 	auto delta = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (delta) {
 		auto delta_pk = GetPKColumns(*delta);
@@ -584,10 +576,41 @@ vector<idx_t> ScenarioDelta::GetKeyColumns(ClientContext &context, Catalog &host
 			}
 			result.push_back(delta_col - PAYLOAD_START);
 		}
-		// the delta's shape is authoritative: no PK = a bag delta (keyless)
+		return result;
+	}
+	vector<string> declared;
+	if (ScenarioRegistry::LookupDeclaredKey(context, host_catalog, scenario_id, logical_name, declared)) {
+		vector<idx_t> result;
+		auto &columns = base_entry.GetColumns();
+		for (auto &name : declared) {
+			if (!columns.ColumnExists(name)) {
+				throw InvalidInputException(
+				    "Scenario table '%s': declared key column '%s' no longer exists in the base table. Re-declare "
+				    "the key with scenario_refresh(<scenario>, key_columns := MAP {'%s': [...]})",
+				    logical_name, name, logical_name);
+			}
+			result.push_back(columns.GetColumn(name).Logical().index);
+		}
 		return result;
 	}
 	return GetPKColumns(base_entry);
+}
+
+optional_ptr<TableCatalogEntry> ScenarioDelta::GetPinnedBaseEntry(ClientContext &context, Catalog &base_catalog,
+                                                                 const string &schema_name, const string &table_name,
+                                                                 timestamp_t at) {
+	BoundAtClause at_clause("timestamp", Value::TIMESTAMP(at));
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, &at_clause, QueryErrorContext());
+	optional_ptr<CatalogEntry> pinned;
+	try {
+		pinned = base_catalog.GetEntry(context, schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+	} catch (CatalogException &) {
+		pinned = nullptr; // e.g. the schema is not in the snapshot either
+	}
+	if (!pinned || pinned->type != CatalogType::TABLE_ENTRY) {
+		return nullptr;
+	}
+	return &pinned->Cast<TableCatalogEntry>();
 }
 
 string ScenarioDelta::MakeKey(DataChunk &chunk, idx_t row, const vector<idx_t> &key_positions) {

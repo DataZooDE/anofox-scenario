@@ -88,8 +88,17 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	table_info.table = table_name;
 
 	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table, for_binding);
-	entry->key_columns = ScenarioDelta::GetKeyColumns(context, scenario_catalog.GetHostCatalog(context),
-	                                                  scenario_catalog.scenario_id, qualified, base_table);
+	try {
+		entry->key_columns = ScenarioDelta::GetKeyColumns(context, scenario_catalog.GetHostCatalog(context),
+		                                                  scenario_catalog.scenario_id, qualified, base_table);
+	} catch (InvalidInputException &) {
+		// a declared key column vanished from the base (renamed or dropped)
+		// and the table has no delta yet: reads are a plain base passthrough
+		// and need no identity, so binding and introspection keep working.
+		// The first write re-resolves the identity and raises the error
+		// (ScenarioCatalog::GetOrCreateWriteDelta), as does scenario_diff
+		entry->key_columns.clear();
+	}
 	return transaction.PublishEntry(qualified, std::move(entry), enumeration);
 }
 
