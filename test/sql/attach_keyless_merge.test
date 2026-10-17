@@ -174,7 +174,7 @@ MERGE INTO s.inventory_events t USING (VALUES ('E5', 'west', 1), ('E5', 'west', 
     ON t.sku = v.sku AND t.warehouse = v.warehouse
     WHEN MATCHED THEN UPDATE SET qty = v.q;
 ----
-same row twice
+<REGEX>:.*(same row twice|same target row more than once).*
 
 statement error
 MERGE INTO s.inventory_events t USING (VALUES ('E5', 'west', 1), ('E5', 'west', 2)) v(sku, warehouse, q)
@@ -182,13 +182,13 @@ MERGE INTO s.inventory_events t USING (VALUES ('E5', 'west', 1), ('E5', 'west', 
     WHEN MATCHED AND v.q = 1 THEN DELETE
     WHEN MATCHED THEN UPDATE SET qty = v.q;
 ----
-same row twice
+<REGEX>:.*(same row twice|same target row more than once).*
 
 # the same rule covers UPDATE ... FROM joins
 statement error
 UPDATE s.inventory_events SET qty = 0 FROM (VALUES ('E5'), ('E5')) v(sku) WHERE inventory_events.sku = v.sku;
 ----
-same row twice
+<REGEX>:.*(same row twice|same target row more than once).*
 
 # ...while repeated deletes are well defined: each copy is deleted once, like
 # core (#39; checked inside a rolled-back transaction to keep the fixture)
