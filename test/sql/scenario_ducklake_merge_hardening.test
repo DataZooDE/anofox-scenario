@@ -37,7 +37,7 @@ SELECT scenario_id FROM scenario_list() WHERE name = 'legacy_lake';
 # a pre-v0.4.1 keyless delta: no _count, insert rows only (each one copy).
 # It is never re-ATTACHed, so the ATTACH-time upgrade does not run.
 statement ok
-DROP TABLE __anofox_scenario.s1_delta_page_views;
+DROP TABLE IF EXISTS __anofox_scenario.s1_delta_page_views;
 
 statement ok
 CREATE TABLE __anofox_scenario.s1_delta_page_views (_op VARCHAR NOT NULL, _ts TIMESTAMP NOT NULL,

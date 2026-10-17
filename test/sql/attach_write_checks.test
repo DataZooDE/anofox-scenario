@@ -255,8 +255,21 @@ ROLLBACK;
 
 endloop
 
+# the statement registers the scenario catalog itself as the writer; the deltas
+# it creates (#34: on the first write of each table) still roll back...
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%\_delta\_fc\_%' ESCAPE '\';
+----
+0
+
 statement ok
 COPY FROM DATABASE src TO b (DATA);
+
+# ...and commit
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%\_delta\_fc\_%' ESCAPE '\';
+----
+3
 
 statement ok
 CHECKPOINT;

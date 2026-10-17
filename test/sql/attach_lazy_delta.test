@@ -1,0 +1,647 @@
+# name: test/sql/attach_lazy_delta.test
+# description: #34: delta tables are created lazily, by the first write to a scenario table
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+load __TEST_DIR__/attach_lazy_delta.db
+
+statement ok
+CREATE TABLE products (id INTEGER PRIMARY KEY, name VARCHAR, price DECIMAL(10, 2));
+
+statement ok
+INSERT INTO products VALUES (1, 'widget', 9.99), (2, 'gadget', 19.99), (3, 'doohickey', 4.50);
+
+statement ok
+CREATE TABLE stores (store_id INTEGER PRIMARY KEY, city VARCHAR);
+
+statement ok
+INSERT INTO stores VALUES (10, 'Berlin'), (20, 'Hamburg');
+
+# keyless: a sensor feed without a key, and a price list with a declared key
+statement ok
+CREATE TABLE readings (sensor VARCHAR, val DOUBLE);
+
+statement ok
+INSERT INTO readings VALUES ('t1', 20.5), ('t1', 20.5), ('t2', 18.0);
+
+statement ok
+CREATE TABLE price_list (sku VARCHAR, tier VARCHAR, price INTEGER);
+
+statement ok
+INSERT INTO price_list VALUES ('A', 'retail', 10), ('A', 'wholesale', 8), ('B', 'retail', 20);
+
+# --- scenario_create creates no delta tables -------------------------------------
+
+statement ok
+CALL scenario_create('plan', 'Q3 plan', key_columns := MAP {'price_list': ['sku', 'tier']});
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's%\_delta\_%' ESCAPE '\';
+----
+0
+
+# the declared key is recorded in the registry, not in a delta
+query TT
+SELECT table_name, key_columns::VARCHAR FROM __anofox_scenario.scenario_tables t JOIN __anofox_scenario.registry r USING (scenario_id) WHERE r.name = 'plan';
+----
+price_list	[sku, tier]
+
+statement ok
+ATTACH 'plan' AS s (TYPE scenario);
+
+# reads pass through to the base
+query ITT
+SELECT id, name, price FROM s.products ORDER BY id;
+----
+1	widget	9.99
+2	gadget	19.99
+3	doohickey	4.50
+
+# point lookups on a table without a delta
+query T
+SELECT name FROM s.products WHERE id = 2;
+----
+gadget
+
+# readers treat a missing delta as empty
+query I
+SELECT count(*) FROM scenario_diff('plan', 'products');
+----
+0
+
+query I
+SELECT count(*) FROM scenario_diff('main', 'plan', 'products');
+----
+0
+
+query I
+SELECT count(*) FROM scenario_diff('plan', 'readings');
+----
+0
+
+query I
+SELECT count(*) FROM scenario_diff_summary('plan');
+----
+0
+
+query I
+SELECT count(*) FROM scenario_merge_preview('plan');
+----
+0
+
+# an unknown table is still an error
+statement error
+SELECT * FROM scenario_diff('plan', 'no_such_table');
+----
+<REGEX>:.*Table 'no_such_table' not found in scenario 'plan'.*
+
+# --- a zero-row write does not create the delta --------------------------------
+
+query I
+DELETE FROM s.products WHERE id = 99;
+----
+0
+
+query I
+UPDATE s.products SET price = 1 WHERE false;
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's%\_delta\_%' ESCAPE '\';
+----
+0
+
+# --- the first write creates the delta, in the caller's transaction --------------
+
+statement ok
+BEGIN;
+
+statement ok
+UPDATE s.products SET price = 11.00 WHERE id = 1;
+
+# the same transaction sees the new delta and its row
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_products';
+----
+1
+
+query T
+SELECT price FROM s.products WHERE id = 1;
+----
+11.00
+
+# and keeps writing through it
+statement ok
+INSERT INTO s.products VALUES (4, 'gizmo', 2.00);
+
+statement ok
+DELETE FROM s.products WHERE id = 3;
+
+query ITT
+SELECT id, name, price FROM s.products ORDER BY id;
+----
+1	widget	11.00
+2	gadget	19.99
+4	gizmo	2.00
+
+statement ok
+ROLLBACK;
+
+# ROLLBACK removes the delta again
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's%\_delta\_%' ESCAPE '\';
+----
+0
+
+query T
+SELECT price FROM s.products WHERE id = 1;
+----
+9.99
+
+# COMMIT keeps it
+statement ok
+BEGIN;
+
+statement ok
+UPDATE s.products SET price = 12.00 WHERE id = 1;
+
+statement ok
+COMMIT;
+
+query TTT
+SELECT id, change_type, new_value FROM scenario_diff('plan', 'products');
+----
+1	modified	12.00
+
+# only the written table has a delta
+query T
+SELECT table_name FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's%\_delta\_%' ESCAPE '\';
+----
+s1_delta_products
+
+# the base is never written
+query T
+SELECT price FROM products WHERE id = 1;
+----
+9.99
+
+# --- every DML kind creates the delta on first write -----------------------------
+
+# INSERT ... ON CONFLICT on a table without a delta
+statement ok
+INSERT INTO s.stores VALUES (10, 'Munich'), (30, 'Cologne') ON CONFLICT (store_id) DO UPDATE SET city = excluded.city;
+
+query IT
+SELECT store_id, city FROM s.stores ORDER BY store_id;
+----
+10	Munich
+20	Hamburg
+30	Cologne
+
+# keyless: a DELETE of one copy creates the bag delta
+statement ok
+DELETE FROM s.readings WHERE sensor = 't2';
+
+query TR
+SELECT sensor, val FROM s.readings ORDER BY ALL;
+----
+t1	20.5
+t1	20.5
+
+# the bag delta carries the multiplicity column
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_readings' ORDER BY column_index DESC LIMIT 1;
+----
+_count
+
+# a declared key: MERGE INTO creates a keyed delta with that key as its PK
+statement ok
+MERGE INTO s.price_list t USING (SELECT 'A' AS sku, 'retail' AS tier, 12 AS price) src
+ON t.sku = src.sku AND t.tier = src.tier WHEN MATCHED THEN UPDATE SET price = src.price;
+
+query TTI
+SELECT sku, tier, price FROM s.price_list ORDER BY ALL;
+----
+A	retail	12
+A	wholesale	8
+B	retail	20
+
+query T
+SELECT constraint_text FROM duckdb_constraints() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_price_list' AND constraint_type = 'PRIMARY KEY';
+----
+PRIMARY KEY(sku, tier)
+
+query TTTTT
+SELECT sku, tier, change_type, old_value, new_value FROM scenario_diff('plan', 'price_list');
+----
+A	retail	modified	10	12
+
+# --- tables added to the base after scenario_create are writable -----------------
+
+statement ok
+CREATE TABLE promotions (promo_id INTEGER PRIMARY KEY, pct INTEGER);
+
+statement ok
+INSERT INTO promotions VALUES (1, 5);
+
+statement ok
+CREATE TABLE notes (txt VARCHAR);
+
+statement ok
+INSERT INTO s.promotions VALUES (2, 10);
+
+statement ok
+UPDATE s.promotions SET pct = 7 WHERE promo_id = 1;
+
+statement ok
+INSERT INTO s.notes VALUES ('late table'), ('late table');
+
+query II
+SELECT promo_id, pct FROM s.promotions ORDER BY promo_id;
+----
+1	7
+2	10
+
+query TI
+SELECT txt, count(*) FROM s.notes GROUP BY txt;
+----
+late table	2
+
+query TIII
+SELECT * FROM scenario_diff_summary('plan') ORDER BY table_name;
+----
+notes	2	0	0
+price_list	0	1	0
+products	0	1	0
+promotions	1	1	0
+readings	0	0	1
+stores	1	1	0
+
+# nothing reached the base
+query I
+SELECT (SELECT count(*) FROM promotions) + (SELECT count(*) FROM notes);
+----
+1
+
+# --- scenario_refresh: deprecated, only records keys for untracked tables --------
+
+statement ok
+CREATE TABLE fx_rates (ccy VARCHAR, rate DOUBLE);
+
+statement ok
+INSERT INTO fx_rates VALUES ('EUR', 1.0), ('USD', 1.1);
+
+# nothing to do without key_columns
+query I
+SELECT refreshed_tables FROM scenario_refresh('plan');
+----
+0
+
+query I
+SELECT refreshed_tables FROM scenario_refresh('plan', key_columns := MAP {'fx_rates': ['ccy']});
+----
+1
+
+# still no delta: the key is recorded, the delta comes with the first write
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_fx_rates';
+----
+0
+
+statement ok
+UPDATE s.fx_rates SET rate = 1.2 WHERE ccy = 'USD';
+
+query TTTT
+SELECT ccy, change_type, old_value, new_value FROM scenario_diff('plan', 'fx_rates');
+----
+USD	modified	1.1	1.2
+
+# a table that is tracked already (a key row or a delta) keeps its identity
+statement error
+SELECT * FROM scenario_refresh('plan', key_columns := MAP {'fx_rates': ['rate']});
+----
+<REGEX>:.*already tracks it.*
+
+statement error
+SELECT * FROM scenario_refresh('plan', key_columns := MAP {'notes': ['txt']});
+----
+<REGEX>:.*already tracks it.*
+
+# a key declared after this transaction bound the table cannot apply to it
+statement ok
+CREATE TABLE tags (tag VARCHAR, weight INTEGER);
+
+statement ok
+INSERT INTO tags VALUES ('a', 1);
+
+statement ok
+BEGIN;
+
+query TI
+SELECT * FROM s.tags;
+----
+a	1
+
+query I
+SELECT refreshed_tables FROM scenario_refresh('plan', key_columns := MAP {'tags': ['tag']});
+----
+1
+
+statement error
+UPDATE s.tags SET weight = 2;
+----
+<REGEX>:.*row identity was declared after this transaction first used the table.*
+
+statement ok
+ROLLBACK;
+
+# --- frozen, read-only and single-writer failures create nothing ----------------
+
+statement ok
+CREATE TABLE budgets (dept VARCHAR PRIMARY KEY, amount INTEGER);
+
+statement ok
+INSERT INTO budgets VALUES ('ops', 100);
+
+statement ok
+CALL scenario_freeze('plan');
+
+statement error
+UPDATE s.budgets SET amount = 1;
+----
+<REGEX>:.*scenario 'plan' is frozen.*
+
+statement ok
+CALL scenario_unfreeze('plan');
+
+statement ok
+ATTACH ':memory:' AS ledger_db;
+
+statement ok
+CREATE TABLE ledger_db.ledger (id INTEGER);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO ledger_db.ledger VALUES (1);
+
+statement error
+UPDATE s.budgets SET amount = 1;
+----
+<REGEX>:.*Cannot write to scenario 'plan': this transaction already modified database "ledger_db".*
+
+statement ok
+ROLLBACK;
+
+statement ok
+BEGIN TRANSACTION READ ONLY;
+
+statement error
+INSERT INTO s.budgets VALUES ('it', 5);
+----
+<REGEX>:.*read-only mode.*
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_budgets';
+----
+0
+
+# --- concurrent first writes: the loser gets a retryable transaction error -------
+
+statement ok con1
+BEGIN;
+
+statement ok con1
+UPDATE s.budgets SET amount = 110 WHERE dept = 'ops';
+
+statement error con2
+INSERT INTO s.budgets VALUES ('hr', 50);
+----
+<REGEX>:.*TransactionContext Error.*scenario 'plan'.*table 'budgets'.*retry.*
+
+statement ok con1
+COMMIT;
+
+# the retry succeeds against the committed delta
+statement ok con2
+INSERT INTO s.budgets VALUES ('hr', 50);
+
+query TI
+SELECT dept, amount FROM s.budgets ORDER BY dept;
+----
+hr	50
+ops	110
+
+# an older snapshot that cannot see the committed delta fails the same way
+statement ok
+CREATE TABLE regions (code VARCHAR PRIMARY KEY);
+
+statement ok
+INSERT INTO regions VALUES ('EU');
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+SELECT count(*) FROM s.regions;
+
+statement ok con1
+INSERT INTO s.regions VALUES ('US');
+
+statement error con2
+INSERT INTO s.regions VALUES ('APAC');
+----
+<REGEX>:.*TransactionContext Error.*scenario 'plan'.*table 'regions'.*retry.*
+
+statement ok con2
+ROLLBACK;
+
+query T
+SELECT code FROM s.regions ORDER BY code;
+----
+EU
+US
+
+# --- branching copies only the parent deltas that exist --------------------------
+
+statement ok
+CALL scenario_create('plan_b', from_scenario := 'plan');
+
+query T rowsort
+SELECT table_name FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's2\_delta\_%' ESCAPE '\';
+----
+s2_delta_budgets
+s2_delta_fx_rates
+s2_delta_notes
+s2_delta_price_list
+s2_delta_products
+s2_delta_promotions
+s2_delta_readings
+s2_delta_regions
+s2_delta_stores
+
+# ...and the parent's declared keys
+query TT rowsort
+SELECT table_name, key_columns::VARCHAR FROM __anofox_scenario.scenario_tables WHERE scenario_id = 2;
+----
+fx_rates	[ccy]
+price_list	[sku, tier]
+
+# a branch may not change an inherited identity
+statement error
+CALL scenario_create('plan_c', from_scenario := 'plan', key_columns := MAP {'price_list': ['sku']});
+----
+<REGEX>:.*differ from the parent scenario's.*
+
+statement error
+CALL scenario_create('plan_c', from_scenario := 'plan', key_columns := MAP {'readings': ['sensor']});
+----
+<REGEX>:.*differ from the parent scenario's.*
+
+statement ok
+ATTACH 'plan_b' AS b (TYPE scenario);
+
+query ITT
+SELECT id, name, price FROM b.products ORDER BY id;
+----
+1	widget	12.00
+2	gadget	19.99
+3	doohickey	4.50
+
+# the child creates its own deltas lazily, too
+statement ok
+CREATE TABLE warehouses (wh INTEGER PRIMARY KEY, cap INTEGER);
+
+statement ok
+INSERT INTO b.warehouses VALUES (1, 1000);
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%\_delta\_warehouses' ESCAPE '\';
+----
+1
+
+# --- existing scenarios need no migration: a delta without a key row ------------
+# (pre-#34 scenarios recorded a declared key only as the delta's PRIMARY KEY)
+
+statement ok
+DELETE FROM __anofox_scenario.scenario_tables WHERE scenario_id = 1;
+
+statement ok
+DETACH s;
+
+statement ok
+ATTACH 'plan' AS s (TYPE scenario);
+
+statement ok
+UPDATE s.price_list SET price = 9 WHERE sku = 'A' AND tier = 'wholesale';
+
+query TTTTT rowsort
+SELECT sku, tier, change_type, old_value, new_value FROM scenario_diff('plan', 'price_list');
+----
+A	retail	modified	10	12
+A	wholesale	modified	8	9
+
+# --- durability across a restart -------------------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+DETACH b;
+
+restart
+
+statement ok
+ATTACH 'plan' AS s (TYPE scenario);
+
+query ITT
+SELECT id, name, price FROM s.products ORDER BY id;
+----
+1	widget	12.00
+2	gadget	19.99
+3	doohickey	4.50
+
+statement ok
+UPDATE s.fx_rates SET rate = 0.9 WHERE ccy = 'EUR';
+
+query TR
+SELECT ccy, rate FROM s.fx_rates ORDER BY ccy;
+----
+EUR	0.9
+USD	1.2
+
+# --- materialized scenarios copy eagerly, but their deltas are lazy -------------
+
+statement ok
+CALL scenario_create('snap', mode := 'materialized');
+
+query II
+SELECT count(*) FILTER (table_name LIKE 's' || r.scenario_id || '\_mat\_%' ESCAPE '\') > 0,
+       count(*) FILTER (table_name LIKE 's' || r.scenario_id || '\_delta\_%' ESCAPE '\')
+FROM duckdb_tables(), (SELECT scenario_id FROM __anofox_scenario.registry WHERE name = 'snap') r
+WHERE schema_name = '__anofox_scenario';
+----
+true	0
+
+statement ok
+ATTACH 'snap' AS m (TYPE scenario);
+
+statement ok
+UPDATE m.products SET price = 1.00 WHERE id = 2;
+
+query T
+SELECT replace(table_name, 's' || r.scenario_id || '_', 's<id>_')
+FROM duckdb_tables(), (SELECT scenario_id FROM __anofox_scenario.registry WHERE name = 'snap') r
+WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's' || r.scenario_id || '\_delta\_%' ESCAPE '\';
+----
+s<id>_delta_products
+
+query T
+SELECT price FROM m.products WHERE id = 2;
+----
+1.00
+
+statement ok
+DETACH m;
+
+# --- merge-back over a scenario with only some deltas ----------------------------
+
+query I
+SELECT rows_applied > 0 FROM scenario_merge('snap');
+----
+true
+
+query T
+SELECT price FROM products WHERE id = 2;
+----
+1.00
+
+# --- drop removes the deltas and the key rows ------------------------------------
+
+statement ok
+DETACH s;
+
+statement ok
+CALL scenario_drop('plan_b');
+
+statement ok
+CALL scenario_drop('plan');
+
+statement ok
+CALL scenario_drop('snap');
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's%\_delta\_%' ESCAPE '\';
+----
+0
+
+query I
+SELECT count(*) FROM __anofox_scenario.scenario_tables;
+----
+0

@@ -92,10 +92,9 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	if (!entry) {
 		throw InvalidInputException("Scenario '%s' not found", scenario_name);
 	}
+	// a table the scenario never wrote has no delta yet (#34): it diffs as
+	// an empty changelog, provided the scenario has the table at all
 	auto delta = ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, table_name);
-	if (!delta) {
-		throw InvalidInputException("Table '%s' not found in scenario '%s'", table_name, scenario_name);
-	}
 
 	// Base side: nearest materialized ancestor or the live host table
 	int64_t mat_base_id = -1;
@@ -151,6 +150,9 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 		base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, schema_name, plain_name,
 		                                                       OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
+			if (!delta) {
+				throw InvalidInputException("Table '%s' not found in scenario '%s'", table_name, scenario_name);
+			}
 			throw InvalidInputException("Table '%s' not found in the base schema", table_name);
 		}
 		target.base_name = target.origin_name;
@@ -159,9 +161,15 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 
 	auto pk_columns =
 	    ScenarioDelta::GetKeyColumns(context, host_catalog, entry->scenario_id, table_name, *base_entry);
+	if (!delta) {
+		// the empty changelog in the delta layout (_op, _ts, base columns),
+		// typed after the base side it overlays
+		target.delta_name = "(SELECT CAST(NULL AS VARCHAR) AS _op, CAST(NULL AS TIMESTAMP) AS _ts, __anofox_e.* FROM " +
+		                    BaseFrom(target, "__anofox_e") + " WHERE false)";
+	}
 	if (pk_columns.empty()) {
 		// keyless: a bag diff over whole rows, netting the delta's I/D counts
-		auto count_name = ScenarioDelta::CountColumnName(*delta);
+		auto count_name = delta ? ScenarioDelta::CountColumnName(*delta) : string();
 		target.count_expr = count_name.empty() ? "1" : Q(count_name);
 		target.keyless = true;
 	}

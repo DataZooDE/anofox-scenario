@@ -16,6 +16,12 @@ CALL scenario_create('cc');
 statement ok
 ATTACH 'cc' AS s (TYPE scenario);
 
+# the table's first write creates its delta (#34); commit one up front, so the
+# two writers below race on the delta's rows rather than on creating it (that
+# race is covered in attach_lazy_delta.test)
+statement ok
+UPDATE s.forecast SET qty = 200 WHERE id = 2;
+
 # two connections updating the SAME base row in the same scenario:
 # both write a 'U' delta row for PK 1; the second commit must fail on the
 # delta's PK index (normal DuckDB conflict semantics, no silent last-wins)

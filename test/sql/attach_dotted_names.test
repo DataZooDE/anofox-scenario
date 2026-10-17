@@ -218,8 +218,8 @@ CALL scenario_drop('m');
 statement ok
 CALL scenario_drop('d');
 
-# no internal table is left behind
+# no internal table of a scenario (s<id>_...) is left behind
 query I
-SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's%\_%' ESCAPE '\';
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND regexp_matches(table_name, '^s[0-9]+_');
 ----
 0

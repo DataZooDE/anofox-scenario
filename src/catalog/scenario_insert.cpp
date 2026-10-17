@@ -232,17 +232,14 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	auto &gstate = input.global_state.Cast<ScenarioInsertGlobalState>();
 	auto &client = context.client;
 	auto &scenario_catalog = entry.GetScenarioCatalog();
-	auto &host_catalog = scenario_catalog.GetHostCatalog(client);
+	if (chunk.size() == 0) {
+		return SinkResultType::NEED_MORE_INPUT; // no row, no delta
+	}
 
-	// Lazy setup on the first chunk. The delta table was created eagerly by
-	// scenario_create; DML never creates catalog entries (single-writer rule).
+	// Lazy setup on the first chunk: the delta is created by the table's
+	// first write (#34), so a statement inserting no rows creates nothing
 	if (!gstate.delta_table) {
-		auto delta_ptr =
-		    ScenarioDelta::TryGetDeltaTable(client, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
-		if (!delta_ptr) {
-			ThrowTableCreatedAfterScenario(entry);
-		}
-		auto &delta = *delta_ptr;
+		auto &delta = scenario_catalog.GetOrCreateWriteDelta(client, entry);
 		gstate.delta_table = &delta;
 		auto binder = Binder::CreateBinder(client);
 		gstate.delta_constraints = binder->BindConstraints(delta);

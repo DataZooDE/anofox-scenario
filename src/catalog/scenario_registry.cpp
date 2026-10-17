@@ -26,6 +26,7 @@ namespace duckdb {
 constexpr const char *ScenarioRegistry::SCHEMA_NAME;
 constexpr const char *ScenarioRegistry::TABLE_NAME;
 constexpr const char *ScenarioRegistry::SEQUENCE_NAME;
+constexpr const char *ScenarioRegistry::TABLES_TABLE_NAME;
 
 namespace {
 
@@ -103,6 +104,39 @@ void MarkHostModified(ClientContext &context, Catalog &host_catalog, DatabaseMod
 	MetaTransaction::Get(context).ModifyDatabase(host_catalog.GetAttached(), type);
 }
 
+// scenario_tables column positions -- keep in sync with EnsureTablesTable
+constexpr idx_t TAB_COL_SCENARIO_ID = 0;
+constexpr idx_t TAB_COL_TABLE_NAME = 1;
+constexpr idx_t TAB_COL_KEY_COLUMNS = 2;
+constexpr idx_t TAB_COL_COUNT = 3;
+
+//! Scan (rowid, scenario_id, table_name, key_columns) of every scenario_tables
+//! row of one scenario
+void ScanDeclaredKeys(ClientContext &context, DuckTableEntry &table, int64_t scenario_id,
+                      const std::function<bool(row_t, const string &, vector<string>)> &callback) {
+	vector<StorageIndex> column_ids;
+	column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+	for (idx_t i = 0; i < TAB_COL_COUNT; i++) {
+		column_ids.emplace_back(i);
+	}
+	vector<LogicalType> types {LogicalType::ROW_TYPE};
+	for (auto &type : table.GetStorage().GetTypes()) {
+		types.push_back(type);
+	}
+	ScenarioDelta::ScanTableRows(context, table, std::move(column_ids), types, [&](DataChunk &chunk, idx_t row) {
+		if (chunk.GetValue(1 + TAB_COL_SCENARIO_ID, row).GetValue<int64_t>() != scenario_id) {
+			return true;
+		}
+		vector<string> key_columns;
+		auto key_list = chunk.GetValue(1 + TAB_COL_KEY_COLUMNS, row);
+		for (auto &column : ListValue::GetChildren(key_list)) {
+			key_columns.push_back(column.GetValue<string>());
+		}
+		return callback(chunk.GetValue(0, row).GetValue<row_t>(),
+		                chunk.GetValue(1 + TAB_COL_TABLE_NAME, row).GetValue<string>(), std::move(key_columns));
+	});
+}
+
 } // namespace
 
 optional_ptr<DuckTableEntry> ScenarioRegistry::GetRegistryTable(ClientContext &context, Catalog &host_catalog) {
@@ -123,6 +157,125 @@ DuckTableEntry &ScenarioRegistry::GetRegistryTableOrThrow(ClientContext &context
 		throw InternalException("anofox_scenario: registry table %s.%s not found", SCHEMA_NAME, TABLE_NAME);
 	}
 	return *table;
+}
+
+optional_ptr<DuckTableEntry> ScenarioRegistry::GetTablesTable(ClientContext &context, Catalog &host_catalog) {
+	auto schema = host_catalog.GetSchema(context, SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
+	if (!schema) {
+		return nullptr;
+	}
+	auto entry =
+	    schema->GetEntry(schema->GetCatalogTransaction(context), CatalogType::TABLE_ENTRY, TABLES_TABLE_NAME);
+	if (!entry || entry->type != CatalogType::TABLE_ENTRY) {
+		return nullptr;
+	}
+	return &entry->Cast<DuckTableEntry>();
+}
+
+DuckTableEntry &ScenarioRegistry::EnsureTablesTable(ClientContext &context, Catalog &host_catalog) {
+	auto existing = GetTablesTable(context, host_catalog);
+	if (existing) {
+		return *existing;
+	}
+	EnsureExists(context, host_catalog);
+	MarkHostModified(context, host_catalog, DatabaseModificationType::CREATE_CATALOG_ENTRY);
+	// column order pinned by the TAB_COL_* constants above
+	auto info = make_uniq<CreateTableInfo>();
+	info->catalog = host_catalog.GetName();
+	info->schema = SCHEMA_NAME;
+	info->table = TABLES_TABLE_NAME;
+	info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
+	info->columns.AddColumn(ColumnDefinition("scenario_id", LogicalType::BIGINT));
+	info->columns.AddColumn(ColumnDefinition("table_name", LogicalType::VARCHAR));
+	info->columns.AddColumn(ColumnDefinition("key_columns", LogicalType::LIST(LogicalType::VARCHAR)));
+	info->constraints.push_back(make_uniq<UniqueConstraint>(vector<string> {"scenario_id", "table_name"}, true));
+	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TAB_COL_KEY_COLUMNS)));
+	host_catalog.CreateTable(context, std::move(info));
+	auto created = GetTablesTable(context, host_catalog);
+	if (!created) {
+		throw InternalException("anofox_scenario: failed to create %s.%s", SCHEMA_NAME, TABLES_TABLE_NAME);
+	}
+	return *created;
+}
+
+bool ScenarioRegistry::LookupDeclaredKey(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                         const string &table_name, vector<string> &key_columns) {
+	auto table = GetTablesTable(context, host_catalog);
+	if (!table) {
+		return false;
+	}
+	bool found = false;
+	ScanDeclaredKeys(context, *table, scenario_id, [&](row_t, const string &name, vector<string> keys) {
+		if (name != table_name) {
+			return true;
+		}
+		key_columns = std::move(keys);
+		found = true;
+		return false;
+	});
+	return found;
+}
+
+map<string, vector<string>> ScenarioRegistry::ListDeclaredKeys(ClientContext &context, Catalog &host_catalog,
+                                                              int64_t scenario_id) {
+	map<string, vector<string>> result;
+	auto table = GetTablesTable(context, host_catalog);
+	if (!table) {
+		return result;
+	}
+	ScanDeclaredKeys(context, *table, scenario_id, [&](row_t, const string &name, vector<string> keys) {
+		result[name] = std::move(keys);
+		return true;
+	});
+	return result;
+}
+
+void ScenarioRegistry::InsertDeclaredKey(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                         const string &table_name, const vector<string> &key_columns) {
+	auto &table = EnsureTablesTable(context, host_catalog);
+	MarkHostModified(context, host_catalog, DatabaseModificationType::INSERT_DATA);
+	auto &data_table = table.GetStorage();
+	DataChunk chunk;
+	chunk.Initialize(Allocator::Get(context), data_table.GetTypes());
+	vector<Value> keys;
+	for (auto &column : key_columns) {
+		keys.emplace_back(column);
+	}
+	chunk.SetValue(TAB_COL_SCENARIO_ID, 0, Value::BIGINT(scenario_id));
+	chunk.SetValue(TAB_COL_TABLE_NAME, 0, Value(table_name));
+	chunk.SetValue(TAB_COL_KEY_COLUMNS, 0, Value::LIST(LogicalType::VARCHAR, std::move(keys)));
+	chunk.SetCardinality(1);
+	auto binder = Binder::CreateBinder(context);
+	auto bound_constraints = binder->BindConstraints(table);
+	data_table.LocalAppend(table, context, chunk, bound_constraints);
+}
+
+void ScenarioRegistry::DeleteDeclaredKeys(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {
+	auto table = GetTablesTable(context, host_catalog);
+	if (!table) {
+		return;
+	}
+	vector<row_t> row_ids;
+	ScanDeclaredKeys(context, *table, scenario_id, [&](row_t row_id, const string &, vector<string>) {
+		row_ids.push_back(row_id);
+		return true;
+	});
+	if (row_ids.empty()) {
+		return;
+	}
+	MarkHostModified(context, host_catalog, DatabaseModificationType::DELETE_DATA);
+	auto &data_table = table->GetStorage();
+	auto binder = Binder::CreateBinder(context);
+	auto bound_constraints = binder->BindConstraints(*table);
+	auto delete_state = data_table.InitializeDelete(*table, context, bound_constraints);
+	for (idx_t offset = 0; offset < row_ids.size(); offset += STANDARD_VECTOR_SIZE) {
+		auto count = MinValue<idx_t>(STANDARD_VECTOR_SIZE, row_ids.size() - offset);
+		Vector row_id_vector(LogicalType::ROW_TYPE);
+		for (idx_t i = 0; i < count; i++) {
+			row_id_vector.SetValue(i, Value::BIGINT(row_ids[offset + i]));
+		}
+		data_table.Delete(*delete_state, context, row_id_vector, count);
+	}
 }
 
 bool ScenarioRegistry::Exists(ClientContext &context, Catalog &host_catalog) {

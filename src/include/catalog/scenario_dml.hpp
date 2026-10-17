@@ -168,10 +168,9 @@ PhysicalOperator &MakeScenarioDeleteOperator(PhysicalPlanGenerator &planner, vec
 static constexpr const char *SCENARIO_MERGE_OPERATION = "MERGE INTO";
 
 //! Keyless tables need a v0.4.1+ bag delta (with _count) for UPDATE, DELETE
-//! and MERGE INTO; throws otherwise
+//! and MERGE INTO; throws for a legacy delta (a missing one is created in the
+//! current layout by the first write)
 void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry);
-//! The error for writing a table created in the base after the scenario
-[[noreturn]] void ThrowTableCreatedAfterScenario(ScenarioTableEntry &entry);
 
 //! Source-side state for DML operators: emits either the affected-count row
 //! or, with RETURNING, the collected result rows

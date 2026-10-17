@@ -1,8 +1,12 @@
 #include "catalog/scenario_catalog.hpp"
 
+#include "catalog/scenario_delta.hpp"
 #include "catalog/scenario_registry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
+#include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/parser/parsed_data/create_index_info.hpp"
@@ -15,8 +19,17 @@ namespace duckdb {
 
 void ThrowScenarioDDLError() {
 	throw NotImplementedException(
-	    "DDL operations are not permitted in scenarios. Modify the base schema instead, then call "
-	    "scenario_refresh() to track any newly added tables");
+	    "DDL operations are not permitted in scenarios. Modify the base schema instead: tables added to the "
+	    "base become readable and writable in the scenario automatically");
+}
+
+//! Serializes the write registrations and delta creations of scenario sinks:
+//! their global states initialize on worker threads in parallel, and
+//! MetaTransaction::ModifyDatabase / DuckTransaction::SetModifications are
+//! not synchronized
+static mutex &ScenarioWriteLock() {
+	static mutex lock;
+	return lock;
 }
 
 ScenarioCatalog::ScenarioCatalog(AttachedDatabase &db, string scenario_name_p, string host_catalog_name_p,
@@ -183,10 +196,75 @@ void ScenarioCatalog::BeginWrite(ClientContext &context, const char *operation, 
 	// pipelines COPY FROM DATABASE plans). MetaTransaction::ModifyDatabase and
 	// DuckTransaction::SetModifications are not synchronized, so registrations
 	// - of every scenario, they may share one host transaction - take turns.
-	static mutex begin_write_lock;
-	lock_guard<mutex> guard(begin_write_lock);
+	lock_guard<mutex> guard(ScenarioWriteLock());
 	ThrowIfNotWritable(context, operation);
 	MarkHostWrite(context, type);
+}
+
+DuckTableEntry &ScenarioCatalog::GetOrCreateWriteDelta(ClientContext &context, ScenarioTableEntry &entry) {
+	auto &host_catalog = GetHostCatalog(context);
+	auto logical_name = ScenarioDelta::LogicalName(entry);
+	// sibling sinks of one statement (MERGE INTO actions, the INSERTs of
+	// COPY FROM DATABASE) may get here together for the same table
+	lock_guard<mutex> guard(ScenarioWriteLock());
+	auto existing = ScenarioDelta::TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
+	if (existing) {
+		return *existing;
+	}
+	if (!base_catalog_name.empty()) {
+		auto &base_catalog = GetBaseCatalog(context);
+		if (base_catalog.GetCatalogType() == "ducklake") {
+			// the scenario reads the lake AT its creation time: a table that
+			// is not in that snapshot is not part of the scenario's base
+			BoundAtClause at_clause("timestamp", Value::TIMESTAMP(created_at));
+			EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, entry.base_entry.name, &at_clause, QueryErrorContext());
+			optional_ptr<CatalogEntry> pinned;
+			try {
+				pinned = base_catalog.GetEntry(context, entry.base_entry.ParentSchema().name, lookup,
+				                               OnEntryNotFound::RETURN_NULL);
+			} catch (CatalogException &) {
+				pinned = nullptr; // e.g. the schema is not in the snapshot either
+			}
+			if (!pinned) {
+				throw InvalidInputException(
+				    "Cannot write to table '%s' of scenario '%s': the table is not in the scenario's base snapshot "
+				    "(DuckLake '%s' AT %s) - it was created in the lake later. Create a new scenario to modify it",
+				    logical_name, scenario_name, base_catalog_name, Timestamp::ToString(created_at));
+			}
+		}
+	}
+	// the identity the statement was bound with must still be the table's:
+	// a key declared (scenario_refresh) after this transaction cached the
+	// entry would otherwise yield a delta of a different shape
+	auto key_columns = ScenarioDelta::GetKeyColumns(context, host_catalog, scenario_id, logical_name, entry.base_entry);
+	if (key_columns != entry.key_columns) {
+		throw TransactionException("Cannot write to table '%s' of scenario '%s': its row identity was declared after "
+		                           "this transaction first used the table. Retry in a new transaction",
+		                           logical_name, scenario_name);
+	}
+	vector<string> declared_keys;
+	if (ScenarioDelta::GetPKColumns(entry.base_entry).empty()) {
+		for (auto key_column : key_columns) {
+			declared_keys.push_back(entry.base_entry.GetColumn(LogicalIndex(key_column)).Name());
+		}
+	}
+	// BeginWrite made the host this transaction's writer already (or, for a
+	// plan that registered this catalog itself, flagged the host transaction)
+	MarkHostWrite(context, DatabaseModificationType::CREATE_CATALOG_ENTRY);
+	auto writer = MetaTransaction::Get(context).ModifiedDatabase();
+	bool host_is_not_writer = writer && writer.get() == &GetAttached();
+	try {
+		return ScenarioDelta::EnsureDeltaTable(context, host_catalog, scenario_id, entry.base_entry,
+		                                       declared_keys.empty() ? nullptr : &declared_keys, &logical_name,
+		                                       host_is_not_writer);
+	} catch (TransactionException &) {
+		// a catalog write-write conflict: another transaction created this
+		// delta concurrently (uncommitted, or committed after we started)
+		throw TransactionException(
+		    "Cannot write to scenario '%s': another transaction concurrently made the first write to table '%s' "
+		    "and created its delta. ROLLBACK and retry the transaction",
+		    scenario_name, logical_name);
+	}
 }
 
 void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModificationType type) {

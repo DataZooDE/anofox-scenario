@@ -244,7 +244,8 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 			migrated_scenarios++;
 		}
 
-		// per-scenario: eager v2 deltas for all base tables + fold legacy deltas
+		// per-scenario: fold each legacy delta into a v2 delta (tables the
+		// legacy scenario never wrote get theirs on first write, #34)
 		auto &host_schema = host.GetSchema(context, DEFAULT_SCHEMA);
 		vector<reference<TableCatalogEntry>> base_tables;
 		host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
@@ -257,10 +258,10 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 		for (auto &legacy : scenarios) {
 			auto v2_id = id_map[legacy.id];
 			for (auto &base_table : base_tables) {
-				auto &v2_delta = ScenarioDelta::EnsureDeltaTable(context, host, v2_id, base_table.get());
 				auto legacy_delta =
 				    TryGetMainTable(context, host, legacy.schema_name, "_delta_" + base_table.get().name);
 				if (legacy_delta) {
+					auto &v2_delta = ScenarioDelta::EnsureDeltaTable(context, host, v2_id, base_table.get());
 					MigrateDeltaTable(context, host, *legacy_delta, v2_delta, base_table.get());
 				}
 			}
@@ -323,9 +324,8 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 				});
 				for (auto &snap_table : snap_tables) {
 					// legacy snapshot tables live in a _snap_* schema but are
-					// logically main-schema tables
-					ScenarioDelta::EnsureDeltaTable(context, host, entry.scenario_id, snap_table.get(), nullptr,
-					                                &snap_table.get().name);
+					// logically main-schema tables (their deltas come with
+					// the first write, #34)
 					ScenarioDelta::CreateMatTable(context, host, entry.scenario_id, snap_table.get(),
 					                              &snap_table.get().name);
 				}

@@ -47,6 +47,10 @@ public:
 	static constexpr const char *SCHEMA_NAME = "__anofox_scenario";
 	static constexpr const char *TABLE_NAME = "registry";
 	static constexpr const char *SEQUENCE_NAME = "registry_seq";
+	//! Declared row identity per (scenario, table): one row per table whose
+	//! key was declared (scenario_create / scenario_refresh key_columns :=).
+	//! Created lazily, like the registry, in the caller's transaction (#34)
+	static constexpr const char *TABLES_TABLE_NAME = "scenario_tables";
 
 	//! Create schema + sequence + registry table if they do not exist yet.
 	//! Runs in the caller's transaction.
@@ -76,9 +80,28 @@ public:
 	//! True if any scenario records the given id as its parent.
 	static bool HasChildren(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
 
+	//===--------------------------------------------------------------===//
+	// __anofox_scenario.scenario_tables (declared keys, #34)
+	//===--------------------------------------------------------------===//
+	//! The declared key of a scenario table (logical name), if one is recorded
+	static bool LookupDeclaredKey(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                              const string &table_name, vector<string> &key_columns);
+	//! Every declared key of a scenario: logical table name -> key column names
+	static map<string, vector<string>> ListDeclaredKeys(ClientContext &context, Catalog &host_catalog,
+	                                                   int64_t scenario_id);
+	//! Record a declared key (creates scenario_tables on first use); the
+	//! caller has checked that none is recorded for the table yet
+	static void InsertDeclaredKey(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                              const string &table_name, const vector<string> &key_columns);
+	//! Remove every declared key of a scenario (scenario_drop)
+	static void DeleteDeclaredKeys(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+
 private:
 	static optional_ptr<DuckTableEntry> GetRegistryTable(ClientContext &context, Catalog &host_catalog);
 	static DuckTableEntry &GetRegistryTableOrThrow(ClientContext &context, Catalog &host_catalog);
+	static optional_ptr<DuckTableEntry> GetTablesTable(ClientContext &context, Catalog &host_catalog);
+	//! Create scenario_tables if it does not exist yet (caller's transaction)
+	static DuckTableEntry &EnsureTablesTable(ClientContext &context, Catalog &host_catalog);
 };
 
 } // namespace duckdb
