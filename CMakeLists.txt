@@ -24,9 +24,10 @@ elseif(APPLE AND DEFINED OSX_BUILD_ARCH AND NOT "${OSX_BUILD_ARCH}" STREQUAL "${
 endif()
 
 # Feedback banner (header-only). Its banner_shown event goes through
-# posthog-telemetry, so the flag follows whether telemetry is compiled in at
-# all -- otherwise the banner header would include a telemetry.hpp that is not
-# on the path for this configuration.
+# posthog-telemetry. The banner enables it only if the posthog_telemetry target
+# exists at generate time, which is only when OpenSSL was found below. A local
+# build without vcpkg therefore links, with the banner's telemetry compiled out
+# (#33).
 set(DATAZOO_BANNER_TELEMETRY ${TELEMETRY_SUPPORTED} CACHE BOOL "" FORCE)
 set(DATAZOO_BANNER_TELEMETRY_INCLUDE_DIR
     ${CMAKE_CURRENT_SOURCE_DIR}/posthog-telemetry/include CACHE PATH "" FORCE)
