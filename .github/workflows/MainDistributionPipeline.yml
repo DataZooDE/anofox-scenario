@@ -1,7 +1,10 @@
 #
 # This workflow calls the main distribution pipeline from DuckDB to build, test and (optionally) release the extension
 #
-# The v2 scenario-catalog core targets DuckDB v1.5.x only (see
+# One source tree builds against DuckDB v1.5.6 and the DuckDB 2.0 pre-release
+# that duckdb/community-extensions builds `repo.ref` against (API differences
+# sit behind duckdb-compat and src/include/catalog/scenario_compat.hpp, see
+# docs/UPDATING.md). The v2 scenario-catalog core does not target v1.4 (see
 # docs/spec/implementation_plan_phase1.md §4: the catalog surface the
 # extension is built on - PlanMergeInto, EntryLookupInfo with at-clauses,
 # virtual columns - does not exist in the v1.4 line). The former v1.4.5 LTS
@@ -33,6 +36,22 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: anofox_scenario
       artifact_postfix: _v1.5.6
+      exclude_archs: windows_amd64_mingw
+
+  # Build against DuckDB 2.0: the commit duckdb/community-extensions pins as
+  # DUCKDB_LATEST_STABLE (keep the SHA in step with it). Build and test only:
+  # no smoke test (there is no stock 2.0 CLI to load the binary into) and no
+  # deploy (an alpha build only loads into that exact alpha). Pull requests
+  # build linux_amd64 and windows_amd64; run the workflow by hand
+  # (workflow_dispatch) for the full matrix incl. macOS.
+  duckdb-next-build:
+    name: Build extension binaries (v2.0 pre-release)
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v2.0-cyanoptera
+    with:
+      duckdb_version: b15358c371daf10dad799a43b6167f6ccdce84d8
+      ci_tools_version: v2.0-cyanoptera
+      extension_name: anofox_scenario
+      artifact_postfix: _v2.0
       exclude_archs: windows_amd64_mingw
 
   duckdb-v1_5_5-smoke-test:
