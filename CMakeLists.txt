@@ -10,6 +10,14 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
+# One source tree for DuckDB v1.5.6 and 2.0: API differences sit behind the
+# header-only shims of duckdb-compat (generic) and
+# src/include/catalog/scenario_compat.hpp (scenario-specific storage internals).
+# Include path only: DuckDB export()s the extension targets, so linking the
+# INTERFACE target would fail the generate step ("not in any export set").
+add_subdirectory(duckdb-compat)
+include_directories(duckdb-compat/include)
+
 # Add PostHog telemetry library (requires OpenSSL, not available for WASM/MinGW/cross-compile)
 set(TELEMETRY_SUPPORTED TRUE)
 if(DEFINED ENV{DUCKDB_WASM_PLATFORM} OR "${DUCKDB_EXPLICIT_PLATFORM}" MATCHES "^wasm" OR EMSCRIPTEN)
@@ -105,8 +113,10 @@ if(TELEMETRY_LIBS)
         target_link_libraries(${EXTENSION_NAME} ${TELEMETRY_LIBS} bcrypt)
         target_link_libraries(${LOADABLE_EXTENSION_NAME} ${TELEMETRY_LIBS} bcrypt)
     elseif(APPLE)
-        target_link_libraries(${EXTENSION_NAME} ${TELEMETRY_LIBS} "-framework CoreFoundation" "-framework SystemConfiguration")
-        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${TELEMETRY_LIBS} "-framework CoreFoundation" "-framework SystemConfiguration")
+        # Security: DuckDB 2.0's httplib (used by the telemetry client) reads the
+        # macOS keychain when built with OpenSSL
+        target_link_libraries(${EXTENSION_NAME} ${TELEMETRY_LIBS} "-framework CoreFoundation" "-framework SystemConfiguration" "-framework Security")
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${TELEMETRY_LIBS} "-framework CoreFoundation" "-framework SystemConfiguration" "-framework Security")
     else()
         target_link_libraries(${EXTENSION_NAME} ${TELEMETRY_LIBS})
         target_link_libraries(${LOADABLE_EXTENSION_NAME} ${TELEMETRY_LIBS})
@@ -134,6 +144,10 @@ if(NOT EMSCRIPTEN AND NOT CMAKE_VERSION VERSION_LESS "3.19")
         get_property(sources GLOBAL PROPERTY ANOFOX_SCENARIO_CPP_TESTS)
         if(TARGET unittest AND sources)
             target_sources(unittest PRIVATE ${sources})
+            # the built extension file, for lines that do not link it into
+            # unittest (DuckDB 2.0)
+            target_compile_definitions(unittest PRIVATE
+                ANOFOX_SCENARIO_EXTENSION_FILE="${CMAKE_BINARY_DIR}/extension/anofox_scenario/anofox_scenario.duckdb_extension")
         endif()
     endfunction()
     cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR} CALL anofox_scenario_add_cpp_tests)
