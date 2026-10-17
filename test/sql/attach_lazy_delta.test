@@ -64,6 +64,17 @@ SELECT name FROM s.products WHERE id = 2;
 ----
 gadget
 
+# only synthesized identity columns, on tables without a delta
+query I
+SELECT count(DISTINCT __scenario_rowno) FROM s.readings;
+----
+3
+
+query II
+SELECT min(__scenario_origin), count(*) FROM s.products;
+----
+0	3
+
 # readers treat a missing delta as empty
 query I
 SELECT count(*) FROM scenario_diff('plan', 'products');
