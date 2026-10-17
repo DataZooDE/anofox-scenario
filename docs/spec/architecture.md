@@ -30,7 +30,8 @@ only the rows a scenario changed, and reconstructs the scenario's view of the wo
 ```
 
 The delta table is a **changelog**: each row carries `_op` (`I`/`U`/`D`) plus the base columns.
-Its primary key is the base table's PK, or the `key_columns` declared at `scenario_create`.
+Its primary key is the base table's PK, or the `key_columns` declared at `scenario_create`. It is
+created by the table's first write, not by `scenario_create` (see *Delta lifecycle*).
 
 That single structure serves four consumers, which is why it is treated as a stable contract:
 
@@ -280,7 +281,8 @@ so uniqueness splits into three checks:
     appends, so the base accepts the reused values too.
 
 `ScenarioCatalog::BeginWrite` is the chokepoint enforcing the single-writer rule, the read-only
-checks and the frozen flag.
+checks and the frozen flag. The sinks then create the delta on their first chunk
+(`GetOrCreateWriteDelta`, see *Delta lifecycle*).
 
 ### Write attribution
 
@@ -329,6 +331,79 @@ checkpoint and write-write conflict detection are the host `DuckTransaction`'s, 
 
 ---
 
+## Delta lifecycle
+
+Delta tables are created **lazily**, by the first write to a scenario table (#34). `scenario_create`
+in delta mode only inserts the registry row (and one `scenario_tables` row per declared key), so it
+costs the same for 3 tables as for 3,000. Materialized mode still copies every base table at
+creation - that copy is its point - but its deltas are lazy too.
+
+**Creation.** Every write sink (insert, update, delete; `MERGE INTO` and `INSERT ... ON CONFLICT`
+run through them) calls `ScenarioCatalog::GetOrCreateWriteDelta` with its first non-empty chunk.
+That is at execution, after `BeginWrite` has run its checks and made the host the transaction's
+writer, so a frozen scenario, a read-only transaction, or a transaction that already wrote another
+database (the single-writer error) fails before anything is created. A statement that writes no
+rows never reaches it and creates nothing. The delta is created in the caller's transaction:
+`ROLLBACK` removes it, and the same transaction sees it at once. Creating a catalog entry bumps the
+host catalog version, so prepared statements rebind in that transaction.
+`GetOrCreateWriteDelta` runs under the same process-wide mutex as `BeginWrite`, because sibling
+sinks of one plan (a `MERGE`'s actions, the INSERTs of `COPY FROM DATABASE`) may reach it together.
+
+`COPY FROM DATABASE ... TO <scenario>` is the one statement that registers the *scenario* catalog
+as the transaction's writer (its binder registers the target catalog directly). `MarkHostWrite`
+then only flags the host transaction read-write, and DuckDB's schema refuses to add an entry to a
+database that is not the registered writer when the `CatalogTransaction` carries a client context
+(`DuckSchemaEntry::AddEntryInternal`). For that case the delta is created through a
+`CatalogTransaction` of the host transaction without the context. The entry still lands in the
+host transaction's undo buffer, so rollback, commit and the WAL behave as usual.
+
+**Identity.** `ScenarioDelta::GetKeyColumns` resolves a table's row identity in this order:
+
+1. a row in `__anofox_scenario.scenario_tables` - a key declared with `key_columns :=` at
+   `scenario_create` or `scenario_refresh`;
+2. the `PRIMARY KEY` of an existing delta (no PK there means a bag delta, i.e. keyless).
+   Scenarios created before #34 recorded declared keys only here, so they need no migration;
+3. the base table's `PRIMARY KEY`;
+4. none: keyless, and the first write creates a bag delta.
+
+The table entry resolves its identity once per transaction, and the delta is created with that
+identity. If a key was declared after the transaction bound the table (`scenario_refresh` in the
+same transaction), the shapes would disagree, so the write fails with a retryable
+`TransactionException`.
+
+**Concurrency.** Two transactions making the first write to the same table both try to create
+`s<id>_delta_<table>`. DuckDB's catalog lets only one of them create it: the other gets a
+write-write conflict, whether the winner has committed yet or committed after the loser's
+snapshot. `GetOrCreateWriteDelta` turns that into a `TransactionException` that names the
+scenario and the table and asks for a retry. The loser's transaction is aborted and nothing is
+half-created.
+
+**Bases.** The delta always lives in the host. For a DuckLake base, the scenario's base is the
+lake *at its creation time*. The scenario schema mirrors the live lake catalog, so a table created
+in the lake later is visible by name. Its first write therefore looks the table up `AT (TIMESTAMP
+=> created_at)` and refuses one that isn't in that snapshot. Overlay scenarios pick up tables
+added to the host base automatically. Materialized scenarios only see their copies.
+
+**Readers.** A missing delta is an empty changelog everywhere:
+
+- The scan binds no delta and passes the base through. Point lookups and the suppression probe
+  only run when a delta exists.
+- `scenario_diff` substitutes an empty relation in the delta layout. `scenario_diff_summary`,
+  `scenario_merge_preview` and `scenario_merge` enumerate the deltas that exist.
+- Branching copies only the parent deltas that exist (each into a child delta of the same
+  shape), plus the parent's `scenario_tables` rows. A child's declaration that differs from the
+  parent's declared key or delta shape is refused.
+- `scenario_drop` drops the deltas that exist and the scenario's `scenario_tables` rows. Freeze
+  doesn't touch deltas.
+- `scenario_migrate` creates a v2 delta only for a legacy delta it folds in. Migrated snapshots get
+  their materialized copies and no deltas.
+- The keyless legacy upgrade at `ATTACH` rewrites only the deltas that exist.
+
+`scenario_refresh` is deprecated. It no longer creates deltas. It only records `key_columns` for
+keyless tables that are not tracked yet (no `scenario_tables` row and no delta).
+
+---
+
 ## Storage layout
 
 All state lives in the host database. That is what keeps a `.duckdb` file self-contained — copy
@@ -338,7 +413,11 @@ the file and the branches travel with it.
 __anofox_scenario.registry              scenario_id, name, mode, frozen, parent_id,
                                         base_snapshot_id, created_at, merged_at, description
 __anofox_scenario.registry_seq          id sequence
-__anofox_scenario.s<id>_delta_<table>   the changelog described above
+__anofox_scenario.scenario_tables       scenario_id, table_name, key_columns VARCHAR[]
+                                        (PK scenario_id, table_name): declared keys, created
+                                        lazily by the first declaration
+__anofox_scenario.s<id>_delta_<table>   the changelog described above, created by the
+                                        table's first write
 __anofox_scenario.s<id>_mat_<table>     base copies, for mode := 'materialized' (columns, NOT NULL/
                                         CHECK/PK/UNIQUE + data; FOREIGN KEYs stripped: they would
                                         resolve inside this schema, and merge-back enforces them)
@@ -348,12 +427,13 @@ __anofox_scenario.s<id>_mat_<table>     base copies, for mode := 'materialized' 
 so a part that contains a dot (or starts with `"`) is double-quoted SQL-style, with inner quotes
 doubled (`ScenarioDelta::EncodeLogicalName` / `SplitLogicalName`). `"a.b"` is the `main` table
 `a.b`, while `a.b` is table `b` in schema `a`. Every other name is written exactly as before, so
-existing databases keep their internal table names. The registry stores no table list: the
-internal names *are* the record of which tables a scenario tracks. User-facing table names
-(`scenario_diff`, `key_columns`, `table_name` outputs) use the same spelling.
+existing databases keep their internal table names. The registry stores no table list: a
+scenario covers every table of its base, the internal delta names record which tables it has
+written, and `scenario_tables` records declared keys, keyed by the same logical name. User-facing
+table names (`scenario_diff`, `key_columns`, `table_name` outputs) use the same spelling.
 
-The registry is manipulated in the **caller's** transaction, so a rolled-back `scenario_create`
-leaves nothing behind.
+The registry and `scenario_tables` are manipulated in the **caller's** transaction, so a
+rolled-back `scenario_create` leaves nothing behind.
 
 ---
 
@@ -361,7 +441,7 @@ leaves nothing behind.
 
 | Tier | Created by | Isolation from later base changes | Cost |
 |------|-----------|-----------------------------------|------|
-| `overlay` (default) | `scenario_create(name)` | None — base churn shows through on keys the scenario never touched | O(#tables) metadata |
+| `overlay` (default) | `scenario_create(name)` | None — base churn shows through on keys the scenario never touched | O(1): one registry row, deltas on first write |
 | `materialized` | `mode := 'materialized'` | Complete | Full copy of every base table |
 | `snapshot` | `base := '<ducklake attach>'` | Complete — reads pinned via `AT (TIMESTAMP => created_at)` | O(1), no data copied |
 
@@ -463,9 +543,9 @@ On success the scenario ends frozen, with `merged_at` set and an empty delta.
 | `catalog/scenario_update_delete.cpp` | Update/delete sinks, op-transition matrix |
 | `catalog/scenario_merge_into.cpp` | `MERGE INTO` support |
 | `catalog/scenario_delta.cpp` | Delta and materialized table management |
-| `catalog/scenario_registry.cpp` | Registry, caller-transaction catalog ops |
+| `catalog/scenario_registry.cpp` | Registry and `scenario_tables`, caller-transaction catalog ops |
 | `catalog/scenario_transaction.cpp` | Transaction shim |
-| `lifecycle/scenario_lifecycle.cpp` | create / drop / freeze / unfreeze / list / refresh |
+| `lifecycle/scenario_lifecycle.cpp` | create / drop / freeze / unfreeze / list / refresh (deprecated) |
 | `lifecycle/scenario_diff.cpp` | Streaming diff engine |
 | `lifecycle/scenario_merge.cpp` | Merge-back planning and apply |
 | `lifecycle/scenario_migrate.cpp` | Legacy v0.1 → v2 migration |
