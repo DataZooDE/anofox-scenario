@@ -94,9 +94,8 @@ void Update(DT &storage, TableUpdateState &state, ClientContext &context, DuckTa
 }
 
 template <class DT>
-auto LocalAppend(DT &storage, LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
-                 DataChunk &chunk, bool unsafe, int)
-    -> decltype(storage.LocalAppend(state, table, context, chunk, unsafe)) {
+auto LocalAppend(DT &storage, LocalAppendState &state, DuckTableEntry &table, ClientContext &context, DataChunk &chunk,
+                 bool unsafe, int) -> decltype(storage.LocalAppend(state, table, context, chunk, unsafe)) {
 	storage.LocalAppend(state, table, context, chunk, unsafe);
 }
 template <class DT>
@@ -119,8 +118,8 @@ inline void TableUpdate(DataTable &storage, TableUpdateState &state, ClientConte
 }
 
 //! storage.LocalAppend(state, context, chunk, unsafe) of `table`'s storage
-inline void TableLocalAppend(DataTable &storage, LocalAppendState &state, DuckTableEntry &table,
-                             ClientContext &context, DataChunk &chunk, bool unsafe) {
+inline void TableLocalAppend(DataTable &storage, LocalAppendState &state, DuckTableEntry &table, ClientContext &context,
+                             DataChunk &chunk, bool unsafe) {
 	detail::LocalAppend(storage, state, table, context, chunk, unsafe, 0);
 }
 
@@ -354,8 +353,8 @@ unique_ptr<BoundIndex> CreateLocalDeleteIndex(A &art) {
 }
 
 template <class R>
-auto MakeUniqueMask(const R &entry, int) -> decltype(entry->VerifyAppend(entry, std::declval<DataChunk &>(), nullptr),
-                                                      unique_ptr<UniqueMaskV2<R>>()) {
+auto MakeUniqueMask(const R &entry, int)
+    -> decltype(entry->VerifyAppend(entry, std::declval<DataChunk &>(), nullptr), unique_ptr<UniqueMaskV2<R>>()) {
 	auto result = make_uniq<UniqueMaskV2<R>>();
 	result->entry = entry;
 	entry->InitializeLocalIndexes(result->delete_indexes, result->append_indexes);
@@ -684,16 +683,15 @@ auto MakeMergeInto(PhysicalPlanGenerator &planner, vector<LogicalType> &types, P
                    MergeIntoActions &actions, idx_t row_id_index, optional_idx source_marker, bool parallel,
                    bool return_chunk, int)
     -> decltype(OP(std::declval<PhysicalPlan &>(), types, child, std::move(actions), row_id_index, source_marker,
-                   parallel, return_chunk),
-                std::declval<PhysicalOperator &>()) {
+	               parallel, return_chunk),
+	            std::declval<PhysicalOperator &>()) {
 	return planner.Make<OP>(types, child, std::move(actions), row_id_index, source_marker, parallel, return_chunk);
 }
 template <class OP = PhysicalMergeInto>
 PhysicalOperator &MakeMergeInto(PhysicalPlanGenerator &planner, vector<LogicalType> &types, PhysicalOperator &child,
                                 MergeIntoActions &actions, idx_t row_id_index, optional_idx source_marker,
                                 bool parallel, bool return_chunk, long) {
-	auto &result =
-	    planner.Make<OP>(types, std::move(actions), row_id_index, source_marker, parallel, return_chunk);
+	auto &result = planner.Make<OP>(types, std::move(actions), row_id_index, source_marker, parallel, return_chunk);
 	result.children.push_back(child);
 	return result;
 }

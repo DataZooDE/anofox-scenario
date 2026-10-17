@@ -15,6 +15,7 @@
 #include "duckdb.hpp"
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "catalog/scenario_compat.hpp"
 
 namespace duckdb {
 
@@ -174,6 +175,9 @@ public:
 	void FetchRow(ClientContext &context, row_t row_id, const vector<StorageIndex> &column_ids, DataChunk &result);
 
 private:
+	//! True for the delta's key index: a bound unique ART on exactly the key columns
+	bool IsKeyIndex(const scenario_compat::IndexEntryRef &entry) const;
+
 	optional_ptr<DuckTableEntry> delta_table;
 	vector<idx_t> key_columns;
 	unordered_set<column_t> key_ids;

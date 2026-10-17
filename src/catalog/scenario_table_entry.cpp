@@ -12,7 +12,14 @@ namespace duckdb {
 
 ScenarioTableEntry::ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
                                        TableCatalogEntry &base_entry_p, bool for_binding)
-    : TableCatalogEntry(catalog, schema, info), base_entry(base_entry_p) {
+    // the column list is copied before the base constructor runs: on 1.5.6 it
+    // moves info.columns into its own member
+    : ScenarioTableEntry(catalog, schema, info, info.columns.Copy(), base_entry_p, for_binding) {
+}
+
+ScenarioTableEntry::ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
+                                       ColumnList columns_p, TableCatalogEntry &base_entry_p, bool for_binding)
+    : TableCatalogEntry(catalog, schema, info), base_entry(base_entry_p), scenario_columns(std::move(columns_p)) {
 	// Write attribution (#31). The binder registers DML against a non-temporary
 	// table as a modification of the table's catalog (bind_insert/update/delete/
 	// merge_into: RegisterDBModify), and MetaTransaction::ModifyDatabase allows
@@ -30,6 +37,10 @@ ScenarioTableEntry::ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &sch
 	// information_schema.tables.table_type), so catalog enumeration
 	// (ScenarioSchemaEntry::Scan) gets a variant without it.
 	temporary = for_binding;
+}
+
+const ColumnList &ScenarioTableEntry::GetColumns() const {
+	return scenario_columns;
 }
 
 unique_ptr<CreateInfo> ScenarioTableEntry::GetInfo() const {
@@ -79,15 +90,16 @@ vector<idx_t> ScenarioTableEntry::IdentityColumns() const {
 virtual_column_map_t ScenarioTableEntry::GetVirtualColumns() const {
 	auto result = TableCatalogEntry::GetVirtualColumns(); // rowid
 	result.insert(
-	    make_pair(SCENARIO_ORIGIN_COLUMN_ID, TableColumn("__scenario_origin", LogicalType::TINYINT)));
+	    make_pair(SCENARIO_ORIGIN_COLUMN_ID, TableColumn(dc::Ident("__scenario_origin"), LogicalType::TINYINT)));
 	auto identity = IdentityColumns();
 	for (idx_t k = 0; k < identity.size(); k++) {
 		auto &column = GetColumn(LogicalIndex(identity[k]));
 		result.insert(make_pair(SCENARIO_KEY_COLUMN_START + k,
-		                        TableColumn("__scenario_key_" + to_string(k), column.Type())));
+		                        TableColumn(dc::Ident("__scenario_key_" + to_string(k)), column.Type())));
 	}
 	if (key_columns.empty()) {
-		result.insert(make_pair(SCENARIO_ROWNO_COLUMN_ID, TableColumn("__scenario_rowno", LogicalType::BIGINT)));
+		result.insert(
+		    make_pair(SCENARIO_ROWNO_COLUMN_ID, TableColumn(dc::Ident("__scenario_rowno"), LogicalType::BIGINT)));
 	}
 	return result;
 }

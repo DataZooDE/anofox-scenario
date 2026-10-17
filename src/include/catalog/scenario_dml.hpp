@@ -137,8 +137,9 @@ private:
 
 	optional_ptr<ScenarioTableEntry> entry;
 	vector<idx_t> key_columns;
-	optional_ptr<IndexEntry> key_index;
-	vector<reference<IndexEntry>> secondary_indexes;
+	//! The base's unique ART on exactly the key columns (null = none)
+	scenario_compat::IndexEntryRef key_index {};
+	vector<scenario_compat::IndexEntryRef> secondary_indexes;
 };
 
 //! Operator factories (used by both the DML plan hooks and PlanMergeInto)

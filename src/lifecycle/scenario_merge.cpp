@@ -53,6 +53,16 @@ string QML(const string &value) {
 	return "'" + StringUtil::Replace(value, "'", "''") + "'";
 }
 
+//! Catalog names that do not convert to string implicitly (2.0's Identifier)
+template <class T, class = typename std::enable_if<!std::is_convertible<T, string>::value>::type>
+string QM(const T &identifier) {
+	return QM(dc::Str(identifier));
+}
+template <class T, class = typename std::enable_if<!std::is_convertible<T, string>::value>::type>
+string QML(const T &value) {
+	return QML(dc::Str(value));
+}
+
 Catalog &MergeHostCatalog(ClientContext &context) {
 	return Catalog::GetCatalog(context, DatabaseManager::GetDefaultDatabase(context));
 }
@@ -66,8 +76,8 @@ vector<pair<string, string>> ListDeltaTables(ClientContext &context, Catalog &ho
 		return result;
 	}
 	schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-		if (entry.type == CatalogType::TABLE_ENTRY && StringUtil::StartsWith(entry.name, prefix)) {
-			result.emplace_back(entry.name, entry.name.substr(prefix.size()));
+		if (entry.type == CatalogType::TABLE_ENTRY && StringUtil::StartsWith(dc::Str(entry.name), prefix)) {
+			result.emplace_back(dc::Str(entry.name), dc::Str(entry.name).substr(prefix.size()));
 		}
 	});
 	return result;
@@ -86,11 +96,11 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 	}
 
 	string sql;
-	auto host_prefix = QM(host.GetName()) + ".";
+	auto host_prefix = QM(dc::Str(host.GetName())) + ".";
 	auto internal_prefix = host_prefix + QM(ScenarioRegistry::SCHEMA_NAME) + ".";
 	optional_ptr<Catalog> preview_base = &host;
 	if (!entry->base_catalog.empty()) {
-		preview_base = Catalog::GetCatalogEntry(context, entry->base_catalog);
+		preview_base = Catalog::GetCatalogEntry(context, dc::Ident(entry->base_catalog));
 		if (!preview_base) {
 			throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", scenario_name,
 			                            entry->base_catalog);
@@ -100,14 +110,14 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 		auto &logical_name = delta_pair.second;
 		string schema_name, table_name;
 		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
-		auto base_entry = preview_base->GetEntry<TableCatalogEntry>(context, schema_name, table_name,
-		                                                            OnEntryNotFound::RETURN_NULL);
+		auto base_entry = dc::GetEntry<TableCatalogEntry>(*preview_base, context, schema_name, table_name,
+		                                                  OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			continue; // base table vanished; scenario_merge reports the error
 		}
 		auto pk_columns =
 		    ScenarioDelta::GetKeyColumns(context, host, entry->scenario_id, logical_name, *base_entry);
-		auto base_name = QM(preview_base->GetName()) + "." + QM(schema_name) + "." + QM(table_name);
+		auto base_name = QM(dc::Str(preview_base->GetName())) + "." + QM(schema_name) + "." + QM(table_name);
 		auto delta_ref = internal_prefix + QM(delta_pair.first);
 
 		// Scenarios with a creation snapshot (materialized: the mat copy;
@@ -214,9 +224,8 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 		sql = "SELECT CAST(NULL AS VARCHAR) AS table_name, CAST(NULL AS VARCHAR) AS key, CAST(NULL AS VARCHAR) AS "
 		      "action, CAST(false AS BOOLEAN) AS conflict WHERE 1 = 0";
 	}
-	Parser parser;
-	parser.ParseQuery(sql);
-	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+	auto statements = dc::ParseStatements(context, sql);
+	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statements[0]));
 	return make_uniq<SubqueryRef>(std::move(select));
 }
 
@@ -236,7 +245,7 @@ struct MergeState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> MergeBind(ClientContext &context, TableFunctionBindInput &input,
-                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                   vector<LogicalType> &return_types, dc::BindNames &names) {
 	auto result = make_uniq<MergeBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("Scenario name cannot be NULL");
@@ -294,11 +303,11 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 		throw NotImplementedException(
 		    "Merging scenario '%s' into base catalog '%s' requires autocommit: the two catalogs cannot commit in "
 		    "one transaction (single-writer rule)",
-		    entry.name, entry.base_catalog);
+		    dc::Str(entry.name), entry.base_catalog);
 	}
-	auto base_catalog = Catalog::GetCatalogEntry(context, entry.base_catalog);
+	auto base_catalog = Catalog::GetCatalogEntry(context, dc::Ident(entry.base_catalog));
 	if (!base_catalog) {
-		throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", entry.name,
+		throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", dc::Str(entry.name),
 		                            entry.base_catalog);
 	}
 
@@ -318,7 +327,7 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 		return NumericCast<idx_t>(chunk->GetValue(0, 0).GetValue<int64_t>());
 	};
 
-	auto host_prefix = QM(host.GetName()) + ".";
+	auto host_prefix = QM(dc::Str(host.GetName())) + ".";
 	auto internal_prefix = host_prefix + QM(ScenarioRegistry::SCHEMA_NAME) + ".";
 	auto delta_tables = ListDeltaTables(context, host, entry.scenario_id);
 	std::sort(delta_tables.begin(), delta_tables.end());
@@ -358,9 +367,10 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 			if (kv["delta"] != fingerprint) {
 				throw InvalidInputException(
 				    "Cannot merge scenario '%s': it was already applied to base catalog '%s' (snapshot %s), but its "
-				    "delta changed since, after the merge's host bookkeeping failed. Inspect the lake and the scenario, "
+				    "delta changed since, after the merge's host bookkeeping failed. Inspect the lake and the "
+				    "scenario, "
 				    "then merge the remaining changes by hand",
-				    entry.name, entry.base_catalog, snapshot_id);
+				    dc::Str(entry.name), entry.base_catalog, snapshot_id);
 			}
 			// already applied: report the original counts, finish the host side
 			tables_changed += std::stoull(kv["tables_changed"]);
@@ -374,12 +384,12 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 		auto &logical_name = delta_pair.second;
 		string schema_name, table_name;
 		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
-		auto base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, schema_name, table_name,
-		                                                            OnEntryNotFound::RETURN_NULL);
+		auto base_entry = dc::GetEntry<TableCatalogEntry>(*base_catalog, context, schema_name, table_name,
+		                                                  OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
 			con.Rollback();
 			throw InvalidInputException("Cannot merge scenario '%s': base table '%s' no longer exists in '%s'",
-			                            entry.name, logical_name, entry.base_catalog);
+			                            dc::Str(entry.name), logical_name, entry.base_catalog);
 		}
 		auto delta_ref = internal_prefix + QM(delta_pair.first);
 		auto base_ref = QM(base_catalog->GetName()) + "." + QM(schema_name) + "." + QM(table_name);
@@ -412,7 +422,7 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 			bool rowid_shadowed = false;
 			string cols, b_cols, n_cols, match_b, match_m;
 			for (auto &col : base_entry->GetColumns().Logical()) {
-				if (StringUtil::CIEquals(col.Name(), "rowid")) {
+				if (StringUtil::CIEquals(dc::Str(col.Name()), "rowid")) {
 					rowid_shadowed = true;
 				}
 				auto name = QM(col.Name());
@@ -447,7 +457,7 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 				throw ConstraintException(
 				    "Cannot merge scenario '%s': the base changed underneath it (e.g. the copies of row %s of "
 				    "keyless table '%s'). Rerun with on_conflict := 'ours' (scenario wins) or 'theirs' (base wins)",
-				    entry.name, sample_row, logical_name);
+				    dc::Str(entry.name), sample_row, logical_name);
 			}
 			conflicts_resolved += n_conflicts;
 			// copies to delete / add per value: clean values apply the net;
@@ -562,7 +572,7 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 			throw ConstraintException(
 			    "Cannot merge scenario '%s': the base changed underneath it (e.g. key %s of table '%s'). Rerun "
 			    "with on_conflict := 'ours' (scenario wins) or 'theirs' (base wins)",
-			    entry.name, sample_key, logical_name);
+			    dc::Str(entry.name), sample_key, logical_name);
 		}
 		conflicts_resolved += n_conflicts;
 
@@ -615,6 +625,7 @@ static void RegisterDeletedBaseRows(ClientContext &context, DuckTableEntry &base
 			fetch_row_ids.SetValue(i, Value::BIGINT(row_ids[offset + i]));
 		}
 		ColumnFetchState fetch_state;
+		dc::SetVectorSize(fetch_row_ids, batch);
 		base_storage.Fetch(transaction, deleted_chunk, all_cols, fetch_row_ids, batch, fetch_state);
 		LocalAppendState append_state;
 		base_storage.InitializeLocalAppend(append_state, base_duck, context, base_constraints);
@@ -627,7 +638,7 @@ static void RegisterDeletedBaseRows(ClientContext &context, DuckTableEntry &base
 void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<MergeState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -636,10 +647,10 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 
 	auto entry = ScenarioRegistry::Lookup(context, host, bind_data.name);
 	if (!entry) {
-		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
+		throw InvalidInputException("Scenario '%s' not found", dc::Str(bind_data.name));
 	}
 	if (entry->has_merged_at) {
-		throw InvalidInputException("Scenario '%s' was already merged back into the base", bind_data.name);
+		throw InvalidInputException("Scenario '%s' was already merged back into the base", dc::Str(bind_data.name));
 	}
 	// Materialized scenarios merge like delta scenarios (writes live in the
 	// delta; the mat tables are the immutable creation snapshot) - and the
@@ -647,10 +658,11 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	// touched row is a conflict even when the overlay model cannot see it.
 	bool is_materialized = entry->mode == "materialized";
 	if (entry->frozen) {
-		throw InvalidInputException("Scenario '%s' is frozen. Unfreeze it before merging", bind_data.name);
+		throw InvalidInputException("Scenario '%s' is frozen. Unfreeze it before merging", dc::Str(bind_data.name));
 	}
 	if (ScenarioRegistry::HasChildren(context, host, entry->scenario_id)) {
-		throw InvalidInputException("Cannot merge scenario '%s': other scenarios branch from it", bind_data.name);
+		throw InvalidInputException("Cannot merge scenario '%s': other scenarios branch from it",
+		                            dc::Str(bind_data.name));
 	}
 	MetaTransaction::Get(context).ModifyDatabase(
 	    host.GetAttached(), DatabaseModificationType::INSERT_DATA | DatabaseModificationType::UPDATE_DATA |
@@ -695,7 +707,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				for (idx_t i = 0; i < batch; i++) {
 					row_ids.SetValue(i, Value::BIGINT(delta_row_ids[offset + i]));
 				}
-				delta_storage.Delete(*delete_state, context, row_ids, batch);
+				dc::SetVectorSize(row_ids, batch);
+				scenario_compat::TableDelete(delta_storage, *delete_state, context, *delta_entry, row_ids, batch);
 				offset += batch;
 			}
 		}
@@ -704,7 +717,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
 		output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
 		output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
-		output.SetCardinality(1);
+		output.SetChildCardinality(1);
 		return;
 	}
 
@@ -753,10 +766,10 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		string schema_name, table_name;
 		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
 		auto base_entry =
-		    host.GetEntry<TableCatalogEntry>(context, schema_name, table_name, OnEntryNotFound::RETURN_NULL);
+		    dc::GetEntry<TableCatalogEntry>(host, context, schema_name, table_name, OnEntryNotFound::RETURN_NULL);
 		if (!base_entry) {
-			throw InvalidInputException(
-			    "Cannot merge scenario '%s': base table '%s' no longer exists", bind_data.name, logical_name);
+			throw InvalidInputException("Cannot merge scenario '%s': base table '%s' no longer exists",
+			                            dc::Str(bind_data.name), logical_name);
 		}
 		auto &base_duck = base_entry->Cast<DuckTableEntry>();
 		auto pk_columns =
@@ -888,7 +901,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 						throw ConstraintException(
 						    "Cannot merge scenario '%s': the base changed underneath it (e.g. key %s of table "
 						    "'%s'). Rerun with on_conflict := 'ours' (scenario wins) or 'theirs' (base wins)",
-						    bind_data.name, key, logical_name);
+						    dc::Str(bind_data.name), key, logical_name);
 					}
 					if (bind_data.policy == MergeConflictPolicy::THEIRS) {
 						continue; // base wins: drop the delta row
@@ -945,7 +958,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 					for (idx_t i = 0; i < batch; i++) {
 						row_ids.SetValue(i, Value::BIGINT(base_rows_to_delete[offset + i]));
 					}
-					base_storage.Delete(*delete_state, context, row_ids, batch);
+					dc::SetVectorSize(row_ids, batch);
+					scenario_compat::TableDelete(base_storage, *delete_state, context, base_duck, row_ids, batch);
 					offset += batch;
 				}
 			}
@@ -959,7 +973,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 					if (count == 0) {
 						return;
 					}
-					append_chunk.SetCardinality(count);
+					append_chunk.SetChildCardinality(count);
 					base_storage.LocalAppend(base_duck, context, append_chunk, base_constraints);
 					append_chunk.Reset();
 					count = 0;
@@ -1082,7 +1096,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 						    "Cannot merge scenario '%s': the base changed underneath it (e.g. the copies of row (%s) "
 						    "of keyless table '%s'). Rerun with on_conflict := 'ours' (scenario wins) or 'theirs' "
 						    "(base wins)",
-						    bind_data.name, rendered, logical_name);
+						    dc::Str(bind_data.name), rendered, logical_name);
 					}
 					if (bind_data.policy == MergeConflictPolicy::THEIRS) {
 						del = 0;
@@ -1111,7 +1125,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 					for (idx_t i = 0; i < batch; i++) {
 						row_ids.SetValue(i, Value::BIGINT(base_rows_to_delete[offset + i]));
 					}
-					base_storage.Delete(*delete_state, context, row_ids, batch);
+					dc::SetVectorSize(row_ids, batch);
+					scenario_compat::TableDelete(base_storage, *delete_state, context, base_duck, row_ids, batch);
 					offset += batch;
 				}
 				rows_applied += base_rows_to_delete.size();
@@ -1124,7 +1139,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				if (count == 0) {
 					return;
 				}
-				append_chunk.SetCardinality(count);
+				append_chunk.SetChildCardinality(count);
 				base_duck.GetStorage().LocalAppend(base_duck, context, append_chunk, base_constraints);
 				append_chunk.Reset();
 				count = 0;
@@ -1164,7 +1179,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			for (idx_t i = 0; i < batch; i++) {
 				row_ids.SetValue(i, Value::BIGINT(delta_row_ids[offset + i]));
 			}
-			delta_table.GetStorage().Delete(*delete_state, context, row_ids, batch);
+			dc::SetVectorSize(row_ids, batch);
+			scenario_compat::TableDelete(delta_table.GetStorage(), *delete_state, context, delta_table, row_ids, batch);
 			offset += batch;
 		}
 	}
@@ -1174,7 +1190,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
 	output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
 	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 } // namespace
@@ -1182,6 +1198,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 void ScenarioMergeBack::RegisterFunctions(ExtensionLoader &loader) {
 	// Descriptions come from the function table in README.md.
 	TableFunction preview("scenario_merge_preview", {LogicalType::VARCHAR}, nullptr);
+	dc::NameParameters(preview, {"scenario"});
 	preview.bind_replace = MergePreviewBindReplace;
 	{
 		CreateTableFunctionInfo info(std::move(preview));
@@ -1198,7 +1215,8 @@ void ScenarioMergeBack::RegisterFunctions(ExtensionLoader &loader) {
 
 	TableFunction merge("scenario_merge", {LogicalType::VARCHAR}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, MergeExecute),
 	                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, MergeBind), MergeInit);
-	merge.named_parameters["on_conflict"] = LogicalType::VARCHAR;
+	dc::NameParameters(merge, {"scenario"});
+	dc::AddNamedParameter(merge, "on_conflict", LogicalType::VARCHAR);
 	{
 		CreateTableFunctionInfo info(std::move(merge));
 		FunctionDescription desc;

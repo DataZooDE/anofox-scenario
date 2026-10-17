@@ -26,7 +26,7 @@ bool ScenarioSchemaEntry::ShouldExpose(CatalogEntry &base_entry) {
 		return false;
 	}
 	// Hide the legacy v0.1 metadata tables from scenario reads
-	if (StringUtil::StartsWith(base_entry.name, "_scenario_")) {
+	if (StringUtil::StartsWith(dc::Str(base_entry.name), "_scenario_")) {
 		return false;
 	}
 	return true;
@@ -36,7 +36,7 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateViewEntry(ClientContext &context, 
 	auto &scenario_catalog = GetScenarioCatalog();
 	auto &transaction = scenario_catalog.GetScenarioTransaction(context);
 
-	auto qualified = QualifiedName(base_view.name);
+	auto qualified = QualifiedName(dc::Str(base_view.name));
 	auto cached = transaction.FindEntry(qualified);
 	if (cached) {
 		return *cached;
@@ -48,20 +48,20 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateViewEntry(ClientContext &context, 
 	// references keep pointing wherever they point (documented).
 	auto create_info = base_view.GetInfo();
 	auto &view_info = create_info->Cast<CreateViewInfo>();
-	view_info.catalog = scenario_catalog.GetName();
-	view_info.schema = name;
+	dc::SetCatalog(view_info, dc::Str(scenario_catalog.GetName()));
+	dc::SetSchema(view_info, dc::Str(name));
 
 	return transaction.PublishEntry(qualified, make_uniq<ViewCatalogEntry>(scenario_catalog, *this, view_info));
 }
 
 string ScenarioSchemaEntry::QualifiedName(const string &table_name) const {
 	// the delta/mat naming contract (ScenarioDelta::LogicalName)
-	return ScenarioDelta::EncodeLogicalName(name, table_name);
+	return ScenarioDelta::EncodeLogicalName(dc::Str(name), table_name);
 }
 
 CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntry(ClientContext &context, TableCatalogEntry &base_table,
                                                          bool for_binding) {
-	return GetOrCreateTableEntryAs(context, base_table, base_table.name, for_binding);
+	return GetOrCreateTableEntryAs(context, base_table, dc::Str(base_table.name), for_binding);
 }
 
 CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &context, TableCatalogEntry &base_table,
@@ -83,9 +83,7 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	// bases the physical name (s<id>_mat_<t>) is replaced by the logical one.
 	auto create_info = base_table.GetInfo();
 	auto &table_info = create_info->Cast<CreateTableInfo>();
-	table_info.catalog = scenario_catalog.GetName();
-	table_info.schema = name;
-	table_info.table = table_name;
+	dc::SetQualifiedName(table_info, dc::Str(scenario_catalog.GetName()), dc::Str(name), table_name);
 
 	auto entry = make_uniq<ScenarioTableEntry>(scenario_catalog, *this, table_info, base_table, for_binding);
 	try {
@@ -147,12 +145,13 @@ void ScenarioSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		// the schema's scan holds its catalog lock (deadlock)
 		vector<pair<reference<TableCatalogEntry>, string>> mat_tables;
 		internal_schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &mat_entry) {
-			if (mat_entry.type != CatalogType::TABLE_ENTRY || !StringUtil::StartsWith(mat_entry.name, prefix)) {
+			if (mat_entry.type != CatalogType::TABLE_ENTRY ||
+			    !StringUtil::StartsWith(dc::Str(mat_entry.name), prefix)) {
 				return;
 			}
 			string schema_name, table_name;
-			ScenarioDelta::SplitLogicalName(mat_entry.name.substr(prefix.size()), schema_name, table_name);
-			if (schema_name != name) {
+			ScenarioDelta::SplitLogicalName(dc::Str(mat_entry.name).substr(prefix.size()), schema_name, table_name);
+			if (schema_name != dc::Str(name)) {
 				return; // belongs to another mirrored schema
 			}
 			mat_tables.emplace_back(mat_entry.Cast<TableCatalogEntry>(), std::move(table_name));
@@ -195,6 +194,7 @@ optional_ptr<CatalogEntry> ScenarioSchemaEntry::LookupEntry(CatalogTransaction t
 	auto &context = *transaction.context;
 	auto &scenario_catalog = GetScenarioCatalog();
 	auto &host_catalog = scenario_catalog.GetHostCatalog(context);
+	ScenarioClientState::Get(context); // see ScenarioConnectionCallback
 
 	if (scenario_catalog.mat_base_scenario_id >= 0) {
 		// Materialized base: resolve against the frozen copy
@@ -212,7 +212,7 @@ optional_ptr<CatalogEntry> ScenarioSchemaEntry::LookupEntry(CatalogTransaction t
 	if (!base_schema) {
 		return nullptr;
 	}
-	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, lookup_info.GetEntryName());
+	EntryLookupInfo table_lookup(CatalogType::TABLE_ENTRY, dc::EntryName(dc::Str(lookup_info.GetEntryName())));
 	auto base_entry = base_schema->LookupEntry(base_catalog.GetCatalogTransaction(context), table_lookup);
 	if (!base_entry || !ShouldExpose(*base_entry)) {
 		return nullptr;
