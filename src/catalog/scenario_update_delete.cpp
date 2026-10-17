@@ -12,8 +12,10 @@
 
 #include "catalog/scenario_catalog.hpp"
 #include "catalog/scenario_delta.hpp"
+#include "catalog/scenario_registry.hpp"
 #include "catalog/scenario_dml.hpp"
 
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/value_operations/value_operations.hpp"
@@ -180,7 +182,7 @@ public:
 			throw ConstraintException(
 			    "Duplicate key violates primary key constraint on scenario table \"%s\": the key exists in the "
 			    "base table",
-			    entry.name);
+			    dc::Str(entry.name));
 		}
 	}
 
@@ -215,6 +217,7 @@ public:
 				fetch_rowids.SetValue(i, Value::BIGINT(row_ids[offset + i]));
 			}
 			ColumnFetchState fetch_state;
+			dc::SetVectorSize(fetch_rowids, batch);
 			storage.Fetch(transaction, fetched, fetch_columns, fetch_rowids, batch, fetch_state);
 			for (idx_t i = 0; i < batch; i++) {
 				vector<Value> row_values;
@@ -256,6 +259,7 @@ public:
 				fetch_rowids.SetValue(i, Value::BIGINT(row_ids[offset + i]));
 			}
 			ColumnFetchState fetch_state;
+			dc::SetVectorSize(fetch_rowids, batch);
 			storage.Fetch(transaction, fetched, fetch_columns, fetch_rowids, batch, fetch_state);
 			for (idx_t i = 0; i < batch; i++) {
 				vector<Value> row_values;
@@ -293,7 +297,7 @@ public:
 					deleted_chunk.SetValue(ScenarioDelta::PAYLOAD_START + col, i, deleted_rows[i][col]);
 				}
 			}
-			deleted_chunk.SetCardinality(deleted_rows.size());
+			deleted_chunk.SetChildCardinality(deleted_rows.size());
 			deleted_chunk_ptr = &deleted_chunk;
 		}
 		idx_t offset = 0;
@@ -311,7 +315,7 @@ public:
 					delta_chunk.SetValue(delta_count_column.GetIndex(), i, Value::BIGINT(1));
 				}
 			}
-			delta_chunk.SetCardinality(batch);
+			delta_chunk.SetChildCardinality(batch);
 			ScenarioDeltaAppendChunk(client, *delta_table, delta_constraints, delta_chunk,
 			                         offset == 0 ? deleted_row_ids : vector<row_t>(), deleted_chunk_ptr);
 			offset += batch;
@@ -332,7 +336,8 @@ public:
 			for (idx_t i = 0; i < batch; i++) {
 				row_ids.SetValue(i, Value::BIGINT(row_ids_to_delete[offset + i]));
 			}
-			storage.Delete(*delete_state, client, row_ids, batch);
+			dc::SetVectorSize(row_ids, batch);
+			scenario_compat::TableDelete(storage, *delete_state, client, *delta_table, row_ids, batch);
 			offset += batch;
 		}
 	}
@@ -361,7 +366,7 @@ SourceResultType ScenarioDMLGetData(const ScenarioDMLGlobalState &gstate, bool r
 	}
 	source.count_emitted = true;
 	chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.affected_count)));
-	chunk.SetCardinality(1);
+	chunk.SetChildCardinality(1);
 	return SourceResultType::FINISHED;
 }
 
@@ -436,6 +441,7 @@ protected:
 
 SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk &chunk,
                                             OperatorSinkInput &input) const {
+	lock_guard<mutex> sink_guard(ScenarioClientState::Get(context.client).sink_lock);
 	auto &gstate = input.global_state.Cast<ScenarioDMLGlobalState>();
 	auto &client = context.client;
 	if (chunk.size() == 0) {
@@ -449,7 +455,7 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 	auto table_column_count = entry.GetColumns().PhysicalColumnCount();
 	DataChunk full_chunk;
 	full_chunk.Initialize(Allocator::Get(client), entry.GetTypes());
-	full_chunk.SetCardinality(chunk.size());
+	full_chunk.SetChildCardinality(chunk.size());
 	ExpressionExecutor default_executor(client, bound_defaults);
 	default_executor.SetChunk(chunk);
 	for (idx_t i = 0; i < expressions.size(); i++) {
@@ -459,7 +465,7 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 			continue;
 		}
 		auto &binding = expressions[i]->Cast<BoundReferenceExpression>();
-		full_chunk.data[target_column].Reference(chunk.data[binding.index]);
+		full_chunk.data[target_column].Reference(chunk.data[dc::ReferenceIndex(binding)]);
 	}
 	(void)table_column_count;
 
@@ -650,7 +656,7 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 				throw ConstraintException(
 				    "Duplicate key violates primary key constraint on scenario table \"%s\": the key was "
 				    "already inserted or modified in this scenario",
-				    entry.name);
+				    dc::Str(entry.name));
 			}
 		} else {
 			// must not collide with a visible base row
@@ -726,7 +732,7 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 				throw ConstraintException(
 				    "Duplicate value violates a UNIQUE constraint on scenario table \"%s\": the value exists in "
 				    "the base table",
-				    entry.name);
+				    dc::Str(entry.name));
 			}
 		}
 	}
@@ -806,6 +812,7 @@ protected:
 
 SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk &chunk,
                                             OperatorSinkInput &input) const {
+	lock_guard<mutex> sink_guard(ScenarioClientState::Get(context.client).sink_lock);
 	auto &gstate = input.global_state.Cast<ScenarioDMLGlobalState>();
 	auto &client = context.client;
 	if (chunk.size() == 0) {
@@ -847,7 +854,7 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 					out_chunk.SetValue(col, i, bag_rows[i][col]);
 				}
 			}
-			out_chunk.SetCardinality(bag_rows.size());
+			out_chunk.SetChildCardinality(bag_rows.size());
 			gstate.return_collection->Append(out_chunk);
 		}
 		gstate.FlushAppends(client, entry, bag_ops, bag_rows);
@@ -914,6 +921,7 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 			for (idx_t i = 0; i < rowids.size(); i++) {
 				fetch_rowids.SetValue(i, Value::BIGINT(rowids[i]));
 			}
+			dc::SetVectorSize(fetch_rowids, rowids.size());
 			ColumnFetchState fetch_state;
 			storage.Fetch(transaction, fetched, fetch_columns, fetch_rowids, rowids.size(), fetch_state);
 			for (idx_t i = 0; i < rowids.size(); i++) {
@@ -991,7 +999,7 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 				out_chunk.SetValue(col, i, returning_rows[i][col]);
 			}
 		}
-		out_chunk.SetCardinality(returning_rows.size());
+		out_chunk.SetChildCardinality(returning_rows.size());
 		gstate.return_collection->Append(out_chunk);
 	}
 	return SinkResultType::NEED_MORE_INPUT;
@@ -1050,13 +1058,13 @@ void ThrowIfKeylessUnsupported(ClientContext &context, ScenarioTableEntry &entry
 			// the real obstacle: nothing could be written here anyway
 			throw InvalidInputException(
 			    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode",
-			    scenario_catalog.scenario_name, host_db.GetName());
+			    scenario_catalog.scenario_name, dc::Str(host_db.GetName()));
 		}
 		throw NotImplementedException(
 		    "UPDATE/DELETE/MERGE on keyless table '%s' needs its pre-v0.4.1 delta upgraded (it lacks the _count "
 		    "column), which happens at ATTACH. DETACH and re-ATTACH the scenario outside an explicit "
 		    "transaction, with its host database writable",
-		    entry.name);
+		    dc::Str(entry.name));
 	}
 }
 
@@ -1098,7 +1106,7 @@ PhysicalOperator &ScenarioCatalog::PlanDelete(ClientContext &context, PhysicalPl
 	// (e.g. __scenario_rowno) already projected it, and the binder reuses it.
 	vector<idx_t> row_id_positions;
 	for (auto &expr : op.expressions) {
-		row_id_positions.push_back(expr->Cast<BoundReferenceExpression>().index);
+		row_id_positions.push_back(dc::ReferenceIndex(expr->Cast<BoundReferenceExpression>()));
 	}
 	if (row_id_positions.size() != entry.GetRowIdColumns().size()) {
 		throw InternalException("anofox_scenario: DELETE row-id column count mismatch");

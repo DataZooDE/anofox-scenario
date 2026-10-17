@@ -116,14 +116,14 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	}
 
 	DiffTarget target;
-	auto host_prefix = Q(host_catalog.GetName()) + ".";
+	auto host_prefix = Q(dc::Str(host_catalog.GetName())) + ".";
 
 	// Origin: the base catalog the scenario reads, pinned when versioned. A
 	// materialized side reads its copy instead, so it needs the catalog only
 	// for a 'main' side (origin_name stays empty when it is not attached)
 	optional_ptr<Catalog> base_catalog = &host_catalog;
 	if (!entry->base_catalog.empty()) {
-		base_catalog = Catalog::GetCatalogEntry(context, entry->base_catalog);
+		base_catalog = Catalog::GetCatalogEntry(context, dc::Ident(entry->base_catalog));
 		if (!base_catalog && mat_base_id < 0) {
 			throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached - ATTACH it first",
 			                            scenario_name, entry->base_catalog);
@@ -134,7 +134,7 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	ScenarioDelta::SplitLogicalName(table_name, schema_name, plain_name);
 	auto &origin_at = target.origin_at;
 	if (base_catalog) {
-		target.origin_name = Q(base_catalog->GetName()) + "." + Q(schema_name) + "." + Q(plain_name);
+		target.origin_name = Q(dc::Str(base_catalog->GetName())) + "." + Q(schema_name) + "." + Q(plain_name);
 		if (base_catalog->GetCatalogType() == "ducklake") {
 			origin_at = " AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry->created_at) + "')";
 		}
@@ -147,11 +147,11 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 			throw InvalidInputException("Table '%s' not found in scenario '%s'", table_name, scenario_name);
 		}
 		base_entry = mat.get();
-		target.base_name = host_prefix + Q(ScenarioRegistry::SCHEMA_NAME) + "." + Q(mat->name);
+		target.base_name = host_prefix + Q(ScenarioRegistry::SCHEMA_NAME) + "." + Q(dc::Str(mat->name));
 	} else {
 		// Phase 4: the base may live in another attached catalog
-		base_entry = base_catalog->GetEntry<TableCatalogEntry>(context, schema_name, plain_name,
-		                                                       OnEntryNotFound::RETURN_NULL);
+		base_entry = dc::GetEntry<TableCatalogEntry>(*base_catalog, context, schema_name, plain_name,
+		                                             OnEntryNotFound::RETURN_NULL);
 		if (base_entry && base_catalog->GetCatalogType() == "ducklake") {
 			// the scenario's base is the lake AT its creation time: a table
 			// created later is not part of it, and the diff reads the
@@ -166,8 +166,8 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 			throw InvalidInputException("Table '%s' not found in the base schema", table_name);
 		}
 		table_name = ScenarioDelta::LogicalName(*base_entry);
-		target.origin_name = Q(base_catalog->GetName()) + "." + Q(base_entry->ParentSchema().name) + "." +
-		                     Q(base_entry->name);
+		target.origin_name = Q(dc::Str(base_catalog->GetName())) + "." + Q(dc::Str(base_entry->ParentSchema().name)) +
+		                     "." + Q(dc::Str(base_entry->name));
 		target.base_name = target.origin_name;
 		target.base_at = origin_at;
 	}
@@ -194,9 +194,9 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	unordered_set<idx_t> pk_set(pk_columns.begin(), pk_columns.end());
 	for (auto &col : base_entry->GetColumns().Logical()) {
 		if (target.keyless || pk_set.find(col.Logical().index) != pk_set.end()) {
-			target.pk_columns.push_back(col.Name());
+			target.pk_columns.push_back(dc::Str(col.Name()));
 		} else {
-			target.payload_columns.push_back(col.Name());
+			target.payload_columns.push_back(dc::Str(col.Name()));
 		}
 	}
 	return target;
@@ -246,12 +246,11 @@ string MergedRelationSQL(ClientContext &context, const string &side, const strin
 }
 
 unique_ptr<TableRef> SQLToSubquery(ClientContext &context, const string &sql) {
-	Parser parser;
-	parser.ParseQuery(sql);
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
+	auto statements = dc::ParseStatements(context, sql);
+	if (statements.size() != 1 || statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw InternalException("anofox_scenario: generated diff SQL did not parse to a single SELECT");
 	}
-	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(parser.statements[0]));
+	auto select = unique_ptr_cast<SQLStatement, SelectStatement>(std::move(statements[0]));
 	return make_uniq<SubqueryRef>(std::move(select));
 }
 
@@ -386,14 +385,15 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 	auto schema = host_catalog.GetSchema(context, ScenarioRegistry::SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
 	if (schema) {
 		schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
-			if (table_entry.type == CatalogType::TABLE_ENTRY && StringUtil::StartsWith(table_entry.name, prefix)) {
-				tables.push_back(table_entry.name);
+			if (table_entry.type == CatalogType::TABLE_ENTRY &&
+			    StringUtil::StartsWith(dc::Str(table_entry.name), prefix)) {
+				tables.push_back(dc::Str(table_entry.name));
 				auto &table = table_entry.Cast<TableCatalogEntry>();
 				vector<string> columns;
 				auto count_column = ScenarioDelta::CountColumnIndex(table);
 				if (count_column.IsValid()) {
 					for (idx_t col = ScenarioDelta::PAYLOAD_START; col < count_column.GetIndex(); col++) {
-						columns.push_back(table.GetColumn(LogicalIndex(col)).Name());
+						columns.push_back(dc::Str(table.GetColumn(LogicalIndex(col)).Name()));
 					}
 				}
 				bag_columns.push_back(std::move(columns));
@@ -403,7 +403,7 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 	}
 
 	string sql;
-	auto host_prefix = Q(host_catalog.GetName()) + "." + Q(ScenarioRegistry::SCHEMA_NAME) + ".";
+	auto host_prefix = Q(dc::Str(host_catalog.GetName())) + "." + Q(ScenarioRegistry::SCHEMA_NAME) + ".";
 	for (idx_t t = 0; t < tables.size(); t++) {
 		auto &delta_table = tables[t];
 		if (!sql.empty()) {
@@ -438,10 +438,12 @@ unique_ptr<TableRef> ScenarioDiffSummaryBindReplace(ClientContext &context, Tabl
 void ScenarioDiff::RegisterFunctions(ExtensionLoader &loader) {
 	TableFunctionSet diff_set("scenario_diff");
 	TableFunction diff2("scenario_diff", {LogicalType::VARCHAR, LogicalType::VARCHAR}, nullptr);
+	dc::NameParameters(diff2, {"scenario", "table_name"});
 	diff2.bind_replace = ScenarioDiffBindReplace;
 	diff_set.AddFunction(diff2);
 	TableFunction diff3("scenario_diff", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                    nullptr);
+	dc::NameParameters(diff3, {"a", "b", "table_name"});
 	diff3.bind_replace = ScenarioDiffBindReplace;
 	diff_set.AddFunction(diff3);
 	{
@@ -473,6 +475,7 @@ void ScenarioDiff::RegisterFunctions(ExtensionLoader &loader) {
 	}
 
 	TableFunction summary("scenario_diff_summary", {LogicalType::VARCHAR}, nullptr);
+	dc::NameParameters(summary, {"scenario"});
 	summary.bind_replace = ScenarioDiffSummaryBindReplace;
 	{
 		CreateTableFunctionInfo info(std::move(summary));

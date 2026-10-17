@@ -104,7 +104,10 @@ appended during a checkpoint go to `added_data_during_checkpoint`. So the probe 
 index scan (`TableScanFunction`) does: under `IndexEntry::lock` it runs read-only `ARTOperator`
 lookups in all three ARTs, collects every row id stored under the key (nested leaves included),
 and keeps the one that `DataTable::CanFetch` says the transaction can see. It then repeats this
-for the transaction's own `append_indexes`, whose hits supersede the committed ones. An older
+for the transaction's own `append_indexes`, whose hits supersede the committed ones. (On DuckDB
+2.0 the index entry and its deltas are reached through `IndexEntry::GetReadHandle<ART>()` and
+`FindDelta`, which hold the entry's storage lock, and the lookups run on a `const ART`; the
+`scenario_compat::WithART` shim hides the difference, see *DuckDB versions*.) An older
 snapshot thus keeps finding its own version of a key that another connection has since changed.
 Without this, the base row would resurface next to the delta row, and the write sinks would
 misclassify the key.
@@ -331,6 +334,24 @@ only fall back to registering the scenario database as the writer; `MarkHostWrit
 case. `GetInfo` also clears the flag, so `ToSQL` stays a plain `CREATE TABLE`. Commit, WAL,
 checkpoint and write-write conflict detection are the host `DuckTransaction`'s, unchanged.
 
+**DuckDB 2.0.** The 2.0 binders register every DML target as modified, temporary or not, so the
+flag no longer keeps the scenario database out of `modified_databases`. `ScenarioClientState`
+(a `ClientContextState`) therefore asks to see every prepared statement (`CanRequestRebind`) and,
+in `OnFinalizePrepare`, demotes the scenario catalogs an `INSERT`/`UPDATE`/`DELETE`/`MERGE`
+registered as modified to reads (same catalog identity, so prepared statements still re-bind on
+catalog changes). Execution then proceeds exactly as on 1.5: the sinks' `BeginWrite` names the
+host. Other statement types (`COPY FROM DATABASE ... TO <scenario>`) keep the registration, as on
+1.5. The state is registered on every connection when it opens (an `ExtensionCallback`), and
+lazily on `ATTACH` and on every scenario lookup for connections that predate `LOAD`. On 1.5.6
+the hook finds nothing to demote.
+
+**MERGE actions run concurrently on 2.0.** Each `WHEN` action of a `MERGE INTO` is its own sink.
+1.5 feeds them one after the other from the merge operator; 2.0 runs them as separate pipelines
+fed through broadcast exchanges, so two actions can append to the same delta (transaction-local
+storage) from two threads, which DuckDB does not synchronize, and share the statement's
+double-touch set. The `Sink` of every scenario DML sink therefore runs under a per-connection
+mutex (`ScenarioClientState::sink_lock`).
+
 ---
 
 ## Delta lifecycle
@@ -556,6 +577,31 @@ On success the scenario ends frozen, with `merged_at` set and an empty delta.
 
 ---
 
+## DuckDB versions
+
+One source tree builds against DuckDB v1.5.6 and the DuckDB 2.0 pre-release that
+community-extensions builds (see `docs/UPDATING.md`). Call sites carry no version checks: API
+differences sit behind helpers that detect the API by its shape (overload resolution / SFINAE),
+in two places:
+
+- `duckdb-compat/` (submodule, DataZooDE/duckdb-compat, namespace `dc`): generic helpers for
+  any extension - `Identifier` vs `std::string` names (`dc::Ident`, `dc::Str`), `CreateInfo` /
+  `DropInfo` qualification setters, catalog lookups, table-function binds and named parameters,
+  constant vectors and 2.0's sized vectors (`dc::ReferenceValue`, `dc::SetVectorSize`), bound
+  expression accessors, parsing.
+- `src/include/catalog/scenario_compat.hpp` (namespace `scenario_compat`): the storage internals
+  only this extension touches - `DataTable` DML entry points, index entries and ART lookups,
+  unique masks, pushed table filters (2.0 pushes `ExpressionFilter`s only), the scan's table
+  identity (`get_bind_info` vs `get_table_entry`), `PhysicalMergeInto`, the oldest active
+  transaction.
+
+2.0 behaviour differences the code handles: write attribution and concurrent MERGE actions
+(*Write path*); vectors carry their own size, so chunks filled with `SetValue` are sized with
+`SetChildCardinality`; `EntryLookupInfo` holds its name by value on 2.0 but by reference on 1.5
+(`dc::EntryName` never passes a temporary there); `NextParallelScan` ends with an invalid
+`optional_idx` rather than 0. Test expectations that 2.0 legitimately changes are written to
+accept both lines (see `docs/UPDATING.md`).
+
 ## Source map
 
 | Path | Responsibility |
@@ -563,6 +609,7 @@ On success the scenario ends frozen, with `merged_at` set and an empty delta.
 | `anofox_scenario_extension.cpp` | Entry point, function registration |
 | `catalog/scenario_storage_extension.cpp` | `ATTACH (TYPE scenario)`, base source resolution |
 | `catalog/scenario_catalog.cpp` | Catalog impl, `BeginWrite`/`MarkHostWrite` write chokepoint |
+| `include/catalog/scenario_compat.hpp` | DuckDB 1.5.6 / 2.0 shims for storage internals |
 | `catalog/scenario_schema_entry.cpp` | Synthetic `main` schema, DDL rejection |
 | `catalog/scenario_table_entry.cpp` | Base mirror, virtual identity columns |
 | `catalog/scenario_scan.cpp` | Merge-on-read scan |

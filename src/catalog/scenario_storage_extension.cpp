@@ -14,10 +14,13 @@ static unique_ptr<Catalog> ScenarioAttach(optional_ptr<StorageExtensionInfo> sto
                                           AttachedDatabase &db, const string &name, AttachInfo &info,
                                           AttachOptions &options) {
 	auto &scenario_name = info.path;
+	// connections opened before the extension was loaded get the client
+	// state here (see ScenarioConnectionCallback)
+	ScenarioClientState::Get(context);
 	// The scenario registry lives in the session's default database. This is
 	// the database scenario_create ran against (documented Phase 1 scoping).
-	auto &host_catalog_name = DatabaseManager::GetDefaultDatabase(context);
-	auto &host_catalog = Catalog::GetCatalog(context, host_catalog_name);
+	const string host_catalog_name = dc::Str(DatabaseManager::GetDefaultDatabase(context));
+	auto &host_catalog = Catalog::GetCatalog(context, dc::Ident(host_catalog_name));
 	if (host_catalog.GetCatalogType() == "scenario") {
 		throw InvalidInputException(
 		    "Cannot attach scenario '%s': the current default database '%s' is itself a scenario. "
@@ -60,7 +63,7 @@ static unique_ptr<Catalog> ScenarioAttach(optional_ptr<StorageExtensionInfo> sto
 			throw InternalException("anofox_scenario: cycle detected in scenario parent chain");
 		}
 	}
-	if (!entry->base_catalog.empty() && !Catalog::GetCatalogEntry(context, entry->base_catalog)) {
+	if (!entry->base_catalog.empty() && !Catalog::GetCatalogEntry(context, dc::Ident(entry->base_catalog))) {
 		throw InvalidInputException(
 		    "Scenario '%s' uses '%s' as its base catalog, which is not attached. ATTACH it first",
 		    scenario_name, entry->base_catalog);

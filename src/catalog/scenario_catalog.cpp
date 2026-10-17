@@ -39,7 +39,7 @@ ScenarioCatalog::ScenarioCatalog(AttachedDatabase &db, string scenario_name_p, s
 
 void ScenarioCatalog::Initialize(bool load_builtin) {
 	CreateSchemaInfo info;
-	info.schema = DEFAULT_SCHEMA;
+	dc::SetSchema(info, DEFAULT_SCHEMA);
 	info.internal = true;
 	main_schema = make_uniq<ScenarioSchemaEntry>(*this, info);
 }
@@ -63,7 +63,7 @@ ScenarioSchemaEntry &ScenarioCatalog::GetOrCreateMirroredSchema(const string &sc
 		return *existing->second;
 	}
 	CreateSchemaInfo info;
-	info.schema = schema_name;
+	dc::SetSchema(info, schema_name);
 	info.internal = true;
 	auto entry = make_uniq<ScenarioSchemaEntry>(*this, info);
 	auto &result = *entry;
@@ -82,7 +82,7 @@ static bool ShouldMirrorSchema(const SchemaCatalogEntry &schema) {
 optional_ptr<SchemaCatalogEntry> ScenarioCatalog::LookupSchema(CatalogTransaction transaction,
                                                                const EntryLookupInfo &schema_lookup,
                                                                OnEntryNotFound if_not_found) {
-	const auto &schema_name = schema_lookup.GetEntryName();
+	const string schema_name = dc::Str(schema_lookup.GetEntryName());
 	if (schema_name == DEFAULT_SCHEMA || schema_name == INVALID_SCHEMA) {
 		return main_schema.get();
 	}
@@ -90,14 +90,15 @@ optional_ptr<SchemaCatalogEntry> ScenarioCatalog::LookupSchema(CatalogTransactio
 	// has right now; the internal metadata schema is never exposed)
 	if (transaction.context && schema_name != ScenarioRegistry::SCHEMA_NAME) {
 		auto &base_catalog = GetBaseCatalog(*transaction.context);
-		auto base_schema = base_catalog.GetSchema(*transaction.context, schema_name, OnEntryNotFound::RETURN_NULL);
+		auto base_schema =
+		    base_catalog.GetSchema(*transaction.context, dc::Ident(schema_name), OnEntryNotFound::RETURN_NULL);
 		if (base_schema && ShouldMirrorSchema(*base_schema)) {
 			return &GetOrCreateMirroredSchema(schema_name);
 		}
 	}
 	if (if_not_found == OnEntryNotFound::THROW_EXCEPTION) {
 		throw CatalogException("Schema \"%s\" does not exist in scenario catalog \"%s\" (schemas mirror the base)",
-		                       schema_name, GetName());
+		                       schema_name, dc::Str(GetName()));
 	}
 	return nullptr;
 }
@@ -107,7 +108,7 @@ void ScenarioCatalog::ScanSchemas(ClientContext &context, std::function<void(Sch
 	auto &base_catalog = GetBaseCatalog(context);
 	base_catalog.ScanSchemas(context, [&](SchemaCatalogEntry &base_schema) {
 		if (ShouldMirrorSchema(base_schema)) {
-			callback(GetOrCreateMirroredSchema(base_schema.name));
+			callback(GetOrCreateMirroredSchema(dc::Str(base_schema.name)));
 		}
 	});
 }
@@ -161,7 +162,7 @@ string ScenarioCatalog::GetDBPath() {
 }
 
 Catalog &ScenarioCatalog::GetHostCatalog(ClientContext &context) {
-	auto host = Catalog::GetCatalogEntry(context, host_catalog_name);
+	auto host = Catalog::GetCatalogEntry(context, dc::Ident(host_catalog_name));
 	if (!host) {
 		throw InvalidInputException(
 		    "Scenario '%s': host database '%s' is no longer attached - reattach it to use this scenario",
@@ -174,7 +175,7 @@ Catalog &ScenarioCatalog::GetBaseCatalog(ClientContext &context) {
 	if (base_catalog_name.empty()) {
 		return GetHostCatalog(context);
 	}
-	auto base = Catalog::GetCatalogEntry(context, base_catalog_name);
+	auto base = Catalog::GetCatalogEntry(context, dc::Ident(base_catalog_name));
 	if (!base) {
 		throw InvalidInputException(
 		    "Scenario '%s': base catalog '%s' is not attached - ATTACH it before using this scenario",
@@ -208,7 +209,8 @@ static bool SameColumns(const TableCatalogEntry &a, const TableCatalogEntry &b) 
 	for (idx_t col = 0; col < a_columns.LogicalColumnCount(); col++) {
 		auto &a_column = a_columns.GetColumn(LogicalIndex(col));
 		auto &b_column = b_columns.GetColumn(LogicalIndex(col));
-		if (!StringUtil::CIEquals(a_column.Name(), b_column.Name()) || a_column.Type() != b_column.Type()) {
+		if (!StringUtil::CIEquals(dc::Str(a_column.Name()), dc::Str(b_column.Name())) ||
+		    a_column.Type() != b_column.Type()) {
 			return false;
 		}
 	}
@@ -230,9 +232,9 @@ DuckTableEntry &ScenarioCatalog::GetOrCreateWriteDelta(ClientContext &context, S
 		if (base_catalog.GetCatalogType() == "ducklake") {
 			// the scenario reads the lake AT its creation time: a table that
 			// is not in that snapshot is not part of the scenario's base
-			auto pinned = ScenarioDelta::GetPinnedBaseEntry(context, base_catalog,
-			                                                entry.base_entry.ParentSchema().name,
-			                                                entry.base_entry.name, created_at);
+			auto pinned =
+			    ScenarioDelta::GetPinnedBaseEntry(context, base_catalog, dc::Str(entry.base_entry.ParentSchema().name),
+				                                  dc::Str(entry.base_entry.name), created_at);
 			if (!pinned) {
 				throw InvalidInputException(
 				    "Cannot write to table '%s' of scenario '%s': the table is not in the scenario's base snapshot "
@@ -266,7 +268,7 @@ DuckTableEntry &ScenarioCatalog::GetOrCreateWriteDelta(ClientContext &context, S
 	// key and a base PK added later both exist (the declaration wins)
 	vector<string> identity_keys;
 	for (auto key_column : key_columns) {
-		identity_keys.push_back(entry.base_entry.GetColumn(LogicalIndex(key_column)).Name());
+		identity_keys.push_back(dc::Str(entry.base_entry.GetColumn(LogicalIndex(key_column)).Name()));
 	}
 	// BeginWrite made the host this transaction's writer already (or, for a
 	// plan that registered this catalog itself, flagged the host transaction)
@@ -305,13 +307,13 @@ void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModification
 	}
 	if (GetAttached().IsReadOnly()) {
 		throw InvalidInputException("Cannot write to scenario '%s': it is attached in read-only mode (as '%s')",
-		                            scenario_name, GetAttached().GetName());
+		                            scenario_name, dc::Str(GetAttached().GetName()));
 	}
 	if (host_db.IsReadOnly()) {
 		// scenario writes physically land in the host database
 		throw InvalidInputException(
 		    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode", scenario_name,
-		    host_db.GetName());
+		    dc::Str(host_db.GetName()));
 	}
 	auto modified = meta.ModifiedDatabase();
 	if (modified && modified.get() != &host_db && modified.get() != &GetAttached()) {
@@ -320,7 +322,7 @@ void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModification
 		    "Cannot write to scenario '%s': this transaction already modified database \"%s\". Scenario writes "
 		    "land in the host database \"%s\", and a single transaction can only write to a single attached "
 		    "database",
-		    scenario_name, modified->GetName(), host_db.GetName());
+		    scenario_name, dc::Str(modified->GetName()), dc::Str(host_db.GetName()));
 	}
 	if (modified && modified.get() == &GetAttached()) {
 		// Defensive: a code path that registered the scenario catalog itself

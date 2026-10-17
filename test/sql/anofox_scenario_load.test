@@ -5,8 +5,10 @@
 # Require statement will ensure this test is run with this extension loaded
 require anofox_scenario
 
-# Confirm the extension is loaded by checking it appears in duckdb_extensions
+# Confirm the extension is loaded by checking it appears in duckdb_extensions.
+# (`loaded`, not `installed`: DuckDB 2.0's test runner loads the build's
+# extension file instead of a linked-in copy, which is not "installed")
 query I
-SELECT installed FROM duckdb_extensions() WHERE extension_name = 'anofox_scenario';
+SELECT loaded FROM duckdb_extensions() WHERE extension_name = 'anofox_scenario';
 ----
 true

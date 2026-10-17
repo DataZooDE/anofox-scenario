@@ -16,6 +16,7 @@
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/transaction/transaction_manager.hpp"
+#include "catalog/scenario_compat.hpp"
 
 namespace duckdb {
 
@@ -88,6 +89,8 @@ public:
 	//! duckdb_tables, information_schema, SHOW TABLES) does not
 	ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
 	                   TableCatalogEntry &base_entry, bool for_binding = true);
+	ScenarioTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, ColumnList columns,
+	                   TableCatalogEntry &base_entry, bool for_binding);
 
 	//! The base table in the host catalog this entry mirrors
 	TableCatalogEntry &base_entry;
@@ -100,6 +103,17 @@ public:
 	vector<idx_t> IdentityColumns() const;
 
 public:
+	//! The mirrored columns. 2.0: the entry's column list (pure virtual in
+	//! TableCatalogEntry, so no `override` on 1.5.6, where it is non-virtual
+	//! and this hides an identical copy held by the base)
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winconsistent-missing-override"
+#endif
+	const ColumnList &GetColumns() const; // NOLINT: see above
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &context) override;
@@ -118,6 +132,9 @@ public:
 	                           ClientContext &context) override;
 
 	ScenarioCatalog &GetScenarioCatalog();
+
+private:
+	ColumnList scenario_columns;
 };
 
 //===----------------------------------------------------------------------===//

@@ -1,6 +1,8 @@
 #include "catalog/scenario_registry.hpp"
 
 #include "catalog/scenario_delta.hpp"
+#include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
@@ -186,14 +188,12 @@ DuckTableEntry &ScenarioRegistry::EnsureTablesTable(ClientContext &context, Cata
 	MarkHostModified(context, host_catalog, DatabaseModificationType::CREATE_CATALOG_ENTRY);
 	// column order pinned by the TAB_COL_* constants above
 	auto info = make_uniq<CreateTableInfo>();
-	info->catalog = host_catalog.GetName();
-	info->schema = SCHEMA_NAME;
-	info->table = TABLES_TABLE_NAME;
+	dc::SetQualifiedName(*info, dc::Str(host_catalog.GetName()), SCHEMA_NAME, TABLES_TABLE_NAME);
 	info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 	info->columns.AddColumn(ColumnDefinition("scenario_id", LogicalType::BIGINT));
 	info->columns.AddColumn(ColumnDefinition("table_name", LogicalType::VARCHAR));
 	info->columns.AddColumn(ColumnDefinition("key_columns", LogicalType::LIST(LogicalType::VARCHAR)));
-	info->constraints.push_back(make_uniq<UniqueConstraint>(vector<string> {"scenario_id", "table_name"}, true));
+	info->constraints.push_back(dc::MakeUniqueConstraint({"scenario_id", "table_name"}, true));
 	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TAB_COL_KEY_COLUMNS)));
 	try {
 		host_catalog.CreateTable(context, std::move(info));
@@ -211,6 +211,33 @@ DuckTableEntry &ScenarioRegistry::EnsureTablesTable(ClientContext &context, Cata
 		throw InternalException("anofox_scenario: failed to create %s.%s", SCHEMA_NAME, TABLES_TABLE_NAME);
 	}
 	return *created;
+}
+
+RebindQueryInfo ScenarioClientState::OnFinalizePrepare(ClientContext &context, PreparedStatementData &prepared,
+                                                       PreparedStatementMode mode) {
+	switch (prepared.statement_type) {
+	case StatementType::INSERT_STATEMENT:
+	case StatementType::UPDATE_STATEMENT:
+	case StatementType::DELETE_STATEMENT:
+	case StatementType::MERGE_INTO_STATEMENT:
+		break;
+	default:
+		// e.g. COPY FROM DATABASE ... TO <scenario> keeps registering the
+		// scenario itself (see ScenarioCatalog::MarkHostWrite)
+		return RebindQueryInfo::DO_NOT_REBIND;
+	}
+	auto &properties = prepared.properties;
+	auto &manager = DatabaseManager::Get(context);
+	for (auto entry = properties.modified_databases.begin(); entry != properties.modified_databases.end();) {
+		auto database = manager.GetDatabase(context, entry->first);
+		if (database && database->GetCatalog().GetCatalogType() == "scenario") {
+			properties.read_databases.emplace(entry->first, entry->second.identity);
+			entry = properties.modified_databases.erase(entry);
+		} else {
+			++entry;
+		}
+	}
+	return RebindQueryInfo::DO_NOT_REBIND;
 }
 
 ScenarioClientState &ScenarioClientState::Get(ClientContext &context) {
@@ -302,7 +329,7 @@ void ScenarioRegistry::InsertDeclaredKey(ClientContext &context, Catalog &host_c
 	chunk.SetValue(TAB_COL_SCENARIO_ID, 0, Value::BIGINT(scenario_id));
 	chunk.SetValue(TAB_COL_TABLE_NAME, 0, Value(table_name));
 	chunk.SetValue(TAB_COL_KEY_COLUMNS, 0, Value::LIST(LogicalType::VARCHAR, std::move(keys)));
-	chunk.SetCardinality(1);
+	chunk.SetChildCardinality(1);
 	auto binder = Binder::CreateBinder(context);
 	auto bound_constraints = binder->BindConstraints(table);
 	data_table.LocalAppend(table, context, chunk, bound_constraints);
@@ -359,7 +386,7 @@ void ScenarioRegistry::ReplaceDeclaredKey(ClientContext &context, Catalog &host_
 		chunk.SetValue(TAB_COL_SCENARIO_ID, 0, Value::BIGINT(scenario_id));
 		chunk.SetValue(TAB_COL_TABLE_NAME, 0, Value(table_name));
 		chunk.SetValue(TAB_COL_KEY_COLUMNS, 0, Value::LIST(LogicalType::VARCHAR, std::move(key_values)));
-		chunk.SetCardinality(1);
+		chunk.SetChildCardinality(1);
 	};
 	DataChunk old_row, new_row;
 	make_row(old_row, old_keys);
@@ -368,12 +395,13 @@ void ScenarioRegistry::ReplaceDeclaredKey(ClientContext &context, Catalog &host_
 	row_ids.SetValue(0, Value::BIGINT(old_row_id));
 	{
 		auto delete_state = data_table.InitializeDelete(*table, context, bound_constraints);
-		data_table.Delete(*delete_state, context, row_ids, 1);
+		dc::SetVectorSize(row_ids, 1);
+		scenario_compat::TableDelete(data_table, *delete_state, context, *table, row_ids, 1);
 	}
 	LocalAppendState append_state;
 	data_table.InitializeLocalAppend(append_state, *table, context, bound_constraints);
 	append_state.storage->AppendToDeleteIndexes(row_ids, old_row);
-	data_table.LocalAppend(append_state, context, new_row, false);
+	scenario_compat::TableLocalAppend(data_table, append_state, *table, context, new_row, false);
 	data_table.FinalizeLocalAppend(append_state);
 	ScenarioClientState::Get(context).Invalidate(context, host_catalog, scenario_id);
 }
@@ -394,7 +422,8 @@ void ScenarioRegistry::DeleteDeclaredKeyRows(ClientContext &context, Catalog &ho
 		for (idx_t i = 0; i < count; i++) {
 			row_id_vector.SetValue(i, Value::BIGINT(row_ids[offset + i]));
 		}
-		data_table.Delete(*delete_state, context, row_id_vector, count);
+		dc::SetVectorSize(row_id_vector, count);
+		scenario_compat::TableDelete(data_table, *delete_state, context, table, row_id_vector, count);
 	}
 }
 
@@ -410,24 +439,20 @@ void ScenarioRegistry::EnsureExists(ClientContext &context, Catalog &host_catalo
 
 	// Schema
 	CreateSchemaInfo schema_info;
-	schema_info.catalog = host_catalog.GetName();
-	schema_info.schema = SCHEMA_NAME;
+	dc::SetCatalog(schema_info, dc::Str(host_catalog.GetName()));
+	dc::SetSchema(schema_info, SCHEMA_NAME);
 	schema_info.on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 	host_catalog.CreateSchema(context, schema_info);
 
 	// Sequence for scenario ids
 	auto seq_info = make_uniq<CreateSequenceInfo>();
-	seq_info->catalog = host_catalog.GetName();
-	seq_info->schema = SCHEMA_NAME;
-	seq_info->name = SEQUENCE_NAME;
+	dc::SetQualifiedName(*seq_info, dc::Str(host_catalog.GetName()), SCHEMA_NAME, SEQUENCE_NAME);
 	seq_info->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 	host_catalog.CreateSequence(context, *seq_info);
 
 	// Registry table -- column order pinned by the REG_COL_* constants above.
 	auto info = make_uniq<CreateTableInfo>();
-	info->catalog = host_catalog.GetName();
-	info->schema = SCHEMA_NAME;
-	info->table = TABLE_NAME;
+	dc::SetQualifiedName(*info, dc::Str(host_catalog.GetName()), SCHEMA_NAME, TABLE_NAME);
 	info->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
 	info->columns.AddColumn(ColumnDefinition("scenario_id", LogicalType::BIGINT));
 	info->columns.AddColumn(ColumnDefinition("name", LogicalType::VARCHAR));
@@ -524,7 +549,7 @@ void ScenarioRegistry::Insert(ClientContext &context, Catalog &host_catalog, con
 	               entry.has_description ? Value(entry.description) : Value(LogicalType::VARCHAR));
 	chunk.SetValue(REG_COL_BASE_CATALOG, 0,
 	               entry.base_catalog.empty() ? Value(LogicalType::VARCHAR) : Value(entry.base_catalog));
-	chunk.SetCardinality(1);
+	chunk.SetChildCardinality(1);
 
 	auto binder = Binder::CreateBinder(context);
 	auto bound_constraints = binder->BindConstraints(table);
@@ -545,7 +570,8 @@ void ScenarioRegistry::Delete(ClientContext &context, Catalog &host_catalog, int
 	auto delete_state = data_table.InitializeDelete(table, context, bound_constraints);
 	Vector row_ids(LogicalType::ROW_TYPE);
 	row_ids.SetValue(0, Value::BIGINT(row_id));
-	data_table.Delete(*delete_state, context, row_ids, 1);
+	dc::SetVectorSize(row_ids, 1);
+	scenario_compat::TableDelete(data_table, *delete_state, context, table, row_ids, 1);
 }
 
 void ScenarioRegistry::SetFrozen(ClientContext &context, Catalog &host_catalog, int64_t scenario_id, bool frozen) {
@@ -566,9 +592,10 @@ void ScenarioRegistry::SetFrozen(ClientContext &context, Catalog &host_catalog, 
 	DataChunk update_chunk;
 	update_chunk.Initialize(Allocator::Get(context), {LogicalType::BOOLEAN});
 	update_chunk.SetValue(0, 0, Value::BOOLEAN(frozen));
-	update_chunk.SetCardinality(1);
+	update_chunk.SetChildCardinality(1);
 	vector<PhysicalIndex> column_ids {PhysicalIndex(REG_COL_FROZEN)};
-	data_table.Update(*update_state, context, row_ids, column_ids, update_chunk);
+	dc::SetVectorSize(row_ids, 1);
+	scenario_compat::TableUpdate(data_table, *update_state, context, table, row_ids, column_ids, update_chunk);
 }
 
 void ScenarioRegistry::MarkMerged(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {
@@ -590,9 +617,10 @@ void ScenarioRegistry::MarkMerged(ClientContext &context, Catalog &host_catalog,
 	update_chunk.Initialize(Allocator::Get(context), {LogicalType::BOOLEAN, LogicalType::TIMESTAMP});
 	update_chunk.SetValue(0, 0, Value::BOOLEAN(true));
 	update_chunk.SetValue(1, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
-	update_chunk.SetCardinality(1);
+	update_chunk.SetChildCardinality(1);
 	vector<PhysicalIndex> column_ids {PhysicalIndex(REG_COL_FROZEN), PhysicalIndex(REG_COL_MERGED_AT)};
-	data_table.Update(*update_state, context, row_ids, column_ids, update_chunk);
+	dc::SetVectorSize(row_ids, 1);
+	scenario_compat::TableUpdate(data_table, *update_state, context, table, row_ids, column_ids, update_chunk);
 }
 
 bool ScenarioRegistry::HasChildren(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {

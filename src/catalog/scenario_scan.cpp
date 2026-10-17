@@ -117,40 +117,6 @@ void HashKeyColumns(ClientContext &context, DataChunk &chunk, const vector<idx_t
 	hashes.Flatten(count);
 }
 
-//! The values an equality-style pushed filter pins a column to: `= c`,
-//! `IN (...)`, or such a filter inside an AND / optional filter. False when
-//! the filter does not pin the column to a finite set.
-bool PointFilterValues(const TableFilter &filter, vector<Value> &values) {
-	switch (filter.filter_type) {
-	case TableFilterType::CONSTANT_COMPARISON: {
-		auto &constant = filter.Cast<ConstantFilter>();
-		if (constant.comparison_type != ExpressionType::COMPARE_EQUAL) {
-			return false;
-		}
-		values.push_back(constant.constant);
-		return true;
-	}
-	case TableFilterType::IN_FILTER:
-		values = filter.Cast<InFilter>().values;
-		return true;
-	case TableFilterType::CONJUNCTION_AND:
-		for (auto &child : filter.Cast<ConjunctionAndFilter>().child_filters) {
-			if (PointFilterValues(*child, values)) {
-				return true;
-			}
-		}
-		return false;
-	case TableFilterType::OPTIONAL_FILTER: {
-		// optional filters are re-checked above the scan, so narrowing the
-		// delta side to their values never changes the result
-		auto &optional = filter.Cast<OptionalFilter>();
-		return optional.child_filter && PointFilterValues(*optional.child_filter, values);
-	}
-	default:
-		return false;
-	}
-}
-
 struct ScenarioScanBindData : public TableFunctionData {
 	ScenarioScanBindData(ScenarioTableEntry &entry_p, TableCatalogEntry &base_entry_p,
 	                     optional_ptr<DuckTableEntry> delta_table_p, vector<idx_t> pk_columns_p)
@@ -270,8 +236,8 @@ void AddPostFilter(ScenarioScanGlobalState &state, const TableFilter &filter, co
 	auto filter_expr = filter.ToExpression(*column_ref);
 	if (state.post_filter) {
 		auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-		conjunction->children.push_back(std::move(state.post_filter));
-		conjunction->children.push_back(std::move(filter_expr));
+		dc::Children(*conjunction).push_back(std::move(state.post_filter));
+		dc::Children(*conjunction).push_back(std::move(filter_expr));
 		state.post_filter = std::move(conjunction);
 	} else {
 		state.post_filter = std::move(filter_expr);
@@ -335,8 +301,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 	// keyless rowid filters wait until the suppression budget is known
 	vector<pair<idx_t, idx_t>> deferred_rowid_filters; // (output pos, scan pos)
 	if (input.filters) {
-		for (auto &filter_entry : input.filters->filters) {
-			auto out_pos = filter_entry.first;
+		scenario_compat::ForEachTableFilter(*input.filters, [&](idx_t out_pos, const TableFilter &filter) {
 			if (out_pos >= result->out_map.size()) {
 				throw InternalException("anofox_scenario: pushed filter references an unprojected column");
 			}
@@ -344,18 +309,18 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			if (result->out_map[out_pos].is_rowno) {
 				// synthesized after the base scan: evaluated on the emitted
 				// output instead (the delta side applies every filter anyway)
-				AddPostFilter(*result, *filter_entry.second, LogicalType::BIGINT, out_pos);
-				continue;
+				AddPostFilter(*result, filter, LogicalType::BIGINT, out_pos);
+				return;
 			}
 			if (bind_data.keyless && has_delta && input.column_indexes[out_pos].IsRowIdColumn()) {
 				deferred_rowid_filters.emplace_back(out_pos, scan_pos);
-				continue;
+				return;
 			}
 			if (scan_pos == DConstants::INVALID_INDEX) {
 				// __scenario_origin: constant 0 for every base row. The filter
 				// either rejects all base rows (skip the base side) or none.
 				auto origin_ref = make_uniq<BoundConstantExpression>(Value::TINYINT(0));
-				auto folded = filter_entry.second->ToExpression(*origin_ref);
+				auto folded = filter.ToExpression(*origin_ref);
 				Value fold_result;
 				if (!ExpressionExecutor::TryEvaluateScalar(context, *folded, fold_result)) {
 					throw InternalException("anofox_scenario: could not fold filter on __scenario_origin");
@@ -363,12 +328,12 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 				if (fold_result.IsNull() || !BooleanValue::Get(fold_result.DefaultCastAs(LogicalType::BOOLEAN))) {
 					result->base_side_disabled = true;
 				}
-				continue;
+				return;
 			}
 			// PushFilter conjuncts when two outputs (a key virtual column and
 			// its PK column) dedupe onto the same scan position
-			result->base_filters.PushFilter(ColumnIndex(scan_pos), filter_entry.second->Copy());
-		}
+			scenario_compat::PushTableFilter(result->base_filters, scan_pos, scenario_compat::CopyTableFilter(filter));
+		});
 	}
 
 	// projection required unless outputs are exactly the scanned columns
@@ -446,22 +411,21 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 		// position, which matches the output position for requested columns).
 		unique_ptr<Expression> delta_filter;
 		if (input.filters) {
-			for (auto &filter_entry : input.filters->filters) {
-				auto scan_pos = filter_entry.first;
+			scenario_compat::ForEachTableFilter(*input.filters, [&](idx_t scan_pos, const TableFilter &filter) {
 				if (scan_pos >= result->out_map.size()) {
 					throw InternalException("anofox_scenario: pushed filter references an unprojected column");
 				}
 				auto column_ref = make_uniq<BoundReferenceExpression>(output_types[scan_pos], scan_pos);
-				auto filter_expr = filter_entry.second->ToExpression(*column_ref);
+				auto filter_expr = filter.ToExpression(*column_ref);
 				if (delta_filter) {
 					auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
-					conjunction->children.push_back(std::move(delta_filter));
-					conjunction->children.push_back(std::move(filter_expr));
+					dc::Children(*conjunction).push_back(std::move(delta_filter));
+					dc::Children(*conjunction).push_back(std::move(filter_expr));
 					delta_filter = std::move(conjunction);
 				} else {
 					delta_filter = std::move(filter_expr);
 				}
-			}
+			});
 		}
 		unique_ptr<ExpressionExecutor> filter_executor;
 		if (delta_filter) {
@@ -518,7 +482,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			if (append_count == 0) {
 				return;
 			}
-			append_chunk.SetCardinality(append_count);
+			append_chunk.SetChildCardinality(append_count);
 			if (filter_executor) {
 				SelectionVector sel(append_count);
 				idx_t kept = filter_executor->SelectExpression(append_chunk, sel);
@@ -577,9 +541,9 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 					auto pos = delta_pos_for_output[out_idx];
 					auto &target = out_chunk.data[out_idx];
 					if (pos == DELTA_OUT_NULL) {
-						target.Reference(Value(LogicalType::ROW_TYPE));
+						dc::ReferenceValue(target, Value(LogicalType::ROW_TYPE), kept);
 					} else if (pos == DELTA_OUT_ORIGIN) {
-						target.Reference(Value::TINYINT(1));
+						dc::ReferenceValue(target, Value::TINYINT(1), kept);
 					} else if (pos == DELTA_OUT_ROWNO) {
 						target.Sequence(delta_rowno, 1, kept);
 						delta_rowno += NumericCast<int64_t>(kept);
@@ -587,7 +551,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 						target.Slice(chunk.data[pos], sel, kept);
 					}
 				}
-				out_chunk.SetCardinality(kept);
+				out_chunk.SetChildCardinality(kept);
 				if (filter_executor) {
 					SelectionVector filter_sel(kept);
 					auto passed = filter_executor->SelectExpression(out_chunk, filter_sel);
@@ -608,17 +572,17 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			bool point_lookup = input.filters != nullptr;
 			idx_t point_key_count = 1;
 			for (idx_t k = 0; point_lookup && k < bind_data.pk_columns.size(); k++) {
-				for (auto &filter_entry : input.filters->filters) {
-					auto id = input.column_indexes[filter_entry.first].GetPrimaryIndex();
-					if (id != bind_data.pk_columns[k] && id != SCENARIO_KEY_COLUMN_START + k) {
-						continue;
+				scenario_compat::ForEachTableFilter(*input.filters, [&](idx_t out_pos, const TableFilter &filter) {
+					auto id = input.column_indexes[out_pos].GetPrimaryIndex();
+					if (!point_values[k].empty() ||
+					    (id != bind_data.pk_columns[k] && id != SCENARIO_KEY_COLUMN_START + k)) {
+						return;
 					}
 					vector<Value> values;
-					if (PointFilterValues(*filter_entry.second, values)) {
+					if (scenario_compat::PointFilterValues(filter, values)) {
 						point_values[k] = std::move(values);
-						break;
 					}
-				}
+				});
 				point_key_count *= point_values[k].size();
 				point_lookup = !point_values[k].empty() && point_key_count <= MAX_POINT_KEYS;
 			}
@@ -633,14 +597,14 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 						rest /= point_values[k].size();
 						Value cast_value;
 						string error;
-						if (!value.DefaultTryCastAs(result->key_types[k], cast_value, &error)) {
+						if (!dc::TryCastValue(value, result->key_types[k], cast_value, &error)) {
 							point_lookup = false;
 							break;
 						}
 						point_keys.SetValue(k, row, cast_value);
 					}
 				}
-				point_keys.SetCardinality(point_key_count);
+				point_keys.SetChildCardinality(point_key_count);
 			}
 			if (point_lookup) {
 				vector<idx_t> positions;
@@ -769,7 +733,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 					for (idx_t col = 0; col < column_count; col++) {
 						value_chunk.SetValue(col, 0, bag_pair.second.row_values[col]);
 					}
-					value_chunk.SetCardinality(1);
+					value_chunk.SetChildCardinality(1);
 					for (int64_t n = 0; n < bag_pair.second.net; n++) {
 						emit_delta_row(value_chunk, 0);
 					}
@@ -793,9 +757,10 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 	// otherwise after suppression, or a filter would pick which copy the
 	// budget swallows (#39 F2)
 	for (auto &deferred : deferred_rowid_filters) {
-		auto &filter = *input.filters->filters.at(deferred.first);
+		auto &filter = scenario_compat::GetTableFilter(*input.filters, deferred.first);
 		if (result->suppress_budget.empty()) {
-			result->base_filters.PushFilter(ColumnIndex(deferred.second), filter.Copy());
+			scenario_compat::PushTableFilter(result->base_filters, deferred.second,
+			                                 scenario_compat::CopyTableFilter(filter));
 		} else {
 			AddPostFilter(*result, filter, LogicalType::ROW_TYPE, deferred.first);
 		}
@@ -811,7 +776,7 @@ unique_ptr<LocalTableFunctionState> ScenarioScanInitLocal(ExecutionContext &cont
 	if (bind_data.base_is_duck) {
 		auto storage_ids = gstate.storage_ids;
 		optional_ptr<TableFilterSet> base_filters;
-		if (!gstate.base_filters.filters.empty()) {
+		if (scenario_compat::HasTableFilters(gstate.base_filters)) {
 			base_filters = &gstate.base_filters;
 		}
 		result->scan_state.Initialize(std::move(storage_ids), context.client, base_filters);
@@ -855,7 +820,8 @@ void ScenarioScanExecute(ClientContext &context, TableFunctionInput &input, Data
 		auto &transaction = DuckTransaction::Get(context, bind_data.base_entry.catalog);
 		if (!lstate.primed) {
 			lstate.primed = true;
-			if (data_table.NextParallelScan(context, gstate.parallel_state, lstate.scan_state) == 0) {
+			if (!scenario_compat::ParallelScanHasMore(
+			        data_table.NextParallelScan(context, gstate.parallel_state, lstate.scan_state))) {
 				lstate.base_done = true;
 				return;
 			}
@@ -867,9 +833,10 @@ void ScenarioScanExecute(ClientContext &context, TableFunctionInput &input, Data
 			scan_target.Reset();
 			data_table.Scan(transaction, scan_target, lstate.scan_state);
 			if (scan_target.size() == 0) {
-				if (data_table.NextParallelScan(context, gstate.parallel_state, lstate.scan_state) == 0) {
+				if (!scenario_compat::ParallelScanHasMore(
+				        data_table.NextParallelScan(context, gstate.parallel_state, lstate.scan_state))) {
 					lstate.base_done = true;
-					output.SetCardinality(0);
+					output.SetChildCardinality(0);
 					return;
 				}
 				continue;
@@ -891,7 +858,7 @@ void ScenarioScanExecute(ClientContext &context, TableFunctionInput &input, Data
 		bind_data.foreign_function.function(context, foreign_input, scan_target);
 		if (scan_target.size() == 0) {
 			gstate.foreign_exhausted = true;
-			output.SetCardinality(0);
+			output.SetChildCardinality(0);
 			return;
 		}
 		if (!EmitBaseChunk(context, gstate, lstate, output, scan_target)) {
@@ -999,12 +966,12 @@ bool EmitBaseChunk(ClientContext &context, ScenarioScanGlobalState &gstate, Scen
 				output.data[out_idx].Sequence(start, 1, count);
 			} else if (mapping.scan_pos == DConstants::INVALID_INDEX) {
 				// __scenario_origin: base rows are origin 0
-				output.data[out_idx].Reference(Value::TINYINT(0));
+				dc::ReferenceValue(output.data[out_idx], Value::TINYINT(0), count);
 			} else {
 				output.data[out_idx].Reference(lstate.scan_chunk.data[mapping.scan_pos]);
 			}
 		}
-		output.SetCardinality(count);
+		output.SetChildCardinality(count);
 	}
 	if (lstate.post_filter_executor) {
 		// without a projection, output is the scan chunk itself
@@ -1021,9 +988,9 @@ bool EmitBaseChunk(ClientContext &context, ScenarioScanGlobalState &gstate, Scen
 	return true;
 }
 
-BindInfo ScenarioScanGetBindInfo(const optional_ptr<FunctionData> bind_data) {
-	auto &data = bind_data->Cast<ScenarioScanBindData>();
-	return BindInfo(data.entry);
+//! The scenario table entry: the identity the planner must see (GetTable)
+TableCatalogEntry &ScenarioScanTable(const FunctionData &bind_data) {
+	return bind_data.Cast<ScenarioScanBindData>().entry;
 }
 
 //! The common-subplan optimizer dedups operators by their SERIALIZED form.
@@ -1031,15 +998,19 @@ BindInfo ScenarioScanGetBindInfo(const optional_ptr<FunctionData> bind_data) {
 //! scenarios are byte-identical and get silently merged (both sides then
 //! return the first world's rows). Serializing the scenario identity keeps
 //! them distinct; plans are never deserialized (statement caching is off).
+//! (FUNCTION: TableFunction on 1.5.6, BoundTableFunction on 2.0 - deduced
+//! from the callback type it is assigned to)
+template <class FUNCTION>
 void ScenarioScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
-                           const TableFunction &function) {
+                           const FUNCTION &function) {
 	auto &data = bind_data->Cast<ScenarioScanBindData>();
-	serializer.WriteProperty(100, "scenario_catalog", data.entry.catalog.GetName());
-	serializer.WriteProperty(101, "schema", data.entry.ParentSchema().name);
-	serializer.WriteProperty(102, "table", data.entry.name);
+	serializer.WriteProperty(100, "scenario_catalog", dc::Str(data.entry.catalog.GetName()));
+	serializer.WriteProperty(101, "schema", dc::Str(data.entry.ParentSchema().name));
+	serializer.WriteProperty(102, "table", dc::Str(data.entry.name));
 }
 
-unique_ptr<FunctionData> ScenarioScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+template <class FUNCTION>
+unique_ptr<FunctionData> ScenarioScanDeserialize(Deserializer &deserializer, FUNCTION &function) {
 	throw NotImplementedException("scenario table scans cannot be deserialized - they rebind per transaction");
 }
 
@@ -1050,7 +1021,7 @@ TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, Scenario
 	TableFunction function("scenario_scan", {}, ScenarioScanExecute);
 	function.init_global = ScenarioScanInitGlobal;
 	function.init_local = ScenarioScanInitLocal;
-	function.get_bind_info = ScenarioScanGetBindInfo;
+	scenario_compat::SetScanTable<ScenarioScanTable>(function);
 	function.serialize = ScenarioScanSerialize;
 	function.deserialize = ScenarioScanDeserialize;
 	function.projection_pushdown = true;
@@ -1074,8 +1045,8 @@ TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, Scenario
 		if (base_catalog.GetCatalogType() == "ducklake") {
 			at_clause = make_uniq<BoundAtClause>("timestamp", Value::TIMESTAMP(scenario_catalog.created_at));
 		}
-		EntryLookupInfo foreign_lookup(CatalogType::TABLE_ENTRY, entry.base_entry.name, at_clause.get(),
-		                               QueryErrorContext());
+		EntryLookupInfo foreign_lookup(CatalogType::TABLE_ENTRY, dc::EntryName(dc::Str(entry.base_entry.name)),
+		                               at_clause.get(), QueryErrorContext());
 		result->foreign_function = entry.base_entry.GetScanFunction(context, result->foreign_bind, foreign_lookup);
 	}
 	bind_data = std::move(result);

@@ -112,9 +112,10 @@ void ScenarioDeltaAppendChunk(ClientContext &context, DuckTableEntry &delta_tabl
 		for (idx_t i = 0; i < deleted_row_ids.size(); i++) {
 			row_ids.SetValue(i, Value::BIGINT(deleted_row_ids[i]));
 		}
+		dc::SetVectorSize(row_ids, deleted_row_ids.size());
 		append_state.storage->AppendToDeleteIndexes(row_ids, *deleted_chunk);
 	}
-	storage.LocalAppend(append_state, context, chunk, false);
+	scenario_compat::TableLocalAppend(storage, append_state, delta_table, context, chunk, false);
 	storage.FinalizeLocalAppend(append_state);
 }
 
@@ -125,8 +126,8 @@ void ScenarioVerifyNotNullAndCheck(ClientContext &context, TableCatalogEntry &en
 		case ConstraintType::NOT_NULL: {
 			auto &not_null = constraint->Cast<BoundNotNullConstraint>();
 			if (VectorOperations::HasNull(chunk.data[not_null.index.index], chunk.size())) {
-				throw ConstraintException("NOT NULL constraint failed: %s.%s", entry.name,
-				                          entry.GetColumn(LogicalIndex(not_null.index.index)).Name());
+				throw ConstraintException("NOT NULL constraint failed: %s.%s", dc::Str(entry.name),
+				                          dc::Str(entry.GetColumn(LogicalIndex(not_null.index.index)).Name()));
 			}
 			break;
 		}
@@ -142,7 +143,7 @@ void ScenarioVerifyNotNullAndCheck(ClientContext &context, TableCatalogEntry &en
 				auto idx = format.sel->get_index(i);
 				// NULL check results pass; only FALSE violates
 				if (format.validity.RowIsValid(idx) && result_data[idx] == 0) {
-					throw ConstraintException("CHECK constraint failed on table %s", entry.name);
+					throw ConstraintException("CHECK constraint failed on table %s", dc::Str(entry.name));
 				}
 			}
 			break;
@@ -229,6 +230,7 @@ unique_ptr<GlobalSinkState> PhysicalScenarioInsert::GetGlobalSinkState(ClientCon
 
 SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk &chunk,
                                             OperatorSinkInput &input) const {
+	lock_guard<mutex> sink_guard(ScenarioClientState::Get(context.client).sink_lock);
 	auto &gstate = input.global_state.Cast<ScenarioInsertGlobalState>();
 	auto &client = context.client;
 	auto &scenario_catalog = entry.GetScenarioCatalog();
@@ -267,8 +269,8 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		vector<idx_t> key_positions;
 		for (auto pk_col : gstate.pk_columns) {
 			if (VectorOperations::HasNull(chunk.data[pk_col], chunk.size())) {
-				throw ConstraintException("NOT NULL constraint failed: %s.%s (PRIMARY KEY)", entry.name,
-				                          entry.GetColumn(LogicalIndex(pk_col)).Name());
+				throw ConstraintException("NOT NULL constraint failed: %s.%s (PRIMARY KEY)", dc::Str(entry.name),
+				                          dc::Str(entry.GetColumn(LogicalIndex(pk_col)).Name()));
 			}
 			key_positions.push_back(pk_col);
 		}
@@ -289,7 +291,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 					throw ConstraintException(
 					    "Duplicate key violates primary key constraint on scenario table \"%s\": the key was "
 					    "already inserted or modified in this scenario",
-					    entry.name);
+					    dc::Str(entry.name));
 				}
 			} else {
 				// Not touched by this scenario: must not collide with a base row
@@ -317,7 +319,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 				throw ConstraintException(
 				    "Duplicate key violates primary key constraint on scenario table \"%s\": the key exists in "
 				    "the base table",
-				    entry.name);
+				    dc::Str(entry.name));
 			}
 		}
 		// Secondary UNIQUE values of every row - re-inserts over a tombstone
@@ -329,7 +331,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 				throw ConstraintException(
 				    "Duplicate value violates a UNIQUE constraint on scenario table \"%s\": the value exists in "
 				    "the base table",
-				    entry.name);
+				    dc::Str(entry.name));
 			}
 		}
 
@@ -341,7 +343,9 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 			for (idx_t i = 0; i < tombstones_to_remove.size(); i++) {
 				row_ids.SetValue(i, Value::BIGINT(tombstones_to_remove[i]));
 			}
-			delta_storage.Delete(*delete_state, client, row_ids, tombstones_to_remove.size());
+			dc::SetVectorSize(row_ids, tombstones_to_remove.size());
+			scenario_compat::TableDelete(delta_storage, *delete_state, client, delta_table, row_ids,
+			                             tombstones_to_remove.size());
 		}
 	} else if (gstate.base_probe.HasSecondary()) {
 		// keyless bag delta: no mirrored UNIQUE index, so secondary UNIQUEs
@@ -356,16 +360,16 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	for (idx_t i = 0; i < chunk.size(); i++) {
 		delta_chunk.SetValue(ScenarioDelta::OP_COL, i, Value(string(1, row_ops[i])));
 	}
-	delta_chunk.data[ScenarioDelta::TS_COL].Reference(Value::TIMESTAMP(now));
+	dc::ReferenceValue(delta_chunk.data[ScenarioDelta::TS_COL], Value::TIMESTAMP(now), chunk.size());
 	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
 		delta_chunk.data[ScenarioDelta::PAYLOAD_START + col].Reference(chunk.data[col]);
 	}
 	auto count_column = ScenarioDelta::CountColumnIndex(delta_table);
 	if (count_column.IsValid()) {
 		// keyless bag deltas: every appended row carries multiplicity 1
-		delta_chunk.data[count_column.GetIndex()].Reference(Value::BIGINT(1));
+		dc::ReferenceValue(delta_chunk.data[count_column.GetIndex()], Value::BIGINT(1), chunk.size());
 	}
-	delta_chunk.SetCardinality(chunk.size());
+	delta_chunk.SetChildCardinality(chunk.size());
 
 	// (delta_keys entries for this chunk were already recorded in the
 	// classification loop above; the host write was registered by BeginWrite)
@@ -388,7 +392,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 				                       chunk.GetValue(pk_col, tombstone_source_rows[i]));
 			}
 		}
-		deleted_chunk.SetCardinality(tombstone_source_rows.size());
+		deleted_chunk.SetChildCardinality(tombstone_source_rows.size());
 		ScenarioDeltaAppendChunk(client, delta_table, gstate.delta_constraints, delta_chunk, tombstones_to_remove,
 		                         &deleted_chunk);
 	}
@@ -423,7 +427,7 @@ SourceResultType PhysicalScenarioInsert::GetDataInternal(ExecutionContext &conte
 	}
 	source.count_emitted = true;
 	chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
-	chunk.SetCardinality(1);
+	chunk.SetChildCardinality(1);
 	return SourceResultType::FINISHED;
 }
 
@@ -453,18 +457,18 @@ void ScenarioCatalog::ThrowIfNotWritable(ClientContext &context, const char *ope
 	// in, like core's.
 	if (MetaTransaction::Get(context).IsReadOnly()) {
 		throw TransactionException("Cannot write to database \"%s\" - transaction is launched in read-only mode",
-		                           GetAttached().GetName());
+		                           dc::Str(GetAttached().GetName()));
 	}
 	if (GetAttached().IsReadOnly()) {
 		throw InvalidInputException(
 		    "Cannot execute statement of type \"%s\" on database \"%s\" which is attached in read-only mode!",
-		    operation, GetAttached().GetName());
+		    operation, dc::Str(GetAttached().GetName()));
 	}
 	auto &host_db = GetHostCatalog(context).GetAttached();
 	if (host_db.IsReadOnly()) {
 		throw InvalidInputException(
 		    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode", scenario_name,
-		    host_db.GetName());
+		    dc::Str(host_db.GetName()));
 	}
 	auto entry = ScenarioRegistry::LookupById(context, GetHostCatalog(context), scenario_id);
 	if (entry && entry->frozen) {
