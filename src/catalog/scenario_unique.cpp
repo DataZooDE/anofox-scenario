@@ -32,35 +32,32 @@ void ScenarioBaseUniqueProbe::Initialize(ScenarioTableEntry &entry_p, const vect
 	}
 	auto &base = entry_p.base_entry.Cast<DuckTableEntry>();
 	unordered_set<column_t> key_set(key_columns.begin(), key_columns.end());
-	for (auto &index_entry : base.GetStorage().GetDataTableInfo()->GetIndexes().IndexEntries()) {
-		auto &index = *index_entry.index;
-		if (!index.IsUnique() || index.GetIndexType() != ART::TYPE_NAME || !index.IsBound()) {
-			continue;
-		}
-		auto &column_set = index.GetColumnIdSet();
-		bool is_key_index = !key_set.empty() && column_set.size() == key_set.size();
-		for (auto col : column_set) {
-			if (key_set.find(col) == key_set.end()) {
-				is_key_index = false;
-				break;
-			}
-		}
-		if (is_key_index) {
-			key_index = &index_entry;
-		} else {
-			secondary_indexes.push_back(index_entry);
-		}
-	}
+	scenario_compat::ForEachIndexEntry(base.GetStorage().GetDataTableInfo()->GetIndexes(),
+	                                   [&](const scenario_compat::IndexEntryRef &index_entry) {
+		                                   if (!scenario_compat::IsBoundUniqueART(index_entry)) {
+			                                   return;
+		                                   }
+		                                   auto column_set = scenario_compat::IndexColumns(index_entry);
+		                                   bool is_key_index = !key_set.empty() && column_set.size() == key_set.size();
+		                                   for (auto col : column_set) {
+			                                   if (key_set.find(col) == key_set.end()) {
+				                                   is_key_index = false;
+				                                   break;
+			                                   }
+		                                   }
+		                                   if (is_key_index) {
+			                                   key_index = index_entry;
+		                                   } else {
+			                                   secondary_indexes.push_back(index_entry);
+		                                   }
+	                                   });
 }
 
 void ScenarioBaseUniqueProbe::ProbePrimaryKey(DataChunk &rows) {
 	if (!key_index || rows.size() == 0) {
 		return;
 	}
-	auto &art = key_index->index->Cast<ART>();
-	lock_guard<mutex> guard(key_index->lock);
-	IndexAppendInfo append_info;
-	art.VerifyAppend(rows, append_info, nullptr);
+	scenario_compat::VerifyAppend(key_index, rows);
 }
 
 void ScenarioBaseUniqueProbe::CollectReplaced(ClientContext &context, DuckTableEntry &delta_table,
@@ -118,7 +115,7 @@ void ScenarioBaseUniqueProbe::CollectReplaced(ClientContext &context, DuckTableE
 				key_chunk.SetValue(k, 0, pending[key_columns[k]]);
 				key_values.push_back(pending[key_columns[k]]);
 			}
-			key_chunk.SetCardinality(1);
+			key_chunk.SetChildCardinality(1);
 			replaced_keys.emplace(ScenarioDelta::MakeKey(key_chunk, 0, positions), std::move(key_values));
 		}
 	}
@@ -129,40 +126,37 @@ void ScenarioBaseUniqueProbe::CollectReplaced(ClientContext &context, DuckTableE
 	// 2. their base rowids: a point lookup in the base PK index, or (declared
 	//    key_columns over a PK-less base) one base scan
 	if (key_index) {
-		auto &art = key_index->index->Cast<ART>();
-		lock_guard<mutex> guard(key_index->lock);
-		DataChunk key_rows;
-		key_rows.Initialize(Allocator::Get(context), table_types);
-		DataChunk expr_chunk;
-		expr_chunk.Initialize(Allocator::Get(context), art.logical_types);
-		auto it = replaced_keys.begin();
-		while (it != replaced_keys.end()) {
-			key_rows.Reset();
-			idx_t count = 0;
-			for (; it != replaced_keys.end() && count < STANDARD_VECTOR_SIZE; ++it, count++) {
-				for (idx_t col = 0; col < column_count; col++) {
-					key_rows.SetValue(col, count, Value(table_types[col]));
+		scenario_compat::WithART(key_index, false, [&](auto &art) {
+			DataChunk key_rows;
+			key_rows.Initialize(Allocator::Get(context), table_types);
+			DataChunk expr_chunk;
+			expr_chunk.Initialize(Allocator::Get(context), art.logical_types);
+			auto it = replaced_keys.begin();
+			while (it != replaced_keys.end()) {
+				key_rows.Reset();
+				idx_t count = 0;
+				for (; it != replaced_keys.end() && count < STANDARD_VECTOR_SIZE; ++it, count++) {
+					for (idx_t col = 0; col < column_count; col++) {
+						key_rows.SetValue(col, count, Value(table_types[col]));
+					}
+					for (idx_t k = 0; k < key_columns.size(); k++) {
+						key_rows.SetValue(key_columns[k], count, it->second[k]);
+					}
 				}
-				for (idx_t k = 0; k < key_columns.size(); k++) {
-					key_rows.SetValue(key_columns[k], count, it->second[k]);
-				}
-			}
-			key_rows.SetCardinality(count);
-			expr_chunk.Reset();
-			art.ExecuteExpressions(key_rows, expr_chunk);
-			ArenaAllocator arena(Allocator::Get(context));
-			unsafe_vector<ARTKey> keys(count);
-			art.GenerateKeys<>(arena, expr_chunk, keys);
-			for (idx_t i = 0; i < count; i++) {
-				if (keys[i].Empty()) {
-					continue;
-				}
-				auto leaf = ARTOperator::Lookup(art, art.tree, keys[i], 0);
-				if (leaf && leaf->GetType() == NType::LEAF_INLINED) {
-					row_ids.push_back(leaf->GetRowId());
+				key_rows.SetChildCardinality(count);
+				expr_chunk.Reset();
+				art.ExecuteExpressions(key_rows, expr_chunk);
+				ArenaAllocator arena(Allocator::Get(context));
+				unsafe_vector<ARTKey> keys(count);
+				art.template GenerateKeys<>(arena, expr_chunk, keys);
+				for (idx_t i = 0; i < count; i++) {
+					row_t row_id;
+					if (scenario_compat::LookupInlinedRowId(art, keys[i], row_id)) {
+						row_ids.push_back(row_id);
+					}
 				}
 			}
-		}
+		});
 	} else {
 		vector<StorageIndex> base_columns;
 		vector<LogicalType> base_types;
@@ -198,6 +192,7 @@ void ScenarioBaseUniqueProbe::CollectReplaced(ClientContext &context, DuckTableE
 			fetch_rowids.SetValue(i, Value::BIGINT(row_ids[offset + i]));
 		}
 		ColumnFetchState fetch_state;
+		dc::SetVectorSize(fetch_rowids, batch);
 		storage.Fetch(transaction, fetched, fetch_columns, fetch_rowids, batch, fetch_state);
 		for (idx_t i = 0; i < batch; i++) {
 			vector<Value> row_values;
@@ -218,10 +213,7 @@ void ScenarioBaseUniqueProbe::ProbeSecondary(ClientContext &context, DuckTableEn
 	// Fast path: nothing collides with any base row at all
 	try {
 		for (auto &index_entry : secondary_indexes) {
-			auto &art = index_entry.get().index->Cast<ART>();
-			lock_guard<mutex> guard(index_entry.get().lock);
-			IndexAppendInfo append_info;
-			art.VerifyAppend(rows, append_info, nullptr);
+			scenario_compat::VerifyAppend(index_entry, rows);
 		}
 		return;
 	} catch (ConstraintException &) {
@@ -238,8 +230,7 @@ void ScenarioBaseUniqueProbe::ProbeSecondary(ClientContext &context, DuckTableEn
 		table_types.push_back(entry->GetColumn(LogicalIndex(col)).Type());
 	}
 	for (auto &index_entry : secondary_indexes) {
-		auto &art = index_entry.get().index->Cast<ART>();
-		auto mask = art.CreateDeltaIndex(DeltaIndexType::LOCAL_DELETE);
+		auto mask = scenario_compat::MakeUniqueMask(index_entry);
 		idx_t offset = 0;
 		while (offset < replaced_rows.size()) {
 			idx_t batch = MinValue<idx_t>(replaced_rows.size() - offset, STANDARD_VECTOR_SIZE);
@@ -252,18 +243,12 @@ void ScenarioBaseUniqueProbe::ProbeSecondary(ClientContext &context, DuckTableEn
 				}
 				mask_row_ids.SetValue(i, Value::BIGINT(replaced_row_ids[offset + i]));
 			}
-			mask_rows.SetCardinality(batch);
-			IndexAppendInfo mask_info(IndexAppendMode::IGNORE_DUPLICATES, nullptr);
-			auto error = mask->Append(mask_rows, mask_row_ids, mask_info);
-			if (error.HasError()) {
-				throw InternalException("anofox_scenario: unexpected error building the unique mask: %s",
-				                        error.Message());
-			}
+			mask_rows.SetChildCardinality(batch);
+			dc::SetVectorSize(mask_row_ids, batch);
+			scenario_compat::MaskAppend(mask, mask_rows, mask_row_ids);
 			offset += batch;
 		}
-		lock_guard<mutex> guard(index_entry.get().lock);
-		IndexAppendInfo append_info(IndexAppendMode::DEFAULT, mask.get());
-		art.VerifyAppend(rows, append_info, nullptr);
+		scenario_compat::MaskVerifyAppend(mask, rows);
 	}
 }
 
@@ -296,8 +281,7 @@ void ScenarioBaseUniqueProbe::ProbeKeyless(ClientContext &context, DuckTableEntr
 	};
 
 	for (auto &index_entry : secondary_indexes) {
-		auto &art = index_entry.get().index->Cast<ART>();
-		auto &id_set = art.GetColumnIdSet();
+		auto id_set = scenario_compat::IndexColumns(index_entry);
 		vector<idx_t> columns(id_set.begin(), id_set.end());
 		std::sort(columns.begin(), columns.end());
 
@@ -362,9 +346,7 @@ void ScenarioBaseUniqueProbe::ProbeKeyless(ClientContext &context, DuckTableEntr
 		// none of the rows collides with a base row.
 		vector<bool> in_base(rows.size(), false);
 		try {
-			lock_guard<mutex> guard(index_entry.get().lock);
-			IndexAppendInfo append_info;
-			art.VerifyAppend(rows, append_info, nullptr);
+			scenario_compat::VerifyAppend(index_entry, rows);
 		} catch (ConstraintException &) {
 			DataChunk single;
 			single.Initialize(Allocator::Get(context), table_types);
@@ -376,11 +358,9 @@ void ScenarioBaseUniqueProbe::ProbeKeyless(ClientContext &context, DuckTableEntr
 				for (idx_t col = 0; col < column_count; col++) {
 					single.SetValue(col, 0, rows.GetValue(col, i));
 				}
-				single.SetCardinality(1);
+				single.SetChildCardinality(1);
 				try {
-					lock_guard<mutex> guard(index_entry.get().lock);
-					IndexAppendInfo append_info;
-					art.VerifyAppend(single, append_info, nullptr);
+					scenario_compat::VerifyAppend(index_entry, single);
 				} catch (ConstraintException &) {
 					in_base[i] = true;
 				}
@@ -398,7 +378,7 @@ void ScenarioBaseUniqueProbe::ProbeKeyless(ClientContext &context, DuckTableEntr
 				throw ConstraintException(
 				    "Duplicate value violates a UNIQUE constraint on keyless scenario table \"%s\": the value is "
 				    "already held by a row of the scenario",
-				    entry->name);
+				    dc::Str(entry->name));
 			}
 			held++;
 		}

@@ -88,7 +88,7 @@ void ValidateDeclaredKey(const TableCatalogEntry &base_table, const vector<strin
 	}
 	case_insensitive_set_t seen;
 	for (auto &column_name : columns) {
-		if (!base_table.ColumnExists(column_name)) {
+		if (!base_table.ColumnExists(dc::Ident(column_name))) {
 			throw InvalidInputException("key_columns for table '%s': column '%s' does not exist", table_name,
 			                            column_name);
 		}
@@ -106,14 +106,14 @@ void ValidateDeclaredKeyPinned(ClientContext &context, Catalog &base_catalog, co
 	if (base_catalog.GetCatalogType() != "ducklake") {
 		return;
 	}
-	if (!ScenarioDelta::GetPinnedBaseEntry(context, base_catalog, base_table.ParentSchema().name, base_table.name,
-	                                       pinned_at)) {
+	if (!ScenarioDelta::GetPinnedBaseEntry(context, base_catalog, dc::Str(base_table.ParentSchema().name),
+	                                       dc::Str(base_table.name), pinned_at)) {
 		throw InvalidInputException(
 		    "key_columns declared for table '%s', but it is not in the base snapshot of scenario '%s' (DuckLake "
 		    "'%s' AT %s) - it was created in the lake later. Create a new scenario over the lake's current state "
 		    "(base := '%s'; a branch keeps its parent's snapshot)",
-		    ScenarioDelta::LogicalName(base_table), scenario_name, base_catalog.GetName(),
-		    Timestamp::ToString(pinned_at), base_catalog.GetName());
+		    ScenarioDelta::LogicalName(base_table), scenario_name, dc::Str(base_catalog.GetName()),
+		    Timestamp::ToString(pinned_at), dc::Str(base_catalog.GetName()));
 	}
 }
 
@@ -122,7 +122,7 @@ unique_ptr<GlobalTableFunctionState> LifecycleInit(ClientContext &context, Table
 }
 
 unique_ptr<FunctionData> LifecycleBind(TableFunctionBindInput &input, vector<LogicalType> &return_types,
-                                       vector<string> &names) {
+                                       dc::BindNames &names) {
 	auto result = make_uniq<LifecycleBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("Scenario name cannot be NULL");
@@ -163,12 +163,12 @@ unique_ptr<FunctionData> LifecycleBind(TableFunctionBindInput &input, vector<Log
 		    "parent's state");
 	}
 	return_types.push_back(LogicalType::BOOLEAN);
-	names.push_back("success");
+	names.emplace_back("success");
 	return std::move(result);
 }
 
 unique_ptr<FunctionData> LifecycleBindWrapper(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names) {
+                                              vector<LogicalType> &return_types, dc::BindNames &names) {
 	return LifecycleBind(input, return_types, names);
 }
 
@@ -177,13 +177,13 @@ template <void (*VERB)(ClientContext &, const LifecycleBindData &)>
 void LifecycleExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<LifecycleGlobalState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	auto &bind_data = data.bind_data->Cast<LifecycleBindData>();
 	VERB(context, bind_data);
 	output.SetValue(0, 0, Value::BOOLEAN(true));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 	state.done = true;
 }
 
@@ -202,7 +202,7 @@ void CollectBaseTables(ClientContext &context, Catalog &base_source, vector<refe
 			if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal) {
 				return;
 			}
-			if (StringUtil::StartsWith(table_entry.name, "_scenario_")) {
+			if (StringUtil::StartsWith(dc::Str(table_entry.name), "_scenario_")) {
 				return; // legacy v0.1 metadata
 			}
 			out.push_back(table_entry.Cast<TableCatalogEntry>());
@@ -214,7 +214,7 @@ void CollectBaseTables(ClientContext &context, Catalog &base_source, vector<refe
 vector<string> DeltaKeyNames(TableCatalogEntry &delta) {
 	vector<string> names;
 	for (auto delta_col : ScenarioDelta::GetPKColumns(delta)) {
-		names.push_back(delta.GetColumn(LogicalIndex(delta_col)).Name());
+		names.push_back(dc::Str(delta.GetColumn(LogicalIndex(delta_col)).Name()));
 	}
 	return names;
 }
@@ -223,7 +223,7 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	auto &host_catalog = GetHostCatalog(context);
 	ScenarioRegistry::EnsureExists(context, host_catalog);
 	if (ScenarioRegistry::Lookup(context, host_catalog, bind_data.name)) {
-		throw InvalidInputException("Scenario '%s' already exists", bind_data.name);
+		throw InvalidInputException("Scenario '%s' already exists", dc::Str(bind_data.name));
 	}
 	// Branching: resolve the parent first
 	unique_ptr<ScenarioRegistryEntry> parent;
@@ -244,7 +244,7 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 	}
 	optional_ptr<Catalog> base_catalog;
 	if (!effective_base.empty()) {
-		base_catalog = Catalog::GetCatalogEntry(context, effective_base);
+		base_catalog = Catalog::GetCatalogEntry(context, dc::Ident(effective_base));
 		if (!base_catalog) {
 			throw InvalidInputException("Base catalog '%s' is not attached", effective_base);
 		}
@@ -367,7 +367,7 @@ void ThrowIfAttached(ClientContext &context, const string &scenario_name) {
 		auto &scenario_catalog = catalog.Cast<ScenarioCatalog>();
 		if (scenario_catalog.scenario_name == scenario_name) {
 			throw InvalidInputException("Scenario '%s' is attached as '%s'. DETACH it before dropping the scenario",
-			                            scenario_name, catalog.GetName());
+			                            scenario_name, dc::Str(catalog.GetName()));
 		}
 	}
 }
@@ -382,17 +382,15 @@ void DropDeltaTables(ClientContext &context, Catalog &host_catalog, int64_t scen
 	string mat_prefix = "s" + to_string(scenario_id) + "_mat_";
 	vector<string> to_drop;
 	schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-		if (entry.type == CatalogType::TABLE_ENTRY && (StringUtil::StartsWith(entry.name, delta_prefix) ||
-		                                               StringUtil::StartsWith(entry.name, mat_prefix))) {
-			to_drop.push_back(entry.name);
+		if (entry.type == CatalogType::TABLE_ENTRY && (StringUtil::StartsWith(dc::Str(entry.name), delta_prefix) ||
+		                                               StringUtil::StartsWith(dc::Str(entry.name), mat_prefix))) {
+			to_drop.push_back(dc::Str(entry.name));
 		}
 	});
 	for (auto &table_name : to_drop) {
 		DropInfo info;
 		info.type = CatalogType::TABLE_ENTRY;
-		info.catalog = host_catalog.GetName();
-		info.schema = ScenarioRegistry::SCHEMA_NAME;
-		info.name = table_name;
+		dc::SetQualifiedName(info, dc::Str(host_catalog.GetName()), ScenarioRegistry::SCHEMA_NAME, table_name);
 		host_catalog.DropEntry(context, info);
 	}
 }
@@ -401,11 +399,11 @@ void ScenarioDropVerb(ClientContext &context, const LifecycleBindData &bind_data
 	auto &host_catalog = GetHostCatalog(context);
 	auto entry = ScenarioRegistry::Lookup(context, host_catalog, bind_data.name);
 	if (!entry) {
-		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
+		throw InvalidInputException("Scenario '%s' not found", dc::Str(bind_data.name));
 	}
 	ThrowIfAttached(context, bind_data.name);
 	if (ScenarioRegistry::HasChildren(context, host_catalog, entry->scenario_id)) {
-		throw ConstraintException("Cannot drop scenario '%s': other scenarios branch from it", bind_data.name);
+		throw ConstraintException("Cannot drop scenario '%s': other scenarios branch from it", dc::Str(bind_data.name));
 	}
 	// Mark the host writable before dropping catalog entries
 	MetaTransaction::Get(context).ModifyDatabase(host_catalog.GetAttached(),
@@ -420,7 +418,7 @@ void ScenarioFreezeVerb(ClientContext &context, const LifecycleBindData &bind_da
 	auto &host_catalog = GetHostCatalog(context);
 	auto entry = ScenarioRegistry::Lookup(context, host_catalog, bind_data.name);
 	if (!entry) {
-		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
+		throw InvalidInputException("Scenario '%s' not found", dc::Str(bind_data.name));
 	}
 	ScenarioRegistry::SetFrozen(context, host_catalog, entry->scenario_id, true);
 }
@@ -429,12 +427,12 @@ void ScenarioUnfreezeVerb(ClientContext &context, const LifecycleBindData &bind_
 	auto &host_catalog = GetHostCatalog(context);
 	auto entry = ScenarioRegistry::Lookup(context, host_catalog, bind_data.name);
 	if (!entry) {
-		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
+		throw InvalidInputException("Scenario '%s' not found", dc::Str(bind_data.name));
 	}
 	if (entry->has_merged_at) {
 		throw InvalidInputException("Scenario '%s' was already merged back into the base - its changelog is "
 		                            "closed. Create a new scenario instead",
-		                            bind_data.name);
+		                            dc::Str(bind_data.name));
 	}
 	ScenarioRegistry::SetFrozen(context, host_catalog, entry->scenario_id, false);
 }
@@ -451,7 +449,7 @@ struct RefreshState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ScenarioRefreshBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, dc::BindNames &names) {
 	auto result = make_uniq<LifecycleBindData>();
 	if (input.inputs[0].IsNull()) {
 		throw InvalidInputException("Scenario name cannot be NULL");
@@ -480,7 +478,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioRefreshInit(ClientContext &context,
 void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<RefreshState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -488,26 +486,26 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 	auto &host_catalog = GetHostCatalog(context);
 	auto entry = ScenarioRegistry::Lookup(context, host_catalog, bind_data.name);
 	if (!entry) {
-		throw InvalidInputException("Scenario '%s' not found", bind_data.name);
+		throw InvalidInputException("Scenario '%s' not found", dc::Str(bind_data.name));
 	}
 	if (entry->frozen) {
 		throw InvalidInputException("Cannot refresh scenario '%s': it is frozen. Unfreeze it first",
-		                            bind_data.name);
+		                            dc::Str(bind_data.name));
 	}
 	if (entry->mode == "materialized") {
 		throw InvalidInputException(
 		    "Cannot refresh scenario '%s': materialized scenarios are point-in-time copies and do not pick up "
 		    "new base tables",
-		    bind_data.name);
+		    dc::Str(bind_data.name));
 	}
 	idx_t refreshed = 0;
 	if (!bind_data.key_columns.empty()) {
 		// Phase 4: honor a cross-catalog base
 		optional_ptr<Catalog> base_source = &host_catalog;
 		if (!entry->base_catalog.empty()) {
-			base_source = Catalog::GetCatalogEntry(context, entry->base_catalog);
+			base_source = Catalog::GetCatalogEntry(context, dc::Ident(entry->base_catalog));
 			if (!base_source) {
-				throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", bind_data.name,
+				throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", dc::Str(bind_data.name),
 				                            entry->base_catalog);
 			}
 		}
@@ -531,19 +529,19 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 				if (ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, declared.first)) {
 					throw InvalidInputException("key_columns declared for table '%s', but scenario '%s' already "
 					                            "tracks it - row identity cannot be changed after the fact",
-					                            declared.first, bind_data.name);
+					                            declared.first, dc::Str(bind_data.name));
 				}
 				vector<string> recorded;
 				if (ScenarioRegistry::LookupDeclaredKey(context, host_catalog, entry->scenario_id, declared.first,
 				                                        recorded)) {
 					bool broken = false;
 					for (auto &column : recorded) {
-						broken = broken || !base_table.get().ColumnExists(column);
+						broken = broken || !base_table.get().ColumnExists(dc::Ident(column));
 					}
 					if (!broken) {
 						throw InvalidInputException("key_columns declared for table '%s', but scenario '%s' already "
 						                            "tracks it - row identity cannot be changed after the fact",
-						                            declared.first, bind_data.name);
+						                            declared.first, dc::Str(bind_data.name));
 					}
 					replaced.insert(declared.first);
 				}
@@ -564,7 +562,7 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 		}
 	}
 	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(refreshed)));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 //===----------------------------------------------------------------------===//
@@ -579,7 +577,7 @@ struct ScenarioListState : public GlobalTableFunctionState {
 };
 
 unique_ptr<FunctionData> ScenarioListBind(ClientContext &context, TableFunctionBindInput &input,
-                                          vector<LogicalType> &return_types, vector<string> &names) {
+                                          vector<LogicalType> &return_types, dc::BindNames &names) {
 	return_types = {LogicalType::BIGINT,  LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::BOOLEAN,
 	                LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR};
 	names = {"scenario_id", "name", "mode", "frozen", "parent", "created_at", "description"};
@@ -615,28 +613,29 @@ void ScenarioListExecute(ClientContext &context, TableFunctionInput &data, DataC
 		output.SetValue(6, count, entry.has_description ? Value(entry.description) : Value(LogicalType::VARCHAR));
 		count++;
 	}
-	output.SetCardinality(count);
+	output.SetChildCardinality(count);
 }
 
 TableFunctionSet MakeVerbSet(const string &name, table_function_t function, bool is_create) {
-	TableFunctionSet set(name);
+	TableFunctionSet set(dc::FunctionName(name));
+	auto add_create_parameters = [](TableFunction &fn) {
+		dc::AddNamedParameter(fn, "mode", LogicalType::VARCHAR);
+		dc::AddNamedParameter(fn, "from_scenario", LogicalType::VARCHAR);
+		dc::AddNamedParameter(fn, "base", LogicalType::VARCHAR);
+		dc::AddNamedParameter(fn, "key_columns",
+		                      LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)));
+	};
 	TableFunction one_arg({LogicalType::VARCHAR}, function, LifecycleBindWrapper, LifecycleInit);
+	dc::NameParameters(one_arg, {"scenario"});
 	if (is_create) {
-		one_arg.named_parameters["mode"] = LogicalType::VARCHAR;
-		one_arg.named_parameters["from_scenario"] = LogicalType::VARCHAR;
-		one_arg.named_parameters["base"] = LogicalType::VARCHAR;
-		one_arg.named_parameters["key_columns"] =
-		    LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
+		add_create_parameters(one_arg);
 	}
 	set.AddFunction(one_arg);
 	if (is_create) {
 		TableFunction two_arg({LogicalType::VARCHAR, LogicalType::VARCHAR}, function, LifecycleBindWrapper,
 		                      LifecycleInit);
-		two_arg.named_parameters["mode"] = LogicalType::VARCHAR;
-		two_arg.named_parameters["from_scenario"] = LogicalType::VARCHAR;
-		two_arg.named_parameters["base"] = LogicalType::VARCHAR;
-		two_arg.named_parameters["key_columns"] =
-		    LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
+		dc::NameParameters(two_arg, {"scenario", "description"});
+		add_create_parameters(two_arg);
 		set.AddFunction(two_arg);
 	}
 	return set;
@@ -725,7 +724,9 @@ void ScenarioLifecycle::RegisterFunctions(ExtensionLoader &loader) {
 		TableFunction refresh("scenario_refresh", {LogicalType::VARCHAR}, DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioRefreshExecute),
 		                      DATAZOO_GUARD(ANOFOX_SCENARIO_BANNER, ScenarioRefreshBind),
 		                      ScenarioRefreshInit);
-		refresh.named_parameters["key_columns"] = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR));
+		dc::NameParameters(refresh, {"scenario"});
+		dc::AddNamedParameter(refresh, "key_columns",
+		                      LogicalType::MAP(LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)));
 		CreateTableFunctionInfo info(std::move(refresh));
 		info.descriptions.push_back(ScenarioDoc(
 		    "Deprecated: tables added to the base after scenario_create are writable without it. Only declares "

@@ -130,6 +130,12 @@ public:
 	//! per-transaction state, so a lock per connection suffices: first writes
 	//! of different connections (or databases) do not serialize
 	mutex write_lock;
+	//! Serializes the Sink calls of this connection's scenario DML sinks. The
+	//! actions of one MERGE INTO are separate sinks over the same delta; on
+	//! DuckDB 2.0 they run as concurrent pipelines (fed through broadcast
+	//! exchanges), and transaction-local appends to one table, like the
+	//! statement's double-touch tracking, are not thread-safe.
+	mutex sink_lock;
 
 	//! The declared keys of one scenario as this transaction sees them,
 	//! loaded once per (transaction, host, scenario): a table entry is built
@@ -141,6 +147,21 @@ public:
 	shared_ptr<const DeclaredKeys> GetDeclaredKeys(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
 	                                               const std::function<DeclaredKeys()> &load);
 	void Invalidate(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+
+	//! Write attribution (#31): a scenario writes only the HOST database (its
+	//! sinks register it at execution, ScenarioCatalog::MarkHostWrite), so a
+	//! DML statement must not register the scenario catalog as a modified
+	//! database - MetaTransaction allows one per transaction, which would
+	//! forbid host and scenario writes in one transaction. DuckDB 1.5.6's
+	//! binder skips the registration for the temporary-flagged scenario table
+	//! entries; 2.0's registers every DML target, so the scenario entries are
+	//! demoted to reads here, once the statement is prepared. A no-op where
+	//! the binder never registered them.
+	bool CanRequestRebind() override {
+		return true;
+	}
+	RebindQueryInfo OnFinalizePrepare(ClientContext &context, PreparedStatementData &prepared,
+	                                  PreparedStatementMode mode) override;
 
 private:
 	mutex cache_lock;

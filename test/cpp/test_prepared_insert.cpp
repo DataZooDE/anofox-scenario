@@ -11,6 +11,7 @@
 
 #include "catch.hpp"
 #include "test_helpers.hpp"
+#include "duckdb/main/extension_helper.hpp"
 
 using namespace duckdb;
 
@@ -33,11 +34,36 @@ void RequireSuccess(QueryResult &result, const string &what) {
 int64_t QueryInt(Connection &con, const string &sql) {
 	auto result = con.Query(sql);
 	RequireSuccess(*result, sql);
-	return result->GetValue(0, 0).GetValue<int64_t>();
+	// Fetch() rather than GetValue(col, row): DuckDB 2.0 has no materialized result type
+	auto chunk = result->Fetch();
+	if (!chunk || chunk->size() == 0) {
+		FAIL(sql << ": no rows");
+	}
+	return chunk->GetValue(0, 0).GetValue<int64_t>();
+}
+
+//! Load the extension the way the sqllogictest runner's `require` does: the
+//! copy linked into unittest (DuckDB 1.5), else the built extension file
+//! (DuckDB 2.0 no longer links out-of-tree extensions into unittest).
+//! Returns false - and the test is skipped, as `require` skips a sqllogictest
+//! - when the file was built for a different DuckDB version string: the 2.0
+//! pre-release CI builds unittest with a version the extension metadata does
+//! not match.
+bool LoadScenarioExtension(DuckDB &db) {
+	if (ExtensionHelper::LoadExtension(db, "anofox_scenario") == ExtensionLoadResult::LOADED_EXTENSION) {
+		return true;
+	}
+	Connection con(db);
+	auto result = con.Query(string("LOAD '") + ANOFOX_SCENARIO_EXTENSION_FILE + "'");
+	if (result->HasError() && result->GetError().find("was built specifically for DuckDB version") != string::npos) {
+		WARN("skipped: " << result->GetError());
+		return false;
+	}
+	REQUIRE_NO_FAIL(*result);
+	return true;
 }
 
 void SetupBase(Connection &con) {
-	REQUIRE_NO_FAIL(con.Query("LOAD anofox_scenario"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE p1d_summary (metric VARCHAR PRIMARY KEY, value DOUBLE NOT NULL)"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE suppliers (supplier_id BIGINT PRIMARY KEY, name VARCHAR NOT NULL)"));
 	REQUIRE_NO_FAIL(con.Query("CREATE TABLE order_plan (supplier_id BIGINT, period INTEGER, sku VARCHAR NOT NULL, "
@@ -70,7 +96,11 @@ TEST_CASE("test/cpp/prepared_insert_across_transactions", "[anofox_scenario]") {
 	int64_t expected_qty = 0;
 	idx_t expected_rows = 0;
 	{
-		DuckDB db(db_path);
+		auto config = GetTestConfig(); // allows the unsigned build of the extension
+		DuckDB db(db_path, config.get());
+		if (!LoadScenarioExtension(db)) {
+			return;
+		}
 		Connection con(db);
 		SetupBase(con);
 		REQUIRE_NO_FAIL(con.Query("ATTACH 'winner' AS ws (TYPE scenario)"));
@@ -148,9 +178,12 @@ TEST_CASE("test/cpp/prepared_insert_across_transactions", "[anofox_scenario]") {
 
 	// --- durable across a restart ----------------------------------------------------
 	{
-		DuckDB db(db_path);
+		auto config = GetTestConfig(); // allows the unsigned build of the extension
+		DuckDB db(db_path, config.get());
 		Connection con(db);
-		REQUIRE_NO_FAIL(con.Query("LOAD anofox_scenario"));
+		if (!LoadScenarioExtension(db)) {
+			return;
+		}
 		REQUIRE_NO_FAIL(con.Query("ATTACH 'winner' AS ws (TYPE scenario)"));
 		REQUIRE(QueryInt(con, "SELECT count(*) FROM ws.order_plan") == int64_t(expected_rows));
 		REQUIRE(QueryInt(con, "SELECT sum(qty) FROM ws.order_plan") == expected_qty);

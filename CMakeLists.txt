@@ -10,6 +10,14 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 project(${TARGET_NAME})
 include_directories(src/include)
 
+# One source tree for DuckDB v1.5.6 and 2.0: API differences sit behind the
+# header-only shims of duckdb-compat (generic) and
+# src/include/catalog/scenario_compat.hpp (scenario-specific storage internals).
+# Include path only: DuckDB export()s the extension targets, so linking the
+# INTERFACE target would fail the generate step ("not in any export set").
+add_subdirectory(duckdb-compat)
+include_directories(duckdb-compat/include)
+
 # Add PostHog telemetry library (requires OpenSSL, not available for WASM/MinGW/cross-compile)
 set(TELEMETRY_SUPPORTED TRUE)
 if(DEFINED ENV{DUCKDB_WASM_PLATFORM} OR "${DUCKDB_EXPLICIT_PLATFORM}" MATCHES "^wasm" OR EMSCRIPTEN)
@@ -78,6 +86,12 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} datazoo_banner)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} datazoo_banner)
 
+# The sources and duckdb-compat need C++17. DuckDB 1.5 sets CMAKE_CXX_STANDARD
+# 11; GCC's default happens to be newer, but Apple Clang and Emscripten then
+# compile as C++11 (no std::optional, no generic lambdas).
+target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
+target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
+
 # Fix "multiple definition of duckdb::LogicalType::VARCHAR/BIGINT/TIMESTAMP".
 # DuckDB core is built as C++11 and emits strong out-of-line definitions of its
 # `static constexpr` LogicalType members. This extension is C++17, so when its
@@ -105,8 +119,10 @@ if(TELEMETRY_LIBS)
         target_link_libraries(${EXTENSION_NAME} ${TELEMETRY_LIBS} bcrypt)
         target_link_libraries(${LOADABLE_EXTENSION_NAME} ${TELEMETRY_LIBS} bcrypt)
     elseif(APPLE)
-        target_link_libraries(${EXTENSION_NAME} ${TELEMETRY_LIBS} "-framework CoreFoundation" "-framework SystemConfiguration")
-        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${TELEMETRY_LIBS} "-framework CoreFoundation" "-framework SystemConfiguration")
+        # Security: DuckDB 2.0's httplib (used by the telemetry client) reads the
+        # macOS keychain when built with OpenSSL
+        target_link_libraries(${EXTENSION_NAME} ${TELEMETRY_LIBS} "-framework CoreFoundation" "-framework SystemConfiguration" "-framework Security")
+        target_link_libraries(${LOADABLE_EXTENSION_NAME} ${TELEMETRY_LIBS} "-framework CoreFoundation" "-framework SystemConfiguration" "-framework Security")
     else()
         target_link_libraries(${EXTENSION_NAME} ${TELEMETRY_LIBS})
         target_link_libraries(${LOADABLE_EXTENSION_NAME} ${TELEMETRY_LIBS})
@@ -134,6 +150,10 @@ if(NOT EMSCRIPTEN AND NOT CMAKE_VERSION VERSION_LESS "3.19")
         get_property(sources GLOBAL PROPERTY ANOFOX_SCENARIO_CPP_TESTS)
         if(TARGET unittest AND sources)
             target_sources(unittest PRIVATE ${sources})
+            # the built extension file, for lines that do not link it into
+            # unittest (DuckDB 2.0)
+            target_compile_definitions(unittest PRIVATE
+                ANOFOX_SCENARIO_EXTENSION_FILE="${CMAKE_BINARY_DIR}/extension/anofox_scenario/anofox_scenario.duckdb_extension")
         endif()
     endfunction()
     cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR} CALL anofox_scenario_add_cpp_tests)

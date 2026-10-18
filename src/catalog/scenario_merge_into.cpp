@@ -120,10 +120,8 @@ PhysicalOperator &ScenarioCatalog::PlanMergeInto(ClientContext &context, Physica
 	}
 
 	// scenario sinks are single-threaded (ParallelSink() = false)
-	auto &result = planner.Make<PhysicalMergeInto>(op.types, std::move(actions), op.row_id_start, op.source_marker,
-	                                               false /* parallel */, op.return_chunk);
-	result.children.push_back(plan);
-	return result;
+	return scenario_compat::MakeMergeInto(planner, op.types, plan, std::move(actions), op.row_id_start,
+	                                      op.source_marker, false /* parallel */, op.return_chunk);
 }
 
 } // namespace duckdb

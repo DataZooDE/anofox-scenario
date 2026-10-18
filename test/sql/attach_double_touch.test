@@ -123,11 +123,36 @@ CALL scenario_create('m');
 statement ok
 ATTACH 'm' AS s (TYPE scenario);
 
-# MERGE reports the matched source rows, exactly like core on a plain table
-query I
+# A target row matched twice by WHEN MATCHED THEN DELETE behaves exactly like
+# core on a plain table: DuckDB 1.5 deletes it once, DuckDB 2.0 rejects the
+# statement (cardinality violation, as PostgreSQL does). Both outcomes are
+# accepted; the scenario must end up where the plain-table oracle does.
+statement ok
+CREATE TABLE stock_m_oracle AS SELECT * FROM stock;
+
+statement ok
+CREATE TABLE events_m_oracle AS SELECT * FROM events;
+
+statement maybe
+MERGE INTO stock_m_oracle t USING recall r ON t.sku = r.sku WHEN MATCHED THEN DELETE;
+----
+same target row more than once
+
+statement maybe
 MERGE INTO s.stock t USING recall r ON t.sku = r.sku WHEN MATCHED THEN DELETE;
 ----
-3
+same target row more than once
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s.stock EXCEPT ALL SELECT * FROM stock_m_oracle)
+    UNION ALL (SELECT * FROM stock_m_oracle EXCEPT ALL SELECT * FROM s.stock));
+----
+0
+
+# from here on the same state on every DuckDB version (a no-op where the
+# MERGE deleted the rows already)
+statement ok
+DELETE FROM s.stock WHERE sku IN (SELECT sku FROM recall);
 
 query TI
 SELECT * FROM s.stock ORDER BY sku;
@@ -136,22 +161,39 @@ B2	20
 D4	40
 
 # two DELETE actions matching one row through different source rows
-query I
+statement maybe
 MERGE INTO s.stock t USING (VALUES ('B2', 1), ('B2', 2)) v(sku, q) ON t.sku = v.sku
     WHEN MATCHED AND v.q = 1 THEN DELETE
     WHEN MATCHED THEN DELETE;
 ----
-2
+same target row more than once
+
+statement ok
+DELETE FROM s.stock WHERE sku = 'B2';
 
 query TI
 SELECT * FROM s.stock ORDER BY sku;
 ----
 D4	40
 
-query I
+statement maybe
+MERGE INTO events_m_oracle t USING recall r ON t.sku = r.sku WHEN MATCHED THEN DELETE;
+----
+same target row more than once
+
+statement maybe
 MERGE INTO s.events t USING recall r ON t.sku = r.sku WHEN MATCHED THEN DELETE;
 ----
-5
+same target row more than once
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s.events EXCEPT ALL SELECT * FROM events_m_oracle)
+    UNION ALL (SELECT * FROM events_m_oracle EXCEPT ALL SELECT * FROM s.events));
+----
+0
+
+statement ok
+DELETE FROM s.events USING recall WHERE events.sku = recall.sku;
 
 query TT
 SELECT * FROM s.events;
@@ -163,7 +205,7 @@ statement error
 MERGE INTO s.stock t USING (VALUES ('D4', 1), ('D4', 2)) v(sku, q) ON t.sku = v.sku
     WHEN MATCHED THEN UPDATE SET qty = v.q;
 ----
-same row twice
+<REGEX>:.*(same row twice|same target row more than once).*
 
 # keyed: one row hit by a DELETE action and an UPDATE action - the clear
 # double-touch error, not a raw delta PRIMARY KEY violation
@@ -172,14 +214,14 @@ MERGE INTO s.stock t USING (VALUES ('D4', 1), ('D4', 2)) v(sku, q) ON t.sku = v.
     WHEN MATCHED AND v.q = 1 THEN DELETE
     WHEN MATCHED THEN UPDATE SET qty = v.q;
 ----
-same row twice
+<REGEX>:.*(same row twice|same target row more than once).*
 
 statement error
 MERGE INTO s.stock t USING (VALUES ('D4', 1), ('D4', 2)) v(sku, q) ON t.sku = v.sku
     WHEN MATCHED AND v.q = 2 THEN DELETE
     WHEN MATCHED THEN UPDATE SET qty = v.q;
 ----
-same row twice
+<REGEX>:.*(same row twice|same target row more than once).*
 
 # a scenario-inserted row (delta origin) too
 statement ok
@@ -190,13 +232,13 @@ MERGE INTO s.stock t USING (VALUES ('F6', 1), ('F6', 2)) v(sku, q) ON t.sku = v.
     WHEN MATCHED AND v.q = 1 THEN UPDATE SET qty = v.q
     WHEN MATCHED THEN DELETE;
 ----
-same row twice
+<REGEX>:.*(same row twice|same target row more than once).*
 
 # UPDATE ... FROM with a duplicate match stays an error (the result would be arbitrary)
 statement error
 UPDATE s.stock SET qty = v.q FROM (VALUES ('D4', 1), ('D4', 2)) v(sku, q) WHERE stock.sku = v.sku;
 ----
-same row twice
+<REGEX>:.*(same row twice|same target row more than once).*
 
 # the failed statements changed nothing
 query TI
@@ -229,7 +271,7 @@ INSERT INTO s.stock VALUES ('G7', 70);
 statement error
 UPDATE s.stock SET sku = 'G7' WHERE sku = 'D4' OR sku = 'G7';
 ----
-<REGEX>:.*(same row twice|Duplicate key).*
+<REGEX>:.*(same row twice|same target row more than once|Duplicate key).*
 
 query TI
 SELECT * FROM s.stock ORDER BY sku;

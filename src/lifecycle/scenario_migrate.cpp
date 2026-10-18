@@ -38,11 +38,12 @@ struct MigrateState : public GlobalTableFunctionState {
 
 optional_ptr<DuckTableEntry> TryGetMainTable(ClientContext &context, Catalog &host, const string &schema_name,
                                              const string &table_name) {
-	auto schema = host.GetSchema(context, schema_name, OnEntryNotFound::RETURN_NULL);
+	auto schema = host.GetSchema(context, dc::Ident(schema_name), OnEntryNotFound::RETURN_NULL);
 	if (!schema) {
 		return nullptr;
 	}
-	auto entry = schema->GetEntry(schema->GetCatalogTransaction(context), CatalogType::TABLE_ENTRY, table_name);
+	auto entry =
+	    schema->GetEntry(schema->GetCatalogTransaction(context), CatalogType::TABLE_ENTRY, dc::Ident(table_name));
 	if (!entry || entry->type != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
@@ -52,9 +53,7 @@ optional_ptr<DuckTableEntry> TryGetMainTable(ClientContext &context, Catalog &ho
 void DropTable(ClientContext &context, Catalog &host, const string &schema_name, const string &table_name) {
 	DropInfo info;
 	info.type = CatalogType::TABLE_ENTRY;
-	info.catalog = host.GetName();
-	info.schema = schema_name;
-	info.name = table_name;
+	dc::SetQualifiedName(info, dc::Str(host.GetName()), schema_name, table_name);
 	info.if_not_found = OnEntryNotFound::RETURN_NULL;
 	host.DropEntry(context, info);
 }
@@ -62,8 +61,7 @@ void DropTable(ClientContext &context, Catalog &host, const string &schema_name,
 void DropSchema(ClientContext &context, Catalog &host, const string &schema_name) {
 	DropInfo info;
 	info.type = CatalogType::SCHEMA_ENTRY;
-	info.catalog = host.GetName();
-	info.name = schema_name;
+	dc::SetQualifiedName(info, dc::Str(host.GetName()), INVALID_SCHEMA, schema_name);
 	info.if_not_found = OnEntryNotFound::RETURN_NULL;
 	info.cascade = true;
 	host.DropEntry(context, info);
@@ -135,7 +133,7 @@ void MigrateDeltaTable(ClientContext &context, Catalog &host, DuckTableEntry &le
 	idx_t count = 0;
 	auto flush = [&]() {
 		if (count > 0) {
-			chunk.SetCardinality(count);
+			chunk.SetChildCardinality(count);
 			v2_storage.LocalAppend(v2_delta, context, chunk, constraints);
 			chunk.Reset();
 			count = 0;
@@ -160,7 +158,7 @@ void MigrateDeltaTable(ClientContext &context, Catalog &host, DuckTableEntry &le
 void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
 	auto &state = data.global_state->Cast<MigrateState>();
 	if (state.done) {
-		output.SetCardinality(0);
+		output.SetChildCardinality(0);
 		return;
 	}
 	state.done = true;
@@ -174,7 +172,7 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 	if (!legacy_registry && !legacy_snapshots) {
 		output.SetValue(0, 0, Value::BIGINT(0));
 		output.SetValue(1, 0, Value::BIGINT(0));
-		output.SetCardinality(1);
+		output.SetChildCardinality(1);
 		return;
 	}
 
@@ -226,7 +224,7 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 				throw InvalidInputException(
 				    "scenario_migrate: scenario '%s' already exists in the v2 registry - migration must run on "
 				    "an unmigrated database",
-				    legacy.name);
+				    dc::Str(legacy.name));
 			}
 			ScenarioRegistryEntry entry;
 			entry.scenario_id = ScenarioRegistry::NextId(context, host);
@@ -250,7 +248,7 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 		vector<reference<TableCatalogEntry>> base_tables;
 		host_schema.Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
 			if (table_entry.type != CatalogType::TABLE_ENTRY || table_entry.internal ||
-			    StringUtil::StartsWith(table_entry.name, "_scenario_")) {
+			    StringUtil::StartsWith(dc::Str(table_entry.name), "_scenario_")) {
 				return;
 			}
 			base_tables.push_back(table_entry.Cast<TableCatalogEntry>());
@@ -299,7 +297,7 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 		for (auto &snap : snapshots) {
 			if (ScenarioRegistry::Lookup(context, host, snap.name)) {
 				throw InvalidInputException(
-				    "scenario_migrate: snapshot '%s' collides with an existing v2 scenario name", snap.name);
+				    "scenario_migrate: snapshot '%s' collides with an existing v2 scenario name", dc::Str(snap.name));
 			}
 			ScenarioRegistryEntry entry;
 			entry.scenario_id = ScenarioRegistry::NextId(context, host);
@@ -314,7 +312,7 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 			ScenarioRegistry::Insert(context, host, entry);
 
 			// copy each snapshot table into the v2 materialized layout
-			auto snap_schema = host.GetSchema(context, snap.schema, OnEntryNotFound::RETURN_NULL);
+			auto snap_schema = host.GetSchema(context, dc::Ident(snap.schema), OnEntryNotFound::RETURN_NULL);
 			if (snap_schema) {
 				vector<reference<TableCatalogEntry>> snap_tables;
 				snap_schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &table_entry) {
@@ -326,8 +324,8 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 					// legacy snapshot tables live in a _snap_* schema but are
 					// logically main-schema tables (their deltas come with
 					// the first write, #34)
-					ScenarioDelta::CreateMatTable(context, host, entry.scenario_id, snap_table.get(),
-					                              &snap_table.get().name);
+					auto logical_name = dc::Str(snap_table.get().name);
+					ScenarioDelta::CreateMatTable(context, host, entry.scenario_id, snap_table.get(), &logical_name);
 				}
 				legacy_schemas_to_drop.push_back(snap.schema);
 			}
@@ -347,11 +345,11 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 
 	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(migrated_scenarios)));
 	output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(migrated_snapshots)));
-	output.SetCardinality(1);
+	output.SetChildCardinality(1);
 }
 
 unique_ptr<FunctionData> ScenarioMigrateBind(ClientContext &context, TableFunctionBindInput &input,
-                                             vector<LogicalType> &return_types, vector<string> &names) {
+                                             vector<LogicalType> &return_types, dc::BindNames &names) {
 	return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
 	names = {"migrated_scenarios", "migrated_snapshots"};
 	return make_uniq<TableFunctionData>();

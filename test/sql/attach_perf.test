@@ -70,7 +70,7 @@ PRAGMA explain_output='physical_only';
 query II
 EXPLAIN SELECT v FROM p.big WHERE id = 123456;
 ----
-physical_plan	<REGEX>:.*Filters.*id=123456.*
+physical_plan	<REGEX>:.*Filters.*id ?= ?123456.*
 
 # pushed filters stay correct across both merge sides:
 # id=200 was updated in the scenario (delta side)...

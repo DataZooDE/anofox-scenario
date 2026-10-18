@@ -32,27 +32,27 @@ WHERE function_name LIKE 'scenario%'
 # These pin the RENDERED list, not just the absence of col0, and they are the
 # reason the lists in scenario_lifecycle.cpp can be trusted.
 #
-# duckdb_functions() replaces the whole parameter list once parameter_names is
-# non-empty: it walks positional arguments FOLLOWED BY named ones and pads any
-# shortfall with col1, col2. So a function with named parameters has to list
-# them too -- and they come out in fun.named_parameters map order, which is a
-# case_insensitive_map_t and therefore neither sorted nor guaranteed stable.
-#
-# If that order ever shifts, these fail loudly. Without them the same shift
-# would silently misname every argument while still reporting 100% coverage.
+# DuckDB 1.5: duckdb_functions() replaces the whole parameter list once
+# parameter_names is non-empty: it walks positional arguments FOLLOWED BY named
+# ones and pads any shortfall with col1, col2. So a function with named
+# parameters has to list them too, in fun.named_parameters map order (a
+# case_insensitive_map_t: neither sorted nor guaranteed stable). DuckDB 2.0
+# renders the signature itself: positional names (dc::NameParameters), then the
+# named parameters in declaration order. The positional prefix is pinned
+# exactly; the named parameters as a sorted set, which both lines agree on.
 # ============================================================================
 
-query I
-SELECT parameters FROM duckdb_functions()
+query II
+SELECT parameters[1:1], list_sort(parameters[2:]) FROM duckdb_functions()
 WHERE function_name = 'scenario_create' AND len(parameters) = 5;
 ----
-[scenario, key_columns, base, from_scenario, mode]
+[scenario]	[base, from_scenario, key_columns, mode]
 
-query I
-SELECT parameters FROM duckdb_functions()
+query II
+SELECT parameters[1:2], list_sort(parameters[3:]) FROM duckdb_functions()
 WHERE function_name = 'scenario_create' AND len(parameters) = 6;
 ----
-[scenario, description, key_columns, base, from_scenario, mode]
+[scenario, description]	[base, from_scenario, key_columns, mode]
 
 query I
 SELECT parameters FROM duckdb_functions() WHERE function_name = 'scenario_refresh';

@@ -65,12 +65,12 @@ string ScenarioDelta::CountColumnName(const TableCatalogEntry &delta_table) {
 	if (!index.IsValid()) {
 		return string();
 	}
-	return delta_table.GetColumn(LogicalIndex(index.GetIndex())).Name();
+	return dc::Str(delta_table.GetColumn(LogicalIndex(index.GetIndex())).Name());
 }
 
 string ScenarioDelta::NewCountColumnName(const ColumnList &payload_columns) {
 	string name = COUNT_COLUMN;
-	while (payload_columns.ColumnExists(name)) {
+	while (payload_columns.ColumnExists(dc::Ident(name))) {
 		name = "_" + name;
 	}
 	return name;
@@ -93,7 +93,7 @@ static vector<reference<DuckTableEntry>> ScenarioDeltaTables(ClientContext &cont
 	}
 	auto prefix = "s" + to_string(scenario_id) + "_delta_";
 	schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-		if (entry.type == CatalogType::TABLE_ENTRY && StringUtil::StartsWith(entry.name, prefix)) {
+		if (entry.type == CatalogType::TABLE_ENTRY && StringUtil::StartsWith(dc::Str(entry.name), prefix)) {
 			result.push_back(entry.Cast<DuckTableEntry>());
 		}
 	});
@@ -113,7 +113,7 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 	vector<string> legacy_names;
 	for (auto &delta : ScenarioDeltaTables(context, host_catalog, scenario_id)) {
 		if (IsLegacyKeylessDelta(delta.get())) {
-			legacy_names.push_back(delta.get().name);
+			legacy_names.push_back(dc::Str(delta.get().name));
 		}
 	}
 	for (auto &table_name : legacy_names) {
@@ -125,9 +125,7 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 		// _count, NOT NULL on the metadata columns, and no UNIQUE mirror (a
 		// bag delta holds D rows next to the I rows they cancel)
 		auto info = make_uniq<CreateTableInfo>();
-		info->catalog = host_catalog.GetName();
-		info->schema = ScenarioRegistry::SCHEMA_NAME;
-		info->table = table_name;
+		dc::SetQualifiedName(*info, dc::Str(host_catalog.GetName()), ScenarioRegistry::SCHEMA_NAME, table_name);
 		info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 		vector<LogicalType> old_types;
 		for (auto &col : old_table->GetColumns().Physical()) {
@@ -136,7 +134,7 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 		}
 		auto count_index = info->columns.LogicalColumnCount();
 		auto count_name = NewCountColumnName(info->columns);
-		info->columns.AddColumn(ColumnDefinition(count_name, LogicalType::BIGINT));
+		info->columns.AddColumn(ColumnDefinition(dc::Ident(count_name), LogicalType::BIGINT));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(OP_COL)));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TS_COL)));
 		info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(count_index)));
@@ -158,7 +156,7 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 			state.Initialize(std::move(column_ids), context);
 			DataChunk chunk;
 			chunk.Initialize(Allocator::Get(context), old_types);
-			while (storage.NextParallelScan(context, parallel_state, state) > 0) {
+			while (scenario_compat::ParallelScanHasMore(storage.NextParallelScan(context, parallel_state, state))) {
 				while (true) {
 					chunk.Reset();
 					storage.Scan(transaction, chunk, state);
@@ -172,9 +170,7 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 
 		DropInfo drop;
 		drop.type = CatalogType::TABLE_ENTRY;
-		drop.catalog = host_catalog.GetName();
-		drop.schema = ScenarioRegistry::SCHEMA_NAME;
-		drop.name = table_name;
+		dc::SetQualifiedName(drop, dc::Str(host_catalog.GetName()), ScenarioRegistry::SCHEMA_NAME, table_name);
 		drop.if_not_found = OnEntryNotFound::THROW_EXCEPTION;
 		host_catalog.DropEntry(context, drop);
 		host_catalog.CreateTable(context, std::move(info));
@@ -194,8 +190,8 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 				append_chunk.data[col].Reference(chunk.data[col]);
 			}
 			// every pre-v0.4.1 row is exactly one inserted copy
-			append_chunk.data[count_index].Reference(Value::BIGINT(1));
-			append_chunk.SetCardinality(chunk.size());
+			dc::ReferenceValue(append_chunk.data[count_index], Value::BIGINT(1), chunk.size());
+			append_chunk.SetChildCardinality(chunk.size());
 			new_table->GetStorage().LocalAppend(*new_table, context, append_chunk, constraints);
 		}
 	}
@@ -231,7 +227,7 @@ bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalo
 	if (transaction_manager.IsDuckTransactionManager()) {
 		auto &duck_manager = DuckTransactionManager::Get(host_db);
 		auto &transaction = DuckTransaction::Get(context, host_db);
-		if (duck_manager.LowestActiveStart() < transaction.start_time) {
+		if (scenario_compat::OlderTransactionActive(duck_manager, transaction)) {
 			return false;
 		}
 	}
@@ -310,7 +306,7 @@ string ScenarioDelta::EncodeLogicalName(const string &schema_name, const string 
 }
 
 string ScenarioDelta::LogicalName(const TableCatalogEntry &table) {
-	return EncodeLogicalName(table.ParentSchema().name, table.name);
+	return EncodeLogicalName(dc::Str(table.ParentSchema().name), dc::Str(table.name));
 }
 
 void ScenarioDelta::SplitLogicalName(const string &logical_name, string &schema_name, string &table_name) {
@@ -333,7 +329,8 @@ static optional_ptr<DuckTableEntry> TryGetInternalTable(ClientContext &context, 
 	if (!schema) {
 		return nullptr;
 	}
-	auto entry = schema->GetEntry(schema->GetCatalogTransaction(context), CatalogType::TABLE_ENTRY, table_name);
+	auto entry =
+	    schema->GetEntry(schema->GetCatalogTransaction(context), CatalogType::TABLE_ENTRY, dc::Ident(table_name));
 	if (!entry || entry->type != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
@@ -367,16 +364,16 @@ DuckTableEntry &ScenarioDelta::CreateMatTable(ClientContext &context, Catalog &h
 		                                 return constraint->type == ConstraintType::FOREIGN_KEY;
 	                                 }),
 	                  constraints.end());
-	info.catalog = host_catalog.GetName();
-	info.schema = ScenarioRegistry::SCHEMA_NAME;
-	info.table = MatTableName(scenario_id, logical_name);
+	dc::SetQualifiedName(info, dc::Str(host_catalog.GetName()), ScenarioRegistry::SCHEMA_NAME,
+	                     MatTableName(scenario_id, logical_name));
 	info.on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 	info.temporary = false;
 	host_catalog.CreateTable(context, unique_ptr_cast<CreateInfo, CreateTableInfo>(std::move(create_info)));
 
 	auto created = TryGetMatTable(context, host_catalog, scenario_id, logical_name);
 	if (!created) {
-		throw InternalException("anofox_scenario: failed to create materialized table for '%s'", base_entry.name);
+		throw InternalException("anofox_scenario: failed to create materialized table for '%s'",
+		                        dc::Str(base_entry.name));
 	}
 	CopyTableData(context, base_entry.Cast<DuckTableEntry>(), *created);
 	return *created;
@@ -411,7 +408,7 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 	if (target_column_offset > 0 || fill_count) {
 		append_chunk.Initialize(Allocator::Get(context), to_types);
 	}
-	while (from_storage.NextParallelScan(context, parallel_state, state) > 0) {
+	while (scenario_compat::ParallelScanHasMore(from_storage.NextParallelScan(context, parallel_state, state))) {
 		while (true) {
 			scan_chunk.Reset();
 			from_storage.Scan(transaction, scan_chunk, state);
@@ -423,8 +420,8 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 				for (idx_t col = 0; col < from_types.size(); col++) {
 					append_chunk.data[col].Reference(scan_chunk.data[col]);
 				}
-				append_chunk.data[from_types.size()].Reference(Value::BIGINT(1));
-				append_chunk.SetCardinality(scan_chunk.size());
+				dc::ReferenceValue(append_chunk.data[from_types.size()], Value::BIGINT(1), scan_chunk.size());
+				append_chunk.SetChildCardinality(scan_chunk.size());
 				to_storage.LocalAppend(to_table, context, append_chunk, to_constraints);
 			} else if (target_column_offset == 0) {
 				to_storage.LocalAppend(to_table, context, scan_chunk, to_constraints);
@@ -433,7 +430,7 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 				for (idx_t col = 0; col < from_types.size(); col++) {
 					append_chunk.data[target_column_offset + col].Reference(scan_chunk.data[col]);
 				}
-				append_chunk.SetCardinality(scan_chunk.size());
+				append_chunk.SetChildCardinality(scan_chunk.size());
 				to_storage.LocalAppend(to_table, context, append_chunk, to_constraints);
 			}
 		}
@@ -452,9 +449,8 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 	// (ScenarioCatalog::MarkHostWrite / MetaTransaction::ModifyDatabase).
 
 	auto info = make_uniq<CreateTableInfo>();
-	info->catalog = host_catalog.GetName();
-	info->schema = ScenarioRegistry::SCHEMA_NAME;
-	info->table = DeltaTableName(scenario_id, logical_name);
+	dc::SetQualifiedName(*info, dc::Str(host_catalog.GetName()), ScenarioRegistry::SCHEMA_NAME,
+	                     DeltaTableName(scenario_id, logical_name));
 	info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
 	info->columns.AddColumn(ColumnDefinition("_op", LogicalType::VARCHAR));
 	info->columns.AddColumn(ColumnDefinition("_ts", LogicalType::TIMESTAMP));
@@ -473,12 +469,12 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 		pk_names = *identity_keys;
 	} else {
 		for (auto col_id : GetPKColumns(base_entry)) {
-			pk_names.push_back(base_entry.GetColumn(LogicalIndex(col_id)).Name());
+			pk_names.push_back(dc::Str(base_entry.GetColumn(LogicalIndex(col_id)).Name()));
 		}
 	}
 	bool keyless = pk_names.empty();
 	if (!keyless) {
-		info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(pk_names), true));
+		info->constraints.push_back(dc::MakeUniqueConstraint(std::move(pk_names), true));
 	}
 
 	if (keyless) {
@@ -489,7 +485,7 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 		// (named _count unless a base column already is - readers find it
 		// by position and its NOT NULL, see CountColumnIndex)
 		info->columns.AddColumn(
-		    ColumnDefinition(NewCountColumnName(base_entry.GetColumns()), LogicalType::BIGINT));
+		    ColumnDefinition(dc::Ident(NewCountColumnName(base_entry.GetColumns())), LogicalType::BIGINT));
 		info->constraints.push_back(
 		    make_uniq<NotNullConstraint>(LogicalIndex(PAYLOAD_START + base_entry.GetColumns().LogicalColumnCount())));
 	} else {
@@ -506,11 +502,11 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 			}
 			vector<string> unique_names;
 			if (unique.HasIndex()) {
-				unique_names.push_back(base_entry.GetColumn(unique.GetIndex()).Name());
+				unique_names.push_back(dc::Str(base_entry.GetColumn(unique.GetIndex()).Name()));
 			} else {
-				unique_names = unique.GetColumnNames();
+				unique_names = dc::Strs(unique.GetColumnNames());
 			}
-			info->constraints.push_back(make_uniq<UniqueConstraint>(std::move(unique_names), false));
+			info->constraints.push_back(dc::MakeUniqueConstraint(std::move(unique_names), false));
 		}
 	}
 	if (!host_is_not_writer) {
@@ -534,7 +530,7 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 
 	auto created = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (!created) {
-		throw InternalException("anofox_scenario: failed to create delta table for '%s'", base_entry.name);
+		throw InternalException("anofox_scenario: failed to create delta table for '%s'", dc::Str(base_entry.name));
 	}
 	return *created;
 }
@@ -583,13 +579,13 @@ vector<idx_t> ScenarioDelta::GetKeyColumns(ClientContext &context, Catalog &host
 		vector<idx_t> result;
 		auto &columns = base_entry.GetColumns();
 		for (auto &name : declared) {
-			if (!columns.ColumnExists(name)) {
+			if (!columns.ColumnExists(dc::Ident(name))) {
 				throw InvalidInputException(
 				    "Scenario table '%s': declared key column '%s' no longer exists in the base table. Re-declare "
 				    "the key with scenario_refresh(<scenario>, key_columns := MAP {'%s': [...]})",
 				    logical_name, name, logical_name);
 			}
-			result.push_back(columns.GetColumn(name).Logical().index);
+			result.push_back(columns.GetColumn(dc::Ident(name)).Logical().index);
 		}
 		return result;
 	}
@@ -600,10 +596,10 @@ optional_ptr<TableCatalogEntry> ScenarioDelta::GetPinnedBaseEntry(ClientContext 
                                                                  const string &schema_name, const string &table_name,
                                                                  timestamp_t at) {
 	BoundAtClause at_clause("timestamp", Value::TIMESTAMP(at));
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, &at_clause, QueryErrorContext());
+	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, dc::EntryName(table_name), &at_clause, QueryErrorContext());
 	optional_ptr<CatalogEntry> pinned;
 	try {
-		pinned = base_catalog.GetEntry(context, schema_name, lookup, OnEntryNotFound::RETURN_NULL);
+		pinned = dc::GetEntryInSchema(base_catalog, context, schema_name, lookup, OnEntryNotFound::RETURN_NULL);
 	} catch (CatalogException &) {
 		pinned = nullptr; // e.g. the schema is not in the snapshot either
 	}
@@ -642,7 +638,7 @@ void ScenarioDelta::ScanTableRows(ClientContext &context, DuckTableEntry &table,
 
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), scan_types);
-	while (data_table.NextParallelScan(context, parallel_state, state) > 0) {
+	while (scenario_compat::ParallelScanHasMore(data_table.NextParallelScan(context, parallel_state, state))) {
 		while (true) {
 			chunk.Reset();
 			data_table.Scan(transaction, chunk, state);
@@ -671,7 +667,7 @@ void ScenarioDelta::ScanTableChunks(ClientContext &context, DuckTableEntry &tabl
 
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), scan_types);
-	while (data_table.NextParallelScan(context, parallel_state, state) > 0) {
+	while (scenario_compat::ParallelScanHasMore(data_table.NextParallelScan(context, parallel_state, state))) {
 		while (true) {
 			chunk.Reset();
 			data_table.Scan(transaction, chunk, state);
@@ -699,62 +695,39 @@ bool ScenarioDeltaIndexProbe::Initialize(ClientContext &context, DuckTableEntry 
 	}
 	auto &storage = delta.GetStorage();
 	storage.BindIndexes(context);
-	ConflictInfo conflict_info(key_ids);
-	for (auto &index : storage.GetDataTableInfo()->GetIndexes().Indexes()) {
-		if (index.IsBound() && index.IsUnique() && index.GetIndexType() == ART::TYPE_NAME &&
-		    conflict_info.ConflictTargetMatches(index)) {
-			delta_table = &delta;
-			return true;
-		}
+	bool found = false;
+	scenario_compat::ForEachIndexEntry(storage.GetDataTableInfo()->GetIndexes(),
+	                                   [&](const scenario_compat::IndexEntryRef &entry) {
+		                                   if (!found && IsKeyIndex(entry)) {
+			                                   found = true;
+		                                   }
+	                                   });
+	if (found) {
+		delta_table = &delta;
 	}
-	return false;
+	return found;
+}
+
+bool ScenarioDeltaIndexProbe::IsKeyIndex(const scenario_compat::IndexEntryRef &entry) const {
+	// the delta's PRIMARY KEY: a unique ART over exactly the key columns
+	return scenario_compat::IsBoundUniqueART(entry) && scenario_compat::IndexColumns(entry) == key_ids;
 }
 
 namespace {
 
-//! Every row id stored under `key` in one ART (a unique index can briefly hold
-//! two: a row deleted by a running transaction plus its replacement; the
-//! deleted_rows_in_use / checkpoint delta ARTs are not unique at all)
-void CollectARTRowIds(ART &art, const ARTKey &key, vector<row_t> &result) {
-	if (key.Empty() || !art.tree.HasMetadata()) {
-		return;
-	}
-	auto leaf = ARTOperator::Lookup(art, art.tree, key, 0);
-	if (!leaf) {
-		return;
-	}
-	if (leaf->GetType() == NType::LEAF_INLINED) {
-		result.push_back(leaf->GetRowId());
-		return;
-	}
-	// a nested leaf (gate): iterate its row ids, exactly as ART::SearchEqual
-	set<row_t> row_ids;
-	Iterator it(art);
-	it.FindMinimum(*leaf);
-	ARTKey empty_key;
-	RowIdSetOutput output(row_ids, NumericLimits<idx_t>::Maximum());
-	it.Scan(empty_key, output, false);
-	result.insert(result.end(), row_ids.begin(), row_ids.end());
-}
-
-//! Look the probe chunk's keys up in `art` (row i -> candidates[i])
-void CollectCandidates(ClientContext &context, ART &art, DataChunk &probe, vector<vector<row_t>> &candidates) {
+//! Look the probe chunk's keys up in `art` (row i -> candidates[i]);
+//! A = ART (1.5.6) or const ART (2.0)
+template <class A>
+void CollectCandidates(ClientContext &context, A &art, DataChunk &probe, vector<vector<row_t>> &candidates) {
 	DataChunk expr_chunk;
 	expr_chunk.Initialize(Allocator::Get(context), art.logical_types, probe.size());
 	art.ExecuteExpressions(probe, expr_chunk);
 	ArenaAllocator arena(Allocator::Get(context));
 	unsafe_vector<ARTKey> keys(probe.size());
-	art.GenerateKeys<>(arena, expr_chunk, keys);
+	art.template GenerateKeys<>(arena, expr_chunk, keys);
 	for (idx_t i = 0; i < probe.size(); i++) {
-		CollectARTRowIds(art, keys[i], candidates[i]);
+		scenario_compat::CollectARTRowIds(art, keys[i], candidates[i]);
 	}
-}
-
-ART &CheckedART(BoundIndex &index) {
-	if (index.GetIndexType() != ART::TYPE_NAME) {
-		throw InternalException("anofox_scenario: concurrent changes made to a non-ART delta index");
-	}
-	return index.Cast<ART>();
 }
 
 } // namespace
@@ -776,7 +749,7 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 	DataChunk probe;
 	probe.InitializeEmpty(types);
 	for (idx_t col = 0; col < types.size(); col++) {
-		probe.data[col].Reference(Value(types[col]));
+		dc::ReferenceValue(probe.data[col], Value(types[col]), count);
 	}
 	for (idx_t k = 0; k < key_columns.size(); k++) {
 		auto delta_col = ScenarioDelta::PAYLOAD_START + key_columns[k];
@@ -789,12 +762,11 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 			probe.data[delta_col].Reference(cast);
 		}
 	}
-	probe.SetCardinality(count);
+	probe.SetChildCardinality(count);
 
 	auto &transaction = DuckTransaction::Get(context, delta_table->catalog);
 	auto &local_storage = LocalStorage::Get(transaction);
 	auto local = local_storage.GetStorage(storage);
-	ConflictInfo conflict_info(key_ids);
 	vector<StorageIndex> op_column {StorageIndex(ScenarioDelta::OP_COL)};
 
 	// Read-only lookups of every key in the key index, mirroring core's index
@@ -802,33 +774,24 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 	// live in deleted_rows_in_use (deleted while older transactions still see
 	// it) or added_data_during_checkpoint (appended during a checkpoint). An
 	// older snapshot's visible delta row is often only found there.
-	auto collect = [&](TableIndexList &indexes, bool global) {
+	auto collect = [&](const TableIndexList &indexes, bool global) {
 		vector<vector<row_t>> candidates(count);
 		bool found = false;
-		for (auto &entry : indexes.IndexEntries()) {
-			auto &index = *entry.index;
-			if (!index.IsBound() || !index.IsUnique() || index.GetIndexType() != ART::TYPE_NAME ||
-			    !conflict_info.ConflictTargetMatches(index)) {
-				continue;
+		scenario_compat::ForEachIndexEntry(indexes, [&](const scenario_compat::IndexEntryRef &entry) {
+			if (found || !IsKeyIndex(entry)) {
+				return;
 			}
-			lock_guard<mutex> guard(entry.lock);
-			CollectCandidates(context, index.Cast<ART>(), probe, candidates);
-			if (entry.deleted_rows_in_use) {
-				CollectCandidates(context, CheckedART(*entry.deleted_rows_in_use), probe, candidates);
-			}
-			if (entry.added_data_during_checkpoint) {
-				CollectCandidates(context, CheckedART(*entry.added_data_during_checkpoint), probe, candidates);
-			}
+			scenario_compat::WithART(entry, true,
+			                         [&](auto &art) { CollectCandidates(context, art, probe, candidates); });
 			found = true;
-			break;
-		}
+		});
 		if (!found) {
 			return;
 		}
 		// Keep the one candidate this transaction can see (the key is a PK:
 		// at most one delta row per key is visible to any snapshot)
 		Vector visible_ids(LogicalType::ROW_TYPE, count);
-		auto visible_data = FlatVector::GetData<row_t>(visible_ids);
+		auto visible_data = dc::FlatData<row_t>(visible_ids);
 		vector<idx_t> visible_rows;
 		for (idx_t i = 0; i < count; i++) {
 			for (auto row_id : candidates[i]) {
@@ -842,6 +805,7 @@ void ScenarioDeltaIndexProbe::Lookup(ClientContext &context, DataChunk &chunk, c
 		if (visible_rows.empty()) {
 			return;
 		}
+		dc::SetVectorSize(visible_ids, visible_rows.size());
 		DataChunk fetched;
 		fetched.Initialize(Allocator::Get(context), {LogicalType::VARCHAR}, visible_rows.size());
 		ColumnFetchState fetch_state;
@@ -871,7 +835,7 @@ void ScenarioDeltaIndexProbe::FetchRow(ClientContext &context, row_t row_id, con
 	D_ASSERT(delta_table);
 	auto &storage = delta_table->GetStorage();
 	auto &transaction = DuckTransaction::Get(context, delta_table->catalog);
-	Vector row_ids(Value::BIGINT(row_id));
+	auto row_ids = dc::MakeValueVector(Value::BIGINT(row_id), 1);
 	row_ids.Flatten(1);
 	ColumnFetchState fetch_state;
 	result.Reset();

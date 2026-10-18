@@ -7,6 +7,9 @@
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/planner/extension_callback.hpp"
+#include "catalog/scenario_registry.hpp"
 #include "anofox_scenario_banner.hpp"
 
 #ifdef HAS_POSTHOG_TELEMETRY
@@ -21,6 +24,16 @@ const datazoo::BannerInfo ANOFOX_SCENARIO_BANNER {
 
 namespace duckdb {
 
+//! Every connection carries the scenario client state from the start: its
+//! OnFinalizePrepare hook must see a connection's first statement too
+//! (ScenarioClientState, write attribution)
+class ScenarioConnectionCallback : public ExtensionCallback {
+public:
+	void OnConnectionOpened(ClientContext &context) override {
+		ScenarioClientState::Get(context);
+	}
+};
+
 static void LoadInternal(ExtensionLoader &loader) {
 	loader.SetDescription("Git-like branching for analytical databases: attach isolated what-if scenarios as "
 	                      "catalogs, edit them with ordinary SQL on copy-on-write delta storage, branch and "
@@ -30,6 +43,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// ATTACH 'name' (TYPE scenario)
 	StorageExtension::Register(config, "scenario", make_shared_ptr<ScenarioStorageExtension>());
+	ExtensionCallbackManager::Get(loader.GetDatabaseInstance()).Register(make_shared_ptr<ScenarioConnectionCallback>());
 	// CALL scenario_create/drop/freeze/unfreeze + scenario_list()
 	ScenarioLifecycle::RegisterFunctions(loader);
 	// scenario_diff / scenario_diff_summary (streaming, bind-replaced)
