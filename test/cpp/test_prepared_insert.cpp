@@ -44,13 +44,23 @@ int64_t QueryInt(Connection &con, const string &sql) {
 
 //! Load the extension the way the sqllogictest runner's `require` does: the
 //! copy linked into unittest (DuckDB 1.5), else the built extension file
-//! (DuckDB 2.0 no longer links out-of-tree extensions into unittest)
-void LoadScenarioExtension(DuckDB &db) {
+//! (DuckDB 2.0 no longer links out-of-tree extensions into unittest).
+//! Returns false - and the test is skipped, as `require` skips a sqllogictest
+//! - when the file was built for a different DuckDB version string: the 2.0
+//! pre-release CI builds unittest with a version the extension metadata does
+//! not match.
+bool LoadScenarioExtension(DuckDB &db) {
 	if (ExtensionHelper::LoadExtension(db, "anofox_scenario") == ExtensionLoadResult::LOADED_EXTENSION) {
-		return;
+		return true;
 	}
 	Connection con(db);
-	REQUIRE_NO_FAIL(con.Query(string("LOAD '") + ANOFOX_SCENARIO_EXTENSION_FILE + "'"));
+	auto result = con.Query(string("LOAD '") + ANOFOX_SCENARIO_EXTENSION_FILE + "'");
+	if (result->HasError() && result->GetError().find("was built specifically for DuckDB version") != string::npos) {
+		WARN("skipped: " << result->GetError());
+		return false;
+	}
+	REQUIRE_NO_FAIL(*result);
+	return true;
 }
 
 void SetupBase(Connection &con) {
@@ -88,7 +98,9 @@ TEST_CASE("test/cpp/prepared_insert_across_transactions", "[anofox_scenario]") {
 	{
 		auto config = GetTestConfig(); // allows the unsigned build of the extension
 		DuckDB db(db_path, config.get());
-		LoadScenarioExtension(db);
+		if (!LoadScenarioExtension(db)) {
+			return;
+		}
 		Connection con(db);
 		SetupBase(con);
 		REQUIRE_NO_FAIL(con.Query("ATTACH 'winner' AS ws (TYPE scenario)"));
@@ -169,7 +181,9 @@ TEST_CASE("test/cpp/prepared_insert_across_transactions", "[anofox_scenario]") {
 		auto config = GetTestConfig(); // allows the unsigned build of the extension
 		DuckDB db(db_path, config.get());
 		Connection con(db);
-		LoadScenarioExtension(db);
+		if (!LoadScenarioExtension(db)) {
+			return;
+		}
 		REQUIRE_NO_FAIL(con.Query("ATTACH 'winner' AS ws (TYPE scenario)"));
 		REQUIRE(QueryInt(con, "SELECT count(*) FROM ws.order_plan") == int64_t(expected_rows));
 		REQUIRE(QueryInt(con, "SELECT sum(qty) FROM ws.order_plan") == expected_qty);

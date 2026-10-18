@@ -86,6 +86,12 @@ build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 target_link_libraries(${EXTENSION_NAME} datazoo_banner)
 target_link_libraries(${LOADABLE_EXTENSION_NAME} datazoo_banner)
 
+# The sources and duckdb-compat need C++17. DuckDB 1.5 sets CMAKE_CXX_STANDARD
+# 11; GCC's default happens to be newer, but Apple Clang and Emscripten then
+# compile as C++11 (no std::optional, no generic lambdas).
+target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
+target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
+
 # Fix "multiple definition of duckdb::LogicalType::VARCHAR/BIGINT/TIMESTAMP".
 # DuckDB core is built as C++11 and emits strong out-of-line definitions of its
 # `static constexpr` LogicalType members. This extension is C++17, so when its
