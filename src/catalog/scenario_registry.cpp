@@ -197,7 +197,10 @@ DuckTableEntry &ScenarioRegistry::EnsureTablesTable(ClientContext &context, Cata
 	info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(TAB_COL_KEY_COLUMNS)));
 	try {
 		host_catalog.CreateTable(context, std::move(info));
-	} catch (TransactionException &) {
+	} catch (std::exception &ex) {
+		if (!scenario_compat::IsException(ex, ExceptionType::TRANSACTION)) {
+			throw;
+		}
 		// a catalog write-write conflict: another transaction declared the
 		// first key on this host concurrently (uncommitted, or committed
 		// after this transaction started) and created the table itself

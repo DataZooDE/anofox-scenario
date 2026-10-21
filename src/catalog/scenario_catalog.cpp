@@ -278,7 +278,10 @@ DuckTableEntry &ScenarioCatalog::GetOrCreateWriteDelta(ClientContext &context, S
 	try {
 		return ScenarioDelta::EnsureDeltaTable(context, host_catalog, scenario_id, entry.base_entry, &identity_keys,
 		                                       &logical_name, host_is_not_writer);
-	} catch (TransactionException &) {
+	} catch (std::exception &ex) {
+		if (!scenario_compat::IsException(ex, ExceptionType::TRANSACTION)) {
+			throw;
+		}
 		// a catalog write-write conflict: another transaction created this
 		// delta concurrently (uncommitted, or committed after we started)
 		throw TransactionException(

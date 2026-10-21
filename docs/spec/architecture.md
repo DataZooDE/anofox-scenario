@@ -602,6 +602,14 @@ in two places:
 `optional_idx` rather than 0. Test expectations that 2.0 legitimately changes are written to
 accept both lines (see `docs/UPDATING.md`).
 
+DuckDB exceptions are never caught by class (`catch (ConstraintException &)`). When the extension
+is a separate image - a `LOAD`ed `.duckdb_extension`, or the 2.0 test runner - macOS matches catch
+clauses by `type_info` address, and the extension's hidden copy of the class's `type_info` does not
+match DuckDB's: the exception skips the handler (seen as raw DuckDB errors in place of the
+scenario's own messages on community-extensions' osx_arm64 2.0 build). Handlers catch
+`std::exception` and test `scenario_compat::IsException(ex, ExceptionType::...)`, rethrowing
+anything else.
+
 ## Source map
 
 | Path | Responsibility |
