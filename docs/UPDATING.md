@@ -6,10 +6,10 @@ releases. One source tree serves two DuckDB lines at the same time:
 | Line | DuckDB | extension-ci-tools | Where |
 |------|--------|--------------------|-------|
 | v1.5 (variegata) | `v1.5.6`, the `./duckdb` submodule pin | `v1.5-variegata` | local builds, `duckdb-v1_5_5-*` CI jobs, releases |
-| 2.0 (cyanoptera) | `b15358c371daf10dad799a43b6167f6ccdce84d8` (`v2.0.0-alpha46057`) | `v2.0-cyanoptera` | `duckdb-next-build` CI job, community-extensions `repo.ref` |
+| 2.0 (cyanoptera) | `v2.0.0` built from commit `d54cbbe3df17e8e5ce68312f483b4155836112aa` (no tag yet) | `v2.0-cyanoptera` | `duckdb-next-build` CI job, community-extensions `repo.ref` |
 
-duckdb/community-extensions builds `repo.ref` against its `DUCKDB_LATEST_STABLE` (the 2.0 commit
-above) and `repo.variegata` against v1.5.6, so both have to build from the same commit.
+duckdb/community-extensions builds `repo.ref` against the 2.0 commit above (`duckdb_commit` in its
+`build.yml`) and `repo.variegata` against v1.5.6, so both have to build from the same commit.
 
 ## The compat-shim approach
 
