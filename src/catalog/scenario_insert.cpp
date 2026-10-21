@@ -315,7 +315,10 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 			gstate.verify_chunk.Slice(base_verify_sel, base_verify_count);
 			try {
 				gstate.base_probe.ProbePrimaryKey(gstate.verify_chunk);
-			} catch (ConstraintException &) {
+			} catch (std::exception &ex) {
+				if (!scenario_compat::IsException(ex, ExceptionType::CONSTRAINT)) {
+					throw;
+				}
 				throw ConstraintException(
 				    "Duplicate key violates primary key constraint on scenario table \"%s\": the key exists in "
 				    "the base table",
@@ -327,7 +330,10 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		if (gstate.base_probe.HasSecondary()) {
 			try {
 				gstate.base_probe.ProbeSecondary(client, delta_table, chunk, {});
-			} catch (ConstraintException &) {
+			} catch (std::exception &ex) {
+				if (!scenario_compat::IsException(ex, ExceptionType::CONSTRAINT)) {
+					throw;
+				}
 				throw ConstraintException(
 				    "Duplicate value violates a UNIQUE constraint on scenario table \"%s\": the value exists in "
 				    "the base table",

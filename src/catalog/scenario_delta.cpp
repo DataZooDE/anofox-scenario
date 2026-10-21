@@ -236,7 +236,10 @@ bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalo
 	                                 DatabaseModificationType::INSERT_DATA);
 	try {
 		UpgradeLegacyKeylessDeltas(context, host_catalog, scenario_id);
-	} catch (TransactionException &) {
+	} catch (std::exception &ex) {
+		if (!scenario_compat::IsException(ex, ExceptionType::TRANSACTION)) {
+			throw;
+		}
 		// a catalog conflict with a concurrent transaction: keep the legacy
 		// layout rather than fail the ATTACH (each table's swap is
 		// self-contained, so tables upgraded before the conflict stay valid)
@@ -600,7 +603,10 @@ optional_ptr<TableCatalogEntry> ScenarioDelta::GetPinnedBaseEntry(ClientContext 
 	optional_ptr<CatalogEntry> pinned;
 	try {
 		pinned = dc::GetEntryInSchema(base_catalog, context, schema_name, lookup, OnEntryNotFound::RETURN_NULL);
-	} catch (CatalogException &) {
+	} catch (std::exception &ex) {
+		if (!scenario_compat::IsException(ex, ExceptionType::CATALOG)) {
+			throw;
+		}
 		pinned = nullptr; // e.g. the schema is not in the snapshot either
 	}
 	if (!pinned || pinned->type != CatalogType::TABLE_ENTRY) {

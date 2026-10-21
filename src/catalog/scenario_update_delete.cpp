@@ -178,7 +178,10 @@ public:
 		verify_chunk.Slice(sel, count);
 		try {
 			base_probe.ProbePrimaryKey(verify_chunk);
-		} catch (ConstraintException &) {
+		} catch (std::exception &ex) {
+			if (!scenario_compat::IsException(ex, ExceptionType::CONSTRAINT)) {
+				throw;
+			}
 			throw ConstraintException(
 			    "Duplicate key violates primary key constraint on scenario table \"%s\": the key exists in the "
 			    "base table",
@@ -728,7 +731,10 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 			}
 			try {
 				gstate.base_probe.ProbeSecondary(client, *gstate.delta_table, verify_chunk, pending_replaced);
-			} catch (ConstraintException &) {
+			} catch (std::exception &ex) {
+				if (!scenario_compat::IsException(ex, ExceptionType::CONSTRAINT)) {
+					throw;
+				}
 				throw ConstraintException(
 				    "Duplicate value violates a UNIQUE constraint on scenario table \"%s\": the value exists in "
 				    "the base table",

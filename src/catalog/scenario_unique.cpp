@@ -216,7 +216,10 @@ void ScenarioBaseUniqueProbe::ProbeSecondary(ClientContext &context, DuckTableEn
 			scenario_compat::VerifyAppend(index_entry, rows);
 		}
 		return;
-	} catch (ConstraintException &) {
+	} catch (std::exception &ex) {
+		if (!scenario_compat::IsException(ex, ExceptionType::CONSTRAINT)) {
+			throw;
+		}
 		// a collision: it only counts if the owning base row is still live
 	}
 
@@ -347,7 +350,10 @@ void ScenarioBaseUniqueProbe::ProbeKeyless(ClientContext &context, DuckTableEntr
 		vector<bool> in_base(rows.size(), false);
 		try {
 			scenario_compat::VerifyAppend(index_entry, rows);
-		} catch (ConstraintException &) {
+		} catch (std::exception &ex) {
+			if (!scenario_compat::IsException(ex, ExceptionType::CONSTRAINT)) {
+				throw;
+			}
 			DataChunk single;
 			single.Initialize(Allocator::Get(context), table_types);
 			for (idx_t i = 0; i < rows.size(); i++) {
@@ -361,7 +367,10 @@ void ScenarioBaseUniqueProbe::ProbeKeyless(ClientContext &context, DuckTableEntr
 				single.SetChildCardinality(1);
 				try {
 					scenario_compat::VerifyAppend(index_entry, single);
-				} catch (ConstraintException &) {
+				} catch (std::exception &row_ex) {
+					if (!scenario_compat::IsException(row_ex, ExceptionType::CONSTRAINT)) {
+						throw;
+					}
 					in_base[i] = true;
 				}
 			}

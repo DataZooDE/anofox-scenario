@@ -15,6 +15,7 @@
 
 #include "duckdb.hpp"
 #include "duckdb_compat.hpp"
+#include "duckdb/common/error_data.hpp"
 
 namespace dc = duckdb_compat;
 
@@ -54,6 +55,23 @@ class ConjunctionAndFilter;
 class OptionalFilter;
 
 namespace scenario_compat {
+
+//===----------------------------------------------------------------------===//
+// Exceptions thrown by DuckDB
+//
+// Never catch a DuckDB exception by its class (catch (ConstraintException &)):
+// when the extension is a separate image (a LOADed .duckdb_extension, the 2.0
+// unittest), macOS matches catch clauses by type_info address, the
+// extension's hidden copy of the class's type_info is not DuckDB's, and the
+// exception flies past the handler. Catch std::exception (type_info from the
+// shared C++ runtime) and test the DuckDB exception type instead:
+//   catch (std::exception &ex) { if (!IsException(ex, ExceptionType::CONSTRAINT)) throw; ... }
+//===----------------------------------------------------------------------===//
+
+//! True when `ex` is a DuckDB exception of `type`
+inline bool IsException(const std::exception &ex, ExceptionType type) {
+	return ErrorData(ex).Type() == type;
+}
 
 //===----------------------------------------------------------------------===//
 // DataTable
