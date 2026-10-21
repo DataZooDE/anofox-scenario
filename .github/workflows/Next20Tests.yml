@@ -57,6 +57,8 @@ jobs:
         run: make release
 
       - name: Test
+        # explicit bash = -eo pipefail: unittest's exit code survives the tee
+        shell: bash
         run: |
           ./build/release/test/unittest "test/*" | tee unittest.log
           # a version mismatch skips every test silently: fail on that
