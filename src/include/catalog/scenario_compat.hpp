@@ -35,10 +35,12 @@ namespace dc = duckdb_compat;
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
-// 2.0 moved TableFilterSet out of table_filter.hpp
-#if __has_include("duckdb/planner/table_filter_set.hpp")
-#include "duckdb/planner/table_filter_set.hpp"
-#endif
+// TableFilterSet: table_filter.hpp on 1.5.6, its own table_filter_set.hpp on
+// 2.0. Not probed with __has_include: on a 1.5.6 build a system DuckDB 2.0
+// (/usr/include/duckdb) makes the probe true and pulls in 2.0's class. Every
+// line declares it through logical_get.hpp instead, since LogicalGet holds one
+// (see the static_assert below).
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/data_table_info.hpp"
 #include "duckdb/storage/table/table_index_list.hpp"
@@ -53,6 +55,12 @@ class ConstantFilter;
 class InFilter;
 class ConjunctionAndFilter;
 class OptionalFilter;
+
+// The table-filter helpers below dispatch on TableFilterSet's shape, which
+// silently picks the wrong overload if the class is still incomplete here.
+static_assert(std::is_same<decltype(LogicalGet::table_filters), TableFilterSet>::value &&
+                  sizeof(TableFilterSet) > 0,
+              "TableFilterSet must be complete here (declared through logical_get.hpp)");
 
 namespace scenario_compat {
 
