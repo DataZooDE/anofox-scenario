@@ -89,7 +89,14 @@ jobs:
   ducklake-integration:
     name: DuckLake integration tests (release, linux)
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: on ubuntu-26.04 the static OpenSSL that the
+    # telemetry build asks for (OPENSSL_USE_STATIC_LIBS) lists -lz, so
+    # FindOpenSSL pulls in /usr/lib/x86_64-linux-gnu/libz.a. That archive is
+    # not built with -fPIC, and linking it into libduckdb.so fails with
+    # "relocation R_X86_64_PC32 against `z_errmsg' ... recompile with -fPIC"
+    # / "final link failed: bad value". The distribution matrix builds on
+    # ubuntu-24.04 too.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -102,7 +109,7 @@ jobs:
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@main
         with:
-          key: ducklake-integration-${{ github.job }}
+          key: ducklake-integration-${{ github.job }}-ubuntu-24.04
 
       - name: Build (release)
         run: GEN=ninja make release
