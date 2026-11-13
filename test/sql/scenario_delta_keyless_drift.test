@@ -1,0 +1,335 @@
+# name: test/sql/scenario_delta_keyless_drift.test
+# description: keyless merge-back of delta scenarios: a delete whose base copies are gone is a conflict (preview, abort, ours, theirs)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# --- the base edits a row after the scenario touched it ----------------------------------
+
+statement ok
+CREATE TABLE k (a VARCHAR, b INTEGER);
+
+statement ok
+INSERT INTO k VALUES ('x', 1);
+
+statement ok
+CALL scenario_create('s', 'keyless');
+
+statement ok
+ATTACH 's' AS s (TYPE scenario);
+
+# delete (x, 1) + insert (x, 2) in the changelog
+statement ok
+UPDATE s.k SET b = 2;
+
+# the base edits the same row: (x, 1) is gone
+statement ok
+UPDATE k SET a = 'y';
+
+query TTTT rowsort
+SELECT table_name, key, action, conflict::VARCHAR FROM scenario_merge_preview('s');
+----
+k	(x, 1)	delete	true
+k	(x, 2)	insert	false
+
+statement ok
+DETACH s;
+
+# the default policy refuses: merging would leave (y, 1) next to (x, 2)
+statement error
+SELECT * FROM scenario_merge('s');
+----
+<REGEX>:.*base changed underneath.*copies of row \(x, 1\) of keyless table 'k'.*on_conflict.*
+
+# the refused merge changed nothing and left the scenario open
+query TI
+SELECT a, b FROM k;
+----
+y	1
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NULL)::VARCHAR FROM scenario_list() WHERE name = 's';
+----
+false	true
+
+# theirs: nothing of (x, 1) is left to delete; the insert has no identity to
+# conflict on, so it applies (as in materialized and DuckLake keyless merges)
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('s', on_conflict := 'theirs');
+----
+1	1	1
+
+query TI rowsort
+SELECT a, b FROM k;
+----
+x	2
+y	1
+
+# --- ours on the same pattern -------------------------------------------------------------
+
+statement ok
+CREATE TABLE k2 (a VARCHAR, b INTEGER);
+
+statement ok
+INSERT INTO k2 VALUES ('x', 1);
+
+statement ok
+CALL scenario_create('s2');
+
+statement ok
+ATTACH 's2' AS s2 (TYPE scenario);
+
+statement ok
+UPDATE s2.k2 SET b = 2;
+
+statement ok
+DETACH s2;
+
+statement ok
+UPDATE k2 SET a = 'y';
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('s2', on_conflict := 'ours');
+----
+1	1	1
+
+query TI rowsort
+SELECT a, b FROM k2;
+----
+x	2
+y	1
+
+# --- partial: the delete removes 2 copies, the base now holds 1 ---------------------------
+
+statement ok
+CREATE TABLE p (v VARCHAR);
+
+statement ok
+INSERT INTO p VALUES ('a'), ('a'), ('b');
+
+statement ok
+CREATE TABLE p2 AS SELECT * FROM p;
+
+statement ok
+CALL scenario_create('pt');
+
+statement ok
+CALL scenario_create('po');
+
+statement ok
+ATTACH 'pt' AS pt (TYPE scenario);
+
+statement ok
+ATTACH 'po' AS po (TYPE scenario);
+
+statement ok
+DELETE FROM pt.p;
+
+statement ok
+DELETE FROM po.p2;
+
+statement ok
+DETACH pt;
+
+statement ok
+DETACH po;
+
+# no drift yet: every delete still finds its copies
+query TTT rowsort
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('pt');
+----
+(a)	delete	false
+(a)	delete	false
+(b)	delete	false
+
+statement ok
+DELETE FROM p WHERE rowid = (SELECT min(rowid) FROM p WHERE v = 'a');
+
+statement ok
+DELETE FROM p2 WHERE rowid = (SELECT min(rowid) FROM p2 WHERE v = 'a');
+
+# both planned copies of (a) conflict - the base holds 1 of the 2; (b) is clean
+query TTT rowsort
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('pt');
+----
+(a)	delete	true
+(a)	delete	true
+(b)	delete	false
+
+statement error
+SELECT * FROM scenario_merge('pt');
+----
+<REGEX>:.*base changed underneath.*copies of row \(a\) of keyless table 'p'.*
+
+# theirs: the drifted value keeps the base's copy; the clean delete applies
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('pt', on_conflict := 'theirs');
+----
+1	1	1
+
+query T
+SELECT v FROM p;
+----
+a
+
+# ours: the scenario deleted every copy it saw - the remaining copy goes too
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('po', on_conflict := 'ours');
+----
+1	2	1
+
+query I
+SELECT count(*) FROM p2;
+----
+0
+
+# --- theirs where nothing applies is still a merge (the plan was not empty) ---------------
+
+statement ok
+CREATE TABLE g (v VARCHAR);
+
+statement ok
+INSERT INTO g VALUES ('a');
+
+statement ok
+CALL scenario_create('gone');
+
+statement ok
+ATTACH 'gone' AS gone (TYPE scenario);
+
+statement ok
+DELETE FROM gone.g;
+
+statement ok
+DETACH gone;
+
+statement ok
+DELETE FROM g;
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('gone', on_conflict := 'theirs');
+----
+0	0	1
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NOT NULL)::VARCHAR FROM scenario_list() WHERE name = 'gone';
+----
+true	true
+
+# --- deletes that still match are not conflicts --------------------------------------------
+
+statement ok
+CREATE TABLE m (v VARCHAR);
+
+statement ok
+INSERT INTO m VALUES ('a'), ('a'), ('a'), ('c');
+
+statement ok
+CALL scenario_create('match');
+
+statement ok
+ATTACH 'match' AS mt (TYPE scenario);
+
+# 2 of the 3 copies of (a), and the only (c)
+statement ok
+DELETE FROM mt.m WHERE rowid IN (SELECT rowid FROM mt.m WHERE v = 'a' LIMIT 2);
+
+statement ok
+DELETE FROM mt.m WHERE v = 'c';
+
+statement ok
+DETACH mt;
+
+# the base gains a copy of (c) and loses one of (a): both deletes still find
+# enough copies, so the counts just subtract
+statement ok
+INSERT INTO m VALUES ('c');
+
+statement ok
+DELETE FROM m WHERE rowid = (SELECT min(rowid) FROM m WHERE v = 'a');
+
+query TTT rowsort
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('match');
+----
+(a)	delete	false
+(a)	delete	false
+(c)	delete	false
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('match');
+----
+1	3	0
+
+query TI rowsort
+SELECT v, count(*) FROM m GROUP BY ALL;
+----
+c	1
+
+# --- upsert-like patterns ------------------------------------------------------------------
+
+statement ok
+CREATE TABLE prices (sku VARCHAR, price INTEGER);
+
+statement ok
+INSERT INTO prices VALUES ('p1', 10), ('p2', 20);
+
+statement ok
+CREATE TABLE price_feed (sku VARCHAR, price INTEGER);
+
+statement ok
+INSERT INTO price_feed VALUES ('p1', 11), ('p3', 30);
+
+statement ok
+CALL scenario_create('ups');
+
+statement ok
+ATTACH 'ups' AS ups (TYPE scenario);
+
+# MERGE as an upsert by sku: (p1, 10) -> (p1, 11), (p3, 30) is new
+statement ok
+MERGE INTO ups.prices t USING price_feed f ON t.sku = f.sku
+WHEN MATCHED THEN UPDATE SET price = f.price
+WHEN NOT MATCHED THEN INSERT VALUES (f.sku, f.price);
+
+# delete + re-insert of the same value nets to nothing: no plan, no conflict
+statement ok
+DELETE FROM ups.prices WHERE sku = 'p2';
+
+statement ok
+INSERT INTO ups.prices VALUES ('p2', 20);
+
+statement ok
+DETACH ups;
+
+# the base reprices p1 and drops p2 meanwhile
+statement ok
+UPDATE prices SET price = 12 WHERE sku = 'p1';
+
+statement ok
+DELETE FROM prices WHERE sku = 'p2';
+
+query TTT rowsort
+SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('ups');
+----
+(p1, 10)	delete	true
+(p1, 11)	insert	false
+(p3, 30)	insert	false
+
+statement error
+SELECT * FROM scenario_merge('ups');
+----
+<REGEX>:.*copies of row \(p1, 10\) of keyless table 'prices'.*
+
+query III
+SELECT tables_changed, rows_applied, conflicts_resolved FROM scenario_merge('ups', on_conflict := 'ours');
+----
+1	2	1
+
+# the scenario's inserts apply under either policy; p2 stays deleted in the
+# base (the scenario's net for it is zero)
+query TI rowsort
+SELECT sku, price FROM prices;
+----
+p1	11
+p1	12
+p3	30

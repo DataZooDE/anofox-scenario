@@ -282,7 +282,7 @@ scenario_create()                      Register a scenario
 | `CALL scenario_create(name, [desc], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog], [key_columns := MAP {...}])` | Register a scenario. `materialized` copies every base table; `from_scenario` branches; `base` uses another attached catalog (DuckLake bases pin to creation time); `key_columns` declares row identity for tables without a PK |
 | `CALL scenario_drop(name)` | Remove the scenario and its delta/materialized tables. Refuses while attached or while branches exist |
 | `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | Reject/allow writes; reads keep working. A frozen materialized scenario is a snapshot |
-| `SELECT * FROM scenario_list()` | `scenario_id, name, mode, frozen, parent, created_at, description` |
+| `SELECT * FROM scenario_list()` | `scenario_id, name, mode, frozen, parent, created_at, description, merged_at` |
 | `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | Deprecated: tables added to the base after `scenario_create` are writable without it. Only declares `key_columns` for keyless tables the scenario does not track yet |
 | `SELECT * FROM scenario_migrate()` | One-way migration of a legacy v0.1 database into the v2 layout |
 
@@ -303,7 +303,7 @@ of rows: every column is the identity and a changed row shows as `removed` + `ad
 | Function | Description |
 |----------|-------------|
 | `SELECT * FROM scenario_merge_preview(scenario)` | Planned actions: `table_name, key, action, conflict`. Streaming, no side effects |
-| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | Apply the delta to the base. `abort` (default) throws on conflict; `ours` = scenario wins; `theirs` = base wins. On success the scenario ends frozen with an empty delta |
+| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | Apply the delta to the base. `abort` (default) throws on conflict; `ours` = scenario wins; `theirs` = base wins. On success the scenario ends frozen with an empty delta; a scenario with nothing to merge is a no-op and stays open |
 
 ### Snapshots and Audit Notes
 

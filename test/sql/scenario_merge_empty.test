@@ -1,0 +1,230 @@
+# name: test/sql/scenario_merge_empty.test
+# description: merging a scenario with nothing to merge (an empty merge plan) is a no-op that leaves it open
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+statement ok
+CREATE TABLE t (id INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+INSERT INTO t VALUES (1, 'a'), (2, 'b');
+
+# --- a scenario that was never written ------------------------------------------------------
+
+statement ok
+CALL scenario_create('e', 'x');
+
+query I
+SELECT count(*) FROM scenario_merge_preview('e');
+----
+0
+
+query III
+SELECT * FROM scenario_merge('e');
+----
+0	0	0
+
+# not merged, not frozen
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NULL)::VARCHAR FROM scenario_list() WHERE name = 'e';
+----
+false	true
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NULL)::VARCHAR FROM __anofox_scenario.registry WHERE name = 'e';
+----
+false	true
+
+# still usable: write, merge for real
+statement ok
+ATTACH 'e' AS e (TYPE scenario);
+
+statement ok
+UPDATE e.t SET v = 'z' WHERE id = 1;
+
+statement ok
+DETACH e;
+
+query III
+SELECT * FROM scenario_merge('e');
+----
+1	1	0
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NOT NULL)::VARCHAR FROM scenario_list() WHERE name = 'e';
+----
+true	true
+
+query IT rowsort
+SELECT id, v FROM t;
+----
+1	z
+2	b
+
+# an empty merge can be repeated, and freeze/unfreeze stay available
+statement ok
+CALL scenario_create('e2');
+
+query III
+SELECT * FROM scenario_merge('e2');
+----
+0	0	0
+
+query III
+SELECT * FROM scenario_merge('e2');
+----
+0	0	0
+
+statement ok
+CALL scenario_freeze('e2');
+
+statement ok
+CALL scenario_unfreeze('e2');
+
+# --- a delta that exists but holds no rows -----------------------------------------------
+
+statement ok
+CALL scenario_create('undone');
+
+statement ok
+ATTACH 'undone' AS u (TYPE scenario);
+
+statement ok
+INSERT INTO u.t VALUES (3, 'c');
+
+statement ok
+DELETE FROM u.t WHERE id = 3;
+
+statement ok
+DETACH u;
+
+query III
+SELECT * FROM scenario_merge('undone');
+----
+0	0	0
+
+query T
+SELECT (merged_at IS NULL)::VARCHAR FROM scenario_list() WHERE name = 'undone';
+----
+true
+
+# --- a keyless delta whose changes net to nothing -------------------------------------------
+
+statement ok
+CREATE TABLE bag (v VARCHAR);
+
+statement ok
+INSERT INTO bag VALUES ('a'), ('a');
+
+statement ok
+CALL scenario_create('net0');
+
+statement ok
+ATTACH 'net0' AS n0 (TYPE scenario);
+
+statement ok
+DELETE FROM n0.bag;
+
+statement ok
+INSERT INTO n0.bag VALUES ('a'), ('a');
+
+statement ok
+DETACH n0;
+
+# the changelog holds rows, the plan does not
+query I
+SELECT count(*) > 0 FROM __anofox_scenario.s4_delta_bag;
+----
+true
+
+query I
+SELECT count(*) FROM scenario_merge_preview('net0');
+----
+0
+
+query III
+SELECT * FROM scenario_merge('net0');
+----
+0	0	0
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NULL)::VARCHAR FROM scenario_list() WHERE name = 'net0';
+----
+false	true
+
+# the changelog is left as it was
+query I
+SELECT count(*) > 0 FROM __anofox_scenario.s4_delta_bag;
+----
+true
+
+# --- a materialized scenario with no changes ----------------------------------------------
+
+statement ok
+CALL scenario_create('mat', mode := 'materialized');
+
+query III
+SELECT * FROM scenario_merge('mat');
+----
+0	0	0
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NULL)::VARCHAR FROM scenario_list() WHERE name = 'mat';
+----
+false	true
+
+# --- a planned action that turns out to be a no-op is still a merge -----------------------
+
+# the scenario deletes a key the base has deleted too: the plan lists the
+# delete, so the merge absorbs the scenario even though no row changes
+statement ok
+CALL scenario_create('satisfied');
+
+statement ok
+ATTACH 'satisfied' AS sat (TYPE scenario);
+
+statement ok
+DELETE FROM sat.t WHERE id = 2;
+
+statement ok
+DETACH sat;
+
+statement ok
+DELETE FROM t WHERE id = 2;
+
+query I
+SELECT count(*) FROM scenario_merge_preview('satisfied');
+----
+1
+
+query III
+SELECT * FROM scenario_merge('satisfied');
+----
+0	0	0
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NOT NULL)::VARCHAR FROM scenario_list() WHERE name = 'satisfied';
+----
+true	true
+
+# --- the other guards still apply -------------------------------------------------------
+
+statement ok
+CALL scenario_freeze('mat');
+
+statement error
+SELECT * FROM scenario_merge('mat');
+----
+<REGEX>:.*frozen.*
+
+statement ok
+CALL scenario_unfreeze('mat');
+
+statement ok
+CALL scenario_create('kid', from_scenario := 'mat');
+
+statement error
+SELECT * FROM scenario_merge('mat');
+----
+<REGEX>:.*other scenarios branch from it.*

@@ -609,10 +609,30 @@ to the scenario's (`snapshot count + net`), deleting or re-adding copies as need
 never conflict. On DuckLake all counts are captured in temp tables before the lake is touched;
 on the host they come from one scan of the base and one of the mat copy, before any write.
 
+Keyless tables of overlay (delta) scenarios on the host have no snapshot count, so only the
+lower bound is checkable: the scenario saw at least `n` copies of a value it deletes `n` of. A
+negative net whose value has fewer than `n` copies in the base now conflicts (the base deleted or
+edited copies the scenario deleted - e.g. the scenario updated `(x, 1)` to `(x, 2)` and the base
+updated `(x, 1)` to `(y, 1)`, where a silent merge would leave both `(y, 1)` and `(x, 2)`). The
+resolution mirrors the snapshot tiers with the smallest snapshot consistent with the delete
+(`snapshot = n`, target count `0`): `theirs` leaves the value's base copies alone, `ours` deletes
+the copies still there and adds none back. A value with at least `n` copies is applied as is,
+so drift that adds copies, or removes fewer than the scenario deletes, stays undetected. Net
+inserts never conflict under any policy. `conflicts_resolved` counts one per conflicting value.
+
 `scenario_merge_preview` lists the same per-value net plan for keyless tables: one row per copy
 the merge deletes or inserts, `key` = the row's values rendered as text (`CAST(row(...) AS
 VARCHAR)`), `conflict` per value from the same count comparison. Values whose inserts and deletes
 cancel out are not listed.
+
+**Empty merges.** Before anything is written the merge checks whether its plan is empty - the
+same plan the preview lists: no delta rows in a keyed delta, and a zero net for every value of a
+keyless one (`ScenarioHasMergePlan`). An empty plan returns `0, 0, 0` and leaves the scenario
+open: no registry update (not frozen, `merged_at` NULL), deltas and pre-images untouched, and on
+DuckLake no lake transaction is committed. A DuckLake merge still looks for its tag first, so a
+scenario whose apply committed before a failed bookkeeping and whose delta was later emptied is
+refused like any other changed delta. A non-empty plan whose actions change nothing (deleting a
+key the base already deleted, every conflict resolved `theirs`) is a normal merge.
 
 ### Merge-back into DuckLake: the two-commit window
 
@@ -638,7 +658,8 @@ its `scenario=/created=` prefix in `ducklake_snapshots(<lake>)`:
 The tag lives in the lake's own snapshot metadata, so it commits atomically with the apply and needs
 no extra table. Non-DuckLake cross-catalog bases have no commit metadata and are not tagged.
 
-On success the scenario ends frozen, with `merged_at` set and an empty delta.
+On success the scenario ends frozen, with `merged_at` set and an empty delta (`scenario_list()`
+reports `merged_at`). An empty plan is the exception (above).
 
 ---
 

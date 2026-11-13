@@ -597,8 +597,10 @@ struct ScenarioListState : public GlobalTableFunctionState {
 unique_ptr<FunctionData> ScenarioListBind(ClientContext &context, TableFunctionBindInput &input,
                                           vector<LogicalType> &return_types, dc::BindNames &names) {
 	return_types = {LogicalType::BIGINT,  LogicalType::VARCHAR,   LogicalType::VARCHAR, LogicalType::BOOLEAN,
-	                LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR};
-	names = {"scenario_id", "name", "mode", "frozen", "parent", "created_at", "description"};
+	                LogicalType::VARCHAR, LogicalType::TIMESTAMP, LogicalType::VARCHAR, LogicalType::TIMESTAMP};
+	// merged_at is appended (not placed next to created_at) so positional
+	// readers of the original seven columns keep working
+	names = {"scenario_id", "name", "mode", "frozen", "parent", "created_at", "description", "merged_at"};
 	return make_uniq<TableFunctionData>();
 }
 
@@ -629,6 +631,8 @@ void ScenarioListExecute(ClientContext &context, TableFunctionInput &data, DataC
 		}
 		output.SetValue(5, count, Value::TIMESTAMP(entry.created_at));
 		output.SetValue(6, count, entry.has_description ? Value(entry.description) : Value(LogicalType::VARCHAR));
+		output.SetValue(7, count,
+		                entry.has_merged_at ? Value::TIMESTAMP(entry.merged_at) : Value(LogicalType::TIMESTAMP));
 		count++;
 	}
 	output.SetChildCardinality(count);

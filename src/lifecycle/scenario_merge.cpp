@@ -9,6 +9,9 @@
 // 'D' rows whose key vanished are already satisfied and are skipped.
 // on_conflict := 'abort' (default) | 'ours' (scenario wins) | 'theirs'
 // (base wins - conflicting delta rows are dropped).
+//
+// A scenario whose merge plan is empty (what scenario_merge_preview lists:
+// no delta rows, keyless nets all zero) merges as a no-op and stays open.
 //===----------------------------------------------------------------------===//
 
 #include "lifecycle/scenario_lifecycle.hpp"
@@ -274,10 +277,15 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 				match_b += "b." + name + " IS NOT DISTINCT FROM n." + name;
 				match_m += "m." + name + " IS NOT DISTINCT FROM n." + name;
 			}
-			string bag_conflict = "false";
+			string bag_conflict;
 			if (!snapshot_ref.empty()) {
 				bag_conflict = "n.__anofox_net < 0 AND (SELECT count(*) FROM " + base_name + " b WHERE " + match_b +
 				               ") <> (SELECT count(*) FROM " + snapshot_ref + " WHERE " + match_m + ")";
+			} else {
+				// delta scenario, no snapshot: the delete conflicts when the
+				// base no longer holds the copies it removes
+				bag_conflict = "n.__anofox_net < 0 AND (SELECT count(*) FROM " + base_name + " b WHERE " + match_b +
+				               ") < -n.__anofox_net";
 			}
 			if (!sql.empty()) {
 				sql += " UNION ALL ";
@@ -401,6 +409,98 @@ struct MergeRow {
 	vector<Value> payload; // base-table layout
 };
 
+//! Whole-row bag identity of a keyless payload (NULL-safe), the same string
+//! ScenarioDelta::MakeKey builds from a base row
+string BagValueKey(const vector<Value> &payload) {
+	string key;
+	for (auto &value : payload) {
+		if (value.IsNull()) {
+			key += "N|";
+		} else {
+			auto str = value.ToString();
+			key += to_string(str.size()) + ":" + str;
+		}
+	}
+	return key;
+}
+
+//! Every row of a delta table, decoded (op, multiplicity, base-layout payload)
+vector<MergeRow> LoadDeltaRows(ClientContext &context, DuckTableEntry &delta_table) {
+	auto delta_types = delta_table.GetStorage().GetTypes();
+	auto count_column = ScenarioDelta::CountColumnIndex(delta_table);
+	idx_t payload_count = delta_types.size() - ScenarioDelta::PAYLOAD_START - (count_column.IsValid() ? 1 : 0);
+	vector<StorageIndex> column_ids;
+	vector<LogicalType> scan_types;
+	column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+	scan_types.push_back(LogicalType::ROW_TYPE);
+	for (idx_t i = 0; i < delta_types.size(); i++) {
+		column_ids.emplace_back(i);
+		scan_types.push_back(delta_types[i]);
+	}
+	vector<MergeRow> rows;
+	ScenarioDelta::ScanTableRows(context, delta_table, std::move(column_ids), scan_types,
+	                             [&](DataChunk &chunk, idx_t row) {
+		                             MergeRow merge_row;
+		                             merge_row.delta_row_id = chunk.GetValue(0, row).GetValue<row_t>();
+		                             merge_row.op = chunk.GetValue(1, row).GetValue<string>()[0];
+		                             for (idx_t i = 0; i < payload_count; i++) {
+			                             merge_row.payload.push_back(
+			                                 chunk.GetValue(1 + ScenarioDelta::PAYLOAD_START + i, row));
+		                             }
+		                             if (count_column.IsValid()) {
+			                             merge_row.count =
+			                                 chunk.GetValue(1 + count_column.GetIndex(), row).GetValue<int64_t>();
+		                             }
+		                             rows.push_back(std::move(merge_row));
+		                             return true;
+	                             });
+	return rows;
+}
+
+//! Whether the merge has anything to apply: the plan scenario_merge_preview
+//! lists. Keyed deltas plan every row; keyless deltas plan the values whose
+//! I/D multiplicities do not cancel out. A delta whose base table vanished
+//! counts as planned (the merge reports the missing table).
+bool ScenarioHasMergePlan(ClientContext &context, Catalog &host, const ScenarioRegistryEntry &entry) {
+	optional_ptr<Catalog> base_catalog = &host;
+	if (!entry.base_catalog.empty()) {
+		base_catalog = Catalog::GetCatalogEntry(context, dc::Ident(entry.base_catalog));
+		if (!base_catalog) {
+			throw InvalidInputException("Scenario '%s': base catalog '%s' is not attached", dc::Str(entry.name),
+			                            entry.base_catalog);
+		}
+	}
+	for (auto &delta_pair : ListDeltaTables(context, host, entry.scenario_id)) {
+		auto &logical_name = delta_pair.second;
+		auto delta_entry = ScenarioDelta::TryGetDeltaTable(context, host, entry.scenario_id, logical_name);
+		if (!delta_entry) {
+			continue;
+		}
+		auto rows = LoadDeltaRows(context, *delta_entry);
+		if (rows.empty()) {
+			continue;
+		}
+		string schema_name, table_name;
+		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
+		auto base_entry = dc::GetEntry<TableCatalogEntry>(*base_catalog, context, schema_name, table_name,
+		                                                  OnEntryNotFound::RETURN_NULL);
+		if (!base_entry ||
+		    !ScenarioDelta::GetKeyColumns(context, host, entry.scenario_id, logical_name, *base_entry).empty()) {
+			return true;
+		}
+		unordered_map<string, int64_t> nets;
+		for (auto &row : rows) {
+			nets[BagValueKey(row.payload)] += row.op == 'I' ? row.count : -row.count;
+		}
+		for (auto &net : nets) {
+			if (net.second != 0) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 //! Merge-back into a cross-catalog (e.g. DuckLake) base. DuckDB transactions
 //! write a single attached database (no 2PC), so the lake apply runs
 //! atomically in its OWN transaction on a second connection (lake = sole
@@ -414,8 +514,12 @@ struct MergeRow {
 //! (commit_extra_info) with the scenario's identity, a fingerprint of the
 //! delta, and the counts; a later merge that finds its tag in the lake's
 //! snapshots skips the lake apply and only finishes the host bookkeeping.
-void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioRegistryEntry &entry,
-                          MergeConflictPolicy policy, idx_t &tables_changed, idx_t &rows_applied,
+//!
+//! Returns false when there was nothing to merge (`has_plan` false and no
+//! tag of an earlier apply): nothing was committed, and the caller leaves
+//! the scenario open.
+bool MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioRegistryEntry &entry,
+                          MergeConflictPolicy policy, bool has_plan, idx_t &tables_changed, idx_t &rows_applied,
                           idx_t &conflicts_resolved) {
 	if (!context.transaction.IsAutoCommit()) {
 		throw NotImplementedException(
@@ -494,8 +598,14 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 			tables_changed += std::stoull(kv["tables_changed"]);
 			rows_applied += std::stoull(kv["rows_applied"]);
 			conflicts_resolved += std::stoull(kv["conflicts_resolved"]);
-			return;
+			return true;
 		}
+	}
+	if (!has_plan) {
+		// empty plan: no lake commit (the tag check above still ran, so an
+		// applied merge whose delta was emptied since is refused)
+		con.Rollback();
+		return false;
 	}
 
 	for (auto &delta_pair : delta_tables) {
@@ -719,6 +829,7 @@ void MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 		    ")");
 	}
 	con.Commit();
+	return true;
 }
 
 //! Register base rows a merge deletes in the transaction's delete indexes
@@ -782,6 +893,19 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		throw InvalidInputException("Cannot merge scenario '%s': other scenarios branch from it",
 		                            dc::Str(bind_data.name));
 	}
+	auto emit_counts = [&](idx_t tables_changed, idx_t rows_applied, idx_t conflicts_resolved) {
+		output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
+		output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
+		output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
+		output.SetChildCardinality(1);
+	};
+	// nothing to merge (the preview's plan is empty): a no-op that leaves the
+	// scenario open - not frozen, merged_at NULL, deltas untouched
+	bool has_plan = ScenarioHasMergePlan(context, host, *entry);
+	if (!has_plan && entry->base_catalog.empty()) {
+		emit_counts(0, 0, 0);
+		return;
+	}
 	MetaTransaction::Get(context).ModifyDatabase(
 	    host.GetAttached(), DatabaseModificationType::INSERT_DATA | DatabaseModificationType::UPDATE_DATA |
 	                            DatabaseModificationType::DELETE_DATA);
@@ -793,8 +917,11 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	if (!entry->base_catalog.empty()) {
 		// cross-catalog base: apply on a second connection (lake commits
 		// atomically on its own), then do host bookkeeping below
-		MergeIntoForeignBase(context, host, *entry, bind_data.policy, tables_changed, rows_applied,
-		                     conflicts_resolved);
+		if (!MergeIntoForeignBase(context, host, *entry, bind_data.policy, has_plan, tables_changed, rows_applied,
+		                          conflicts_resolved)) {
+			emit_counts(0, 0, 0);
+			return;
+		}
 		// empty the deltas in the caller's transaction
 		for (auto &delta_pair : ListDeltaTables(context, host, entry->scenario_id)) {
 			auto delta_entry =
@@ -832,10 +959,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		}
 		ScenarioRegistry::MarkMerged(context, host, entry->scenario_id);
 		ScenarioRegistry::SetFrozen(context, host, entry->scenario_id, true);
-		output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
-		output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
-		output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
-		output.SetChildCardinality(1);
+		emit_counts(tables_changed, rows_applied, conflicts_resolved);
 		return;
 	}
 
@@ -851,35 +975,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		}
 		auto &delta_table = *delta_entry;
 
-		// load the delta rows
-		auto delta_types = delta_table.GetStorage().GetTypes();
-		auto count_column = ScenarioDelta::CountColumnIndex(delta_table);
-		idx_t payload_count = delta_types.size() - ScenarioDelta::PAYLOAD_START - (count_column.IsValid() ? 1 : 0);
-		vector<StorageIndex> column_ids;
-		vector<LogicalType> scan_types;
-		column_ids.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
-		scan_types.push_back(LogicalType::ROW_TYPE);
-		for (idx_t i = 0; i < delta_types.size(); i++) {
-			column_ids.emplace_back(i);
-			scan_types.push_back(delta_types[i]);
-		}
-		vector<MergeRow> rows;
-		ScenarioDelta::ScanTableRows(context, delta_table, std::move(column_ids), scan_types,
-		                             [&](DataChunk &chunk, idx_t row) {
-			                             MergeRow merge_row;
-			                             merge_row.delta_row_id = chunk.GetValue(0, row).GetValue<row_t>();
-			                             merge_row.op = chunk.GetValue(1, row).GetValue<string>()[0];
-			                             for (idx_t i = 0; i < payload_count; i++) {
-				                             merge_row.payload.push_back(
-				                                 chunk.GetValue(1 + ScenarioDelta::PAYLOAD_START + i, row));
-			                             }
-			                             if (count_column.IsValid()) {
-				                             merge_row.count =
-				                                 chunk.GetValue(1 + count_column.GetIndex(), row).GetValue<int64_t>();
-			                             }
-			                             rows.push_back(std::move(merge_row));
-			                             return true;
-		                             });
+		auto rows = LoadDeltaRows(context, delta_table);
 		if (rows.empty()) {
 			continue;
 		}
@@ -1192,18 +1288,6 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		} else {
 			// keyless bag: aggregate net multiplicity per value, delete that
 			// many matching base rows for negative nets, append for positive
-			auto value_key = [&](const vector<Value> &payload) {
-				string key;
-				for (auto &value : payload) {
-					if (value.IsNull()) {
-						key += "N|";
-					} else {
-						auto str = value.ToString();
-						key += to_string(str.size()) + ":" + str;
-					}
-				}
-				return key;
-			};
 			struct BagNet {
 				int64_t net = 0;
 				const vector<Value> *payload = nullptr;
@@ -1213,7 +1297,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 			};
 			unordered_map<string, BagNet> nets;
 			for (auto &row : rows) {
-				auto &net = nets[value_key(row.payload)];
+				auto &net = nets[BagValueKey(row.payload)];
 				net.net += (row.op == 'I') ? row.count : -row.count;
 				if (!net.payload) {
 					net.payload = &row.payload;
@@ -1270,9 +1354,14 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 					}
 				}
 			}
-			// per value: clean deletes apply the net; a drifted value (its base
-			// count differs from the snapshot's) conflicts - 'theirs' keeps the
-			// base copies, 'ours' sets the base to the scenario's count
+			// per value: clean deletes apply the net; a drifted value conflicts -
+			// 'theirs' keeps the base copies, 'ours' sets the base to the
+			// scenario's count. Materialized: the base count differs from the
+			// snapshot's. Delta scenarios have no snapshot, only its lower bound
+			// (the scenario saw at least the copies it deletes): the base holds
+			// fewer copies than the delete removes. 'ours' then targets the
+			// smallest consistent snapshot (count 0): it deletes the copies
+			// still there and re-adds none.
 			vector<row_t> base_rows_to_delete;
 			for (auto &net_pair : nets) {
 				auto &net = net_pair.second;
@@ -1282,7 +1371,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				}
 				idx_t now = net.base_rows.size();
 				idx_t del = MinValue<idx_t>(NumericCast<idx_t>(-net.net), now);
-				if (is_materialized && now != net.snap) {
+				bool drifted = is_materialized ? now != net.snap : now < NumericCast<idx_t>(-net.net);
+				if (drifted) {
 					conflicts_resolved++;
 					if (bind_data.policy == MergeConflictPolicy::ABORT) {
 						string rendered;
@@ -1297,7 +1387,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 					}
 					if (bind_data.policy == MergeConflictPolicy::THEIRS) {
 						del = 0;
-					} else {
+					} else if (is_materialized) {
 						auto target_signed = static_cast<int64_t>(net.snap) + net.net;
 						idx_t target = target_signed > 0 ? NumericCast<idx_t>(target_signed) : 0;
 						del = now > target ? now - target : 0;
@@ -1391,11 +1481,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	}
 
 	ScenarioRegistry::MarkMerged(context, host, entry->scenario_id);
-
-	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
-	output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
-	output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
-	output.SetChildCardinality(1);
+	emit_counts(tables_changed, rows_applied, conflicts_resolved);
 }
 
 } // namespace
