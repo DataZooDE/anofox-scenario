@@ -262,7 +262,8 @@ UPDATE __anofox_scenario.registry SET frozen = false WHERE name IN (SELECT name 
 ----
 <REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
 
-# a rejected statement fails like a binder error: the transaction stays usable
+# inside a transaction: rejected, nothing written. DuckDB 1.5 keeps the
+# transaction usable, 2.0 aborts it, so only ROLLBACK is portable.
 statement ok
 BEGIN;
 
@@ -275,12 +276,17 @@ UPDATE __anofox_scenario.registry SET frozen = false;
 <REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
 
 statement ok
-COMMIT;
+ROLLBACK;
 
 query I
 SELECT count(*) FROM forecast;
 ----
-3
+2
+
+query I
+SELECT count(*) FROM __anofox_scenario.registry WHERE frozen;
+----
+1
 
 # prepared statements: SQL PREPARE only plans the statement, EXECUTE runs the
 # guard (client-API prepared statements: test/cpp/test_internal_guard.cpp)

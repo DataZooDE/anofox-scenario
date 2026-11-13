@@ -240,7 +240,9 @@ Scenarios change only through the scenario functions and attached scenarios, whi
 go through SQL. The check runs when a statement is planned, independent of the optimizer and
 of the statement form (a prepared statement that was allowed with the setting on is checked
 again at every execution). A rejected
-statement fails like a binder error: an open transaction stays usable.
+statement writes nothing. Inside an explicit transaction, roll back afterwards: DuckDB 1.5 keeps
+the transaction usable, DuckDB 2.0 aborts it, so a later `COMMIT` there discards its earlier
+writes.
 
 The escape hatch is a per-connection setting:
 

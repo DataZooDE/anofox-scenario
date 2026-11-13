@@ -520,8 +520,9 @@ may run long after the setting was turned off again, and DuckDB 2.0 has no execu
 client states (1.5's `OnExecutePrepared` is gone), so an internal write that the setting allowed
 is marked `always_require_rebind`: every execution re-plans it and checks it again.
 
-The check throws before execution and before any write, like a binder error, so the transaction
-stays usable. `anofox_scenario_allow_internal_writes` (session-scoped, default off) disables it
+The check throws before execution and before any write. On DuckDB 1.5 that leaves an explicit
+transaction usable, like a binder error; DuckDB 2.0 invalidates the transaction for errors raised
+from `OnFinalizePrepare`, so a later `COMMIT` rolls back (the test only relies on `ROLLBACK`). `anofox_scenario_allow_internal_writes` (session-scoped, default off) disables it
 for restores (`IMPORT DATABASE` re-creates the schema through SQL), `COPY FROM DATABASE` and
 manual repair.
 
