@@ -124,6 +124,56 @@ SELECT frozen::VARCHAR FROM scenario_list() WHERE name = 'baseline';
 ----
 true
 
+# the columns, in order: merged_at is the last one
+query T
+SELECT column_name FROM (DESCRIBE SELECT * FROM scenario_list());
+----
+scenario_id
+name
+mode
+frozen
+parent
+created_at
+description
+merged_at
+
+query TT
+SELECT column_type, null FROM (DESCRIBE SELECT merged_at FROM scenario_list());
+----
+TIMESTAMP	NULL
+
+# NULL until the scenario is merged back; freezing alone does not set it
+query T
+SELECT count(*) FILTER (WHERE merged_at IS NOT NULL)::VARCHAR FROM scenario_list();
+----
+0
+
+statement ok
+CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER);
+
+statement ok
+CALL scenario_create('booked');
+
+statement ok
+ATTACH 'booked' AS bk (TYPE scenario);
+
+statement ok
+INSERT INTO bk.ledger VALUES (1, 100);
+
+statement ok
+DETACH bk;
+
+statement ok
+SELECT * FROM scenario_merge('booked');
+
+query TT
+SELECT frozen::VARCHAR, (merged_at = (SELECT merged_at FROM __anofox_scenario.registry WHERE name = 'booked'))::VARCHAR FROM scenario_list() WHERE name = 'booked';
+----
+true	true
+
+statement ok
+CALL scenario_drop('booked');
+
 # --- cleanup ------------------------------------------------------------------------
 
 statement ok

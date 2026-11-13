@@ -348,3 +348,96 @@ SELECT body FROM lake.notes;
 ----
 n1
 n2
+
+# --- an empty merge makes no lake commit and leaves the scenario open ---------------------
+
+statement ok
+CALL scenario_create('lake_empty', base := 'lake');
+
+statement ok
+CREATE TABLE snapshots_before AS SELECT count(*) AS n FROM lake.snapshots();
+
+query III
+SELECT * FROM scenario_merge('lake_empty');
+----
+0	0	0
+
+query I
+SELECT (SELECT count(*) FROM lake.snapshots()) - n FROM snapshots_before;
+----
+0
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NULL)::VARCHAR FROM scenario_list() WHERE name = 'lake_empty';
+----
+false	true
+
+# a keyless delta that nets to nothing is empty too
+statement ok
+ATTACH 'lake_empty' AS le (TYPE scenario);
+
+statement ok
+INSERT INTO le.notes VALUES ('tmp');
+
+statement ok
+DELETE FROM le.notes WHERE body = 'tmp';
+
+statement ok
+DETACH le;
+
+query III
+SELECT * FROM scenario_merge('lake_empty');
+----
+0	0	0
+
+query I
+SELECT (SELECT count(*) FROM lake.snapshots()) - n FROM snapshots_before;
+----
+0
+
+query TT
+SELECT frozen::VARCHAR, (merged_at IS NULL)::VARCHAR FROM scenario_list() WHERE name = 'lake_empty';
+----
+false	true
+
+# --- an applied merge whose delta was emptied afterwards is still refused -----------------
+
+statement ok
+CALL scenario_create('emptied_after', base := 'lake');
+
+statement ok
+ATTACH 'emptied_after' AS ea (TYPE scenario);
+
+statement ok
+INSERT INTO ea.notes VALUES ('n4');
+
+statement ok con2
+BEGIN;
+
+statement ok con2
+UPDATE __anofox_scenario.registry SET frozen = true WHERE name = 'emptied_after';
+
+statement error
+SELECT * FROM scenario_merge('emptied_after');
+----
+<REGEX>:.*[Cc]onflict.*
+
+statement ok con2
+ROLLBACK;
+
+# the lake has n4; the scenario takes its insert back, so its delta nets to nothing
+statement ok
+DELETE FROM ea.notes WHERE body = 'n4';
+
+statement ok
+DETACH ea;
+
+query I
+SELECT count(*) FROM scenario_merge_preview('emptied_after');
+----
+0
+
+statement error
+SELECT * FROM scenario_merge('emptied_after');
+----
+<REGEX>:.*already applied to base catalog 'lake'.*changed since.*

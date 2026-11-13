@@ -305,7 +305,9 @@ test/sql/
   attach_write_checks.test        # read-only / frozen / single-writer checks at EXECUTE, not PREPARE (#39)
   attach_internal_guard.test      # host SQL may read __anofox_scenario but not write it / change its schema; escape-hatch setting, IMPORT (#55)
   scenario_merge_keyless_drift.test # 3-way drift for keyless tables in materialized scenarios (#39)
-  scenario_ducklake_merge_hardening.test # legacy deltas, rowid columns, net-plan preview, idempotent lake re-merge (#39)
+  scenario_ducklake_merge_hardening.test # legacy deltas, rowid columns, net-plan preview, idempotent lake re-merge (#39), empty lake merges
+  scenario_delta_keyless_drift.test # keyless delete whose base copies are gone = conflict in delta scenarios (preview, abort/ours/theirs)
+  scenario_merge_empty.test       # merging an empty plan is a no-op: 0|0|0, scenario stays open (not frozen, merged_at NULL)
   scenario_delta_drift.test       # delta scenarios: pre-images, drift conflicts at merge/preview, branches, legacy (#53)
   scenario_merge_fk_order.test    # merge applies parents first; in-place updates of referenced rows (#54)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
