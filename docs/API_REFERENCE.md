@@ -139,9 +139,20 @@ CALL scenario_drop('optimistic');                    -- refuses while attached o
   Change the base schema instead: new base tables show up in delta scenarios automatically.
   Materialized scenarios (and their branches) keep the copy made at creation and DuckLake-based
   ones their creation snapshot, so schema changes reach them only through a new scenario; the
-  error's hint says which case applies.
+  error's hint says which case applies. Altering a base table that a scenario has already written (it has a
+  delta for it) currently breaks that scenario with an INTERNAL error that invalidates the
+  database ([#62](https://github.com/DataZooDE/anofox-scenario/issues/62)); undo the base
+  change to recover. Alter only tables no open scenario has written.
 - **Host database:** the scenario registry lives in the session's *default* database at
-  `scenario_create` / `ATTACH` time.
+  `scenario_create` / `ATTACH` time. So after `USE alias` (a scenario) the `scenario_*` functions look in the
+  scenario catalog and find nothing: `scenario_list()` returns no rows and the other functions
+  fail with `Scenario '…' not found`. `USE` the host database again (`memory`, or the file's
+  stem) before calling them; prefer `alias.t` over `USE alias`.
+- **Telemetry:** the extension sends anonymous usage telemetry (an `extension_loaded` event
+  with extension version and platform). Setting:
+  | Setting | Default | Meaning |
+  | --- | --- | --- |
+  | `anofox_scenario_telemetry_enabled` | `true` | `SET anofox_scenario_telemetry_enabled = false` turns it off for the process. Set it before `SET lock_configuration = true`, which freezes every option. The load event itself fires during `LOAD`; to suppress it as well, set the environment variable `DATAZOO_DISABLE_TELEMETRY=1` before starting. Telemetry is off automatically in common CI environments (`CI`, `GITHUB_ACTIONS`, ...). |
 
 **Remaining limitations** (clean errors; everything else from the v1 list has shipped)
 
@@ -168,7 +179,7 @@ CALL scenario_drop('optimistic');                    -- refuses while attached o
 | `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). Keyless tables merge as bags: per distinct row (NULL-safe whole-row match) the net delete count `n` removes exactly `n` copies and a net insert count adds that many; on a drifted row of a snapshot scenario (materialized or DuckLake) `theirs` keeps the base's copies and `ours` sets the base to the scenario's count. In a delta scenario a keyless delete whose copies are no longer all in the base is a conflict: `abort` refuses the merge, `theirs` keeps the base's remaining copies of that row, `ours` deletes the copies still there (the missing ones are skipped; nothing is re-added). The scenario's keyless inserts have no identity to conflict on and apply under every policy - so `(x, 1) -> (x, 2)` in the scenario, merged with `ours` or `theirs` after the base changed `(x, 1)` to `(y, 1)`, leaves both `(y, 1)` and `(x, 2)`. Each conflicting row value counts once in `conflicts_resolved`. On a DuckLake base the lake commit is tagged (`commit_extra_info`), so a merge whose host bookkeeping failed can simply be re-run. On success the scenario ends `frozen` with `merged_at` set and an empty delta, and the function returns one row `tables_changed, rows_applied, conflicts_resolved`. A scenario with nothing to merge - its merge plan is empty, i.e. `scenario_merge_preview` lists no rows: no delta rows, or keyless changes that net to zero per row - is a no-op: it returns `0, 0, 0`, writes nothing (no lake commit on a DuckLake base), and stays open (not frozen, `merged_at` NULL). A plan whose actions all turn out to change nothing (a delete of a key the base already deleted, conflicts all resolved `theirs`) is still a merge. Refuses while branches exist (a merged branch counts until it is dropped), while the scenario is frozen, and once it has been merged. Merging a branch applies its parent's changes too. Drift (a base edit to a row the scenario touched) is a conflict like the overlay ones, also for delta scenarios (#53; see `scenario_merge_preview`). Tables are applied referenced-first, so new parent rows exist before the children that reference them; an update that keeps the key and every indexed column is applied in place, so rows referencing it stay valid (#54). With a host base, a `ROLLBACK` of the surrounding transaction undoes the merge and leaves the scenario mergeable. |
 | `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | verb | **Deprecated (#34).** Tables added to the base after `scenario_create` are writable without it, and it no longer creates delta tables. What remains: `key_columns` declares the row identity of keyless tables the scenario does not track yet (no declared key, never written); rejected once a table is tracked, except to replace a declared key whose column was renamed or dropped in the base before the table's first write. For DuckLake bases the table must be in the scenario's snapshot. Returns `refreshed_tables`, the number of keys declared (`0` without `key_columns`). Refuses frozen and materialized scenarios. |
 | `SELECT * FROM scenario_migrate()` | verb | Returns `migrated_scenarios, migrated_snapshots` (both `0` on a database without legacy tables). One-way migration of a legacy v0.1 database (`_scenario_registry`, `_scen_*`, `_snap_*`) into the v2 layout. Archived -> frozen; snapshots -> materialized+frozen; multi-op delta rows folded to net effects; `_scenario_base_rowids` dropped; `_scenario_protocols` preserved. |
-| `ATTACH 'name' AS alias (TYPE scenario [, READ_ONLY])` / `DETACH alias` | SQL | The entire read/write UX. `USE alias` makes unqualified table names resolve to the scenario. |
+| `ATTACH 'name' AS alias (TYPE scenario [, READ_ONLY])` / `DETACH alias` | SQL | The entire read/write UX. `USE alias` makes unqualified table names resolve to the scenario, but also hides the registry from the `scenario_*` functions until you `USE` the host database again. |
 
 ## Internal Layout
 

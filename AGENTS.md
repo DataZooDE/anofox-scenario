@@ -320,7 +320,8 @@ test/cpp/                         # Catch tests linked into unittest (see test/R
 ```
 .claude-plugin/marketplace.json                 # marketplace manifest (repo = marketplace)
 plugins/anofox-scenario/.claude-plugin/plugin.json  # plugin manifest; version = CalVer release
-plugins/anofox-scenario/skills/<skill>/SKILL.md # one skill per usage pattern
+plugins/anofox-scenario/skills/<skill>/SKILL.md # one skill per usage pattern (aim: <= ~10 KB)
+plugins/anofox-scenario/skills/<skill>/*.md      # companion files (long or optional recipes), linked from SKILL.md
 scripts/check_doc_snippets.py                   # `make check-docs`: runs every ```sql block
 scripts/doc_snippets/                           #   fixtures, expected errors, synopses, allowed names
 ```
