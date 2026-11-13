@@ -78,6 +78,14 @@ public:
 	static string DeltaTableName(int64_t scenario_id, const string &table_name);
 	//! Materialized base copy: __anofox_scenario.s<id>_mat_<table> (Phase 2)
 	static string MatTableName(int64_t scenario_id, const string &table_name);
+	//! Pre-image table of a delta scenario over a host base (#53):
+	//! __anofox_scenario.s<id>_pre_<table> with the base columns and the row
+	//! identity as PRIMARY KEY. It holds each base row as it was when the
+	//! scenario first touched its key (UPDATE or DELETE of a base row), so
+	//! scenario_merge detects base edits made afterwards (drift), as the mat
+	//! copy does for materialized scenarios. Keyed tables only; absent for
+	//! deltas written before it existed (no drift detection for those).
+	static string PreTableName(int64_t scenario_id, const string &table_name);
 	//! Logical name of a base table within a scenario: plain for the main
 	//! schema, '<schema>.<table>' otherwise. A part containing '.' (or
 	//! starting with '"') is double-quoted SQL-style ('"a.b"' = main table
@@ -92,6 +100,15 @@ public:
 	//! The delta table for a scenario table, if any writes happened yet
 	static optional_ptr<DuckTableEntry> TryGetDeltaTable(ClientContext &context, Catalog &host_catalog,
 	                                                     int64_t scenario_id, const string &table_name);
+	//! The pre-image table for a scenario table, if any (#53)
+	static optional_ptr<DuckTableEntry> TryGetPreTable(ClientContext &context, Catalog &host_catalog,
+	                                                   int64_t scenario_id, const string &table_name);
+	//! Create the pre-image table unless it exists (caller's transaction and
+	//! host-write registration, as for EnsureDeltaTable); identity_keys is the
+	//! delta's row identity (non-empty)
+	static DuckTableEntry &EnsurePreTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                                      TableCatalogEntry &base_entry, const vector<string> &identity_keys,
+	                                      const string &logical_name, bool host_is_not_writer = false);
 	//! The materialized base copy for a scenario table, if any
 	static optional_ptr<DuckTableEntry> TryGetMatTable(ClientContext &context, Catalog &host_catalog,
 	                                                   int64_t scenario_id, const string &table_name);

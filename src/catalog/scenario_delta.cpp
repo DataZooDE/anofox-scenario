@@ -256,6 +256,10 @@ string ScenarioDelta::MatTableName(int64_t scenario_id, const string &table_name
 	return "s" + to_string(scenario_id) + "_mat_" + table_name;
 }
 
+string ScenarioDelta::PreTableName(int64_t scenario_id, const string &table_name) {
+	return "s" + to_string(scenario_id) + "_pre_" + table_name;
+}
+
 //! A name part as written in a logical name: double-quoted (inner quotes
 //! doubled) only when it contains the '.' separator or starts with a quote,
 //! so every other name is spelled exactly as before
@@ -343,6 +347,11 @@ static optional_ptr<DuckTableEntry> TryGetInternalTable(ClientContext &context, 
 optional_ptr<DuckTableEntry> ScenarioDelta::TryGetDeltaTable(ClientContext &context, Catalog &host_catalog,
                                                              int64_t scenario_id, const string &table_name) {
 	return TryGetInternalTable(context, host_catalog, DeltaTableName(scenario_id, table_name));
+}
+
+optional_ptr<DuckTableEntry> ScenarioDelta::TryGetPreTable(ClientContext &context, Catalog &host_catalog,
+                                                           int64_t scenario_id, const string &table_name) {
+	return TryGetInternalTable(context, host_catalog, PreTableName(scenario_id, table_name));
 }
 
 optional_ptr<DuckTableEntry> ScenarioDelta::TryGetMatTable(ClientContext &context, Catalog &host_catalog,
@@ -440,6 +449,29 @@ void ScenarioDelta::CopyTableData(ClientContext &context, DuckTableEntry &from_t
 	}
 }
 
+//! Create an internal table in the caller's transaction (the caller registered
+//! the host write). host_is_not_writer: the statement registered the scenario
+//! catalog itself as the transaction's writer (COPY FROM DATABASE ... TO
+//! <scenario>), and a transaction has exactly one: the host's transaction is
+//! flagged read-write (MarkHostWrite) but cannot become the writer. DuckDB's
+//! schema refuses entries for a database that is not the registered writer
+//! when it sees a client context, so the entry is created in the host
+//! transaction without one. Everything else is unchanged: the entry goes into
+//! the host transaction's undo buffer, so ROLLBACK removes it and COMMIT
+//! writes it to the host's WAL.
+static void CreateInternalTable(ClientContext &context, Catalog &host_catalog, unique_ptr<CreateTableInfo> info,
+                                bool host_is_not_writer) {
+	if (!host_is_not_writer) {
+		host_catalog.CreateTable(context, std::move(info));
+		return;
+	}
+	auto binder = Binder::CreateBinder(context);
+	auto bound_info = binder->BindCreateTableInfo(std::move(info));
+	auto catalog_transaction = host_catalog.GetCatalogTransaction(context);
+	catalog_transaction.context = nullptr;
+	host_catalog.CreateTable(catalog_transaction, *bound_info);
+}
+
 DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
                                                 TableCatalogEntry &base_entry, const vector<string> *identity_keys,
                                                 const string *logical_name_override, bool host_is_not_writer) {
@@ -512,28 +544,37 @@ DuckTableEntry &ScenarioDelta::EnsureDeltaTable(ClientContext &context, Catalog 
 			info->constraints.push_back(dc::MakeUniqueConstraint(std::move(unique_names), false));
 		}
 	}
-	if (!host_is_not_writer) {
-		host_catalog.CreateTable(context, std::move(info));
-	} else {
-		// The statement registered the scenario catalog itself as the
-		// transaction's writer (COPY FROM DATABASE ... TO <scenario>), and a
-		// transaction has exactly one: the host's transaction is flagged
-		// read-write (MarkHostWrite) but cannot become the writer. DuckDB's
-		// schema refuses entries for a database that is not the registered
-		// writer when it sees a client context, so create the entry in the
-		// host transaction without one. Everything else is unchanged: the
-		// entry goes into the host transaction's undo buffer, so ROLLBACK
-		// removes it and COMMIT writes it to the host's WAL.
-		auto binder = Binder::CreateBinder(context);
-		auto bound_info = binder->BindCreateTableInfo(std::move(info));
-		auto catalog_transaction = host_catalog.GetCatalogTransaction(context);
-		catalog_transaction.context = nullptr;
-		host_catalog.CreateTable(catalog_transaction, *bound_info);
-	}
+	CreateInternalTable(context, host_catalog, std::move(info), host_is_not_writer);
 
 	auto created = TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (!created) {
 		throw InternalException("anofox_scenario: failed to create delta table for '%s'", dc::Str(base_entry.name));
+	}
+	return *created;
+}
+
+DuckTableEntry &ScenarioDelta::EnsurePreTable(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                              TableCatalogEntry &base_entry, const vector<string> &identity_keys,
+                                              const string &logical_name, bool host_is_not_writer) {
+	auto existing = TryGetPreTable(context, host_catalog, scenario_id, logical_name);
+	if (existing) {
+		return *existing;
+	}
+	D_ASSERT(!identity_keys.empty());
+	// Base columns with the row identity as PRIMARY KEY; no other constraint
+	// is mirrored (a pre-image is a copy of a row that satisfied them)
+	auto info = make_uniq<CreateTableInfo>();
+	dc::SetQualifiedName(*info, dc::Str(host_catalog.GetName()), ScenarioRegistry::SCHEMA_NAME,
+	                     PreTableName(scenario_id, logical_name));
+	info->on_conflict = OnCreateConflict::ERROR_ON_CONFLICT;
+	for (auto &col : base_entry.GetColumns().Logical()) {
+		info->columns.AddColumn(ColumnDefinition(col.Name(), col.Type()));
+	}
+	info->constraints.push_back(dc::MakeUniqueConstraint(vector<string>(identity_keys), true));
+	CreateInternalTable(context, host_catalog, std::move(info), host_is_not_writer);
+	auto created = TryGetPreTable(context, host_catalog, scenario_id, logical_name);
+	if (!created) {
+		throw InternalException("anofox_scenario: failed to create pre-image table for '%s'", logical_name);
 	}
 	return *created;
 }

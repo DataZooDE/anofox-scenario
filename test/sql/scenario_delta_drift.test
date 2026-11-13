@@ -1,0 +1,491 @@
+# name: test/sql/scenario_delta_drift.test
+# description: Delta scenarios detect base edits to rows they touched (pre-images, issue #53)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+load __TEST_DIR__/scenario_delta_drift.db
+
+# A delta scenario reads the live base, so it used to have no record of what a
+# base row looked like when the scenario changed it: a base edit made after
+# the scenario's UPDATE was silently overwritten at merge time, even with
+# on_conflict := 'abort'. The first touch of a base row now keeps its
+# pre-image in __anofox_scenario.s<id>_pre_<table>; merge and preview compare
+# the current base row with it (3-way drift, as for materialized scenarios).
+
+statement ok
+CREATE TABLE p (id INTEGER PRIMARY KEY, name VARCHAR, price INTEGER);
+
+statement ok
+INSERT INTO p VALUES (1, 'old', 10), (2, 'keep', 20), (3, 'three', 30), (4, 'four', 40);
+
+# --- the issue #53 repro: an edit of another column ---------------------------
+
+statement ok
+CALL scenario_create('s_abort');
+
+statement ok
+ATTACH 's_abort' AS sa (TYPE scenario);
+
+statement ok
+UPDATE sa.p SET price = 11 WHERE id = 1;
+
+# the pre-image table exists and holds the base row as it was
+query I
+SELECT scenario_id FROM scenario_list() WHERE name = 's_abort';
+----
+1
+
+query III
+SELECT * FROM __anofox_scenario.s1_pre_p;
+----
+1	old	10
+
+statement ok
+UPDATE p SET name = 'renamed' WHERE id = 1;
+
+# an untouched row changes in the base too: never a conflict
+statement ok
+UPDATE p SET price = 99 WHERE id = 2;
+
+query TTTT
+SELECT * FROM scenario_merge_preview('s_abort');
+----
+p	1	update	true
+
+statement error
+SELECT * FROM scenario_merge('s_abort');
+----
+the base changed underneath it
+
+# nothing was applied, the scenario is still mergeable
+query ITI
+SELECT * FROM p ORDER BY id;
+----
+1	renamed	10
+2	keep	99
+3	three	30
+4	four	40
+
+# 'theirs': the base edit wins, the scenario's change of that row is dropped
+query III
+SELECT * FROM scenario_merge('s_abort', on_conflict := 'theirs');
+----
+0	0	1
+
+query ITI
+SELECT * FROM p ORDER BY id;
+----
+1	renamed	10
+2	keep	99
+3	three	30
+4	four	40
+
+# a merge empties the pre-images with the delta
+query I
+SELECT count(*) FROM __anofox_scenario.s1_pre_p;
+----
+0
+
+statement ok
+DETACH sa;
+
+statement ok
+CALL scenario_drop('s_abort');
+
+# scenario_drop removes the pre-image table
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE 's1\_%' ESCAPE '\';
+----
+0
+
+# --- 'ours': the scenario's row wins ------------------------------------------
+
+statement ok
+CALL scenario_create('s_ours');
+
+statement ok
+ATTACH 's_ours' AS so (TYPE scenario);
+
+statement ok
+UPDATE so.p SET price = 12 WHERE id = 1;
+
+statement ok
+UPDATE p SET name = 'base edit' WHERE id = 1;
+
+query III
+SELECT * FROM scenario_merge('s_ours', on_conflict := 'ours');
+----
+1	1	1
+
+# the whole scenario row replaces the base row (as for materialized drift)
+query ITI
+SELECT * FROM p WHERE id = 1;
+----
+1	renamed	12
+
+statement ok
+DETACH so;
+
+statement ok
+CALL scenario_drop('s_ours');
+
+# --- the same column edited on both sides --------------------------------------
+
+statement ok
+CALL scenario_create('s_same');
+
+statement ok
+ATTACH 's_same' AS ss (TYPE scenario);
+
+statement ok
+UPDATE ss.p SET price = 13 WHERE id = 3;
+
+statement ok
+UPDATE p SET price = 31 WHERE id = 3;
+
+query TTTT
+SELECT * FROM scenario_merge_preview('s_same');
+----
+p	3	update	true
+
+statement ok
+DETACH ss;
+
+statement ok
+CALL scenario_drop('s_same');
+
+# --- base delete after a scenario update: conflict, as before -------------------
+
+statement ok
+CREATE TABLE q (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO q VALUES (1, 1), (2, 2), (3, 3);
+
+statement ok
+CALL scenario_create('s_q');
+
+statement ok
+ATTACH 's_q' AS sq (TYPE scenario);
+
+statement ok
+UPDATE sq.q SET v = 10 WHERE id = 1;
+
+# scenario delete of a row the base edits afterwards: conflict
+statement ok
+DELETE FROM sq.q WHERE id = 2;
+
+statement ok
+DELETE FROM q WHERE id = 1;
+
+statement ok
+UPDATE q SET v = 20 WHERE id = 2;
+
+query TTTT
+SELECT * FROM scenario_merge_preview('s_q') ORDER BY key;
+----
+q	1	update	true
+q	2	delete	true
+
+# 'theirs' keeps the edited base row 2 and does not resurrect row 1
+query III
+SELECT * FROM scenario_merge('s_q', on_conflict := 'theirs');
+----
+0	0	2
+
+query II
+SELECT * FROM q ORDER BY id;
+----
+2	20
+3	3
+
+statement ok
+DETACH sq;
+
+statement ok
+CALL scenario_drop('s_q');
+
+# --- re-touching a key keeps the first pre-image ------------------------------
+
+statement ok
+CREATE TABLE r (id INTEGER PRIMARY KEY, name VARCHAR, price INTEGER);
+
+statement ok
+INSERT INTO r VALUES (1, 'orig', 10), (2, 'two', 20), (3, 'three', 30), (4, 'four', 40);
+
+statement ok
+CALL scenario_create('s_r');
+
+statement ok
+ATTACH 's_r' AS sr (TYPE scenario);
+
+query I
+SELECT scenario_id FROM scenario_list() WHERE name = 's_r';
+----
+5
+
+statement ok
+UPDATE sr.r SET price = 11 WHERE id = 1;
+
+statement ok
+UPDATE r SET name = 'base edit' WHERE id = 1;
+
+statement ok
+UPDATE sr.r SET price = 12 WHERE id = 1;
+
+query III
+SELECT * FROM __anofox_scenario.s5_pre_r;
+----
+1	orig	10
+
+query TTTT
+SELECT * FROM scenario_merge_preview('s_r');
+----
+r	1	update	true
+
+# a rolled-back statement leaves no pre-image
+statement ok
+BEGIN;
+
+statement ok
+UPDATE sr.r SET price = 21 WHERE id = 2;
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM __anofox_scenario.s5_pre_r;
+----
+1
+
+# INSERT OR REPLACE over a base key records the pre-image too
+statement ok
+INSERT OR REPLACE INTO sr.r VALUES (3, 'replaced', 33);
+
+# MERGE INTO updating a base row as well
+statement ok
+MERGE INTO sr.r t USING (SELECT 4 AS id) s ON t.id = s.id WHEN MATCHED THEN UPDATE SET price = 44;
+
+query ITI
+SELECT * FROM __anofox_scenario.s5_pre_r ORDER BY id;
+----
+1	orig	10
+3	three	30
+4	four	40
+
+statement ok
+UPDATE r SET name = 'base three' WHERE id = 3;
+
+query TTTT
+SELECT * FROM scenario_merge_preview('s_r') ORDER BY key;
+----
+r	1	update	true
+r	3	update	true
+r	4	update	false
+
+# --- persistence: the pre-images survive a restart ----------------------------
+
+restart
+
+query TTTT
+SELECT * FROM scenario_merge_preview('s_r') ORDER BY key;
+----
+r	1	update	true
+r	3	update	true
+r	4	update	false
+
+statement error
+SELECT * FROM scenario_merge('s_r');
+----
+the base changed underneath it
+
+# --- PK move: the old key's pre-image ------------------------------------------
+
+statement ok
+CREATE TABLE m (id INTEGER PRIMARY KEY, v VARCHAR);
+
+statement ok
+INSERT INTO m VALUES (1, 'a'), (2, 'b');
+
+statement ok
+CALL scenario_create('s_move');
+
+statement ok
+ATTACH 's_move' AS sm (TYPE scenario);
+
+statement ok
+UPDATE sm.m SET id = 10 WHERE id = 1;
+
+statement ok
+UPDATE m SET v = 'edited' WHERE id = 1;
+
+query TTTT
+SELECT * FROM scenario_merge_preview('s_move') ORDER BY action, key;
+----
+m	1	delete	true
+m	10	insert	false
+
+statement ok
+DETACH sm;
+
+statement ok
+CALL scenario_drop('s_move');
+
+# --- branches inherit the parent's pre-images -----------------------------------
+
+statement ok
+CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO b VALUES (1, 1), (2, 2), (3, 3);
+
+statement ok
+CALL scenario_create('parent');
+
+statement ok
+ATTACH 'parent' AS par (TYPE scenario);
+
+statement ok
+UPDATE par.b SET v = 10 WHERE id = 1;
+
+statement ok
+CALL scenario_create('child', from_scenario := 'parent');
+
+statement ok
+ATTACH 'child' AS ch (TYPE scenario);
+
+# the child's own first touch of row 2
+statement ok
+UPDATE ch.b SET v = 20 WHERE id = 2;
+
+statement ok
+UPDATE b SET v = 100 + id;
+
+query TTTT
+SELECT * FROM scenario_merge_preview('child') ORDER BY key;
+----
+b	1	update	true
+b	2	update	true
+
+statement error
+SELECT * FROM scenario_merge('child');
+----
+the base changed underneath it
+
+statement ok
+DETACH ch;
+
+statement ok
+CALL scenario_drop('child');
+
+statement ok
+DETACH par;
+
+statement ok
+CALL scenario_drop('parent');
+
+# --- a delta written before pre-images existed keeps the overlay model ----------
+
+statement ok
+CREATE TABLE l (id INTEGER PRIMARY KEY, name VARCHAR, price INTEGER);
+
+statement ok
+INSERT INTO l VALUES (1, 'old', 10);
+
+statement ok
+CALL scenario_create('s_legacy');
+
+statement ok
+ATTACH 's_legacy' AS sl (TYPE scenario);
+
+statement ok
+UPDATE sl.l SET price = 11;
+
+query I
+SELECT scenario_id FROM scenario_list() WHERE name = 's_legacy';
+----
+9
+
+# simulate the old layout: no pre-image table
+statement ok
+DROP TABLE __anofox_scenario.s9_pre_l;
+
+statement ok
+UPDATE l SET name = 'renamed';
+
+query TTTT
+SELECT * FROM scenario_merge_preview('s_legacy');
+----
+l	1	update	false
+
+# further writes do not recreate it (the delta exists)
+statement ok
+UPDATE sl.l SET price = 12;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name = 's9_pre_l';
+----
+0
+
+query III
+SELECT * FROM scenario_merge('s_legacy');
+----
+1	1	0
+
+query ITI
+SELECT * FROM l;
+----
+1	old	12
+
+# --- no pre-images where another snapshot exists, or without a key -------------
+
+statement ok
+CREATE TABLE k (a INTEGER, b INTEGER);
+
+statement ok
+INSERT INTO k VALUES (1, 1);
+
+statement ok
+CALL scenario_create('s_mat', mode := 'materialized');
+
+statement ok
+ATTACH 's_mat' AS smat (TYPE scenario);
+
+statement ok
+UPDATE smat.p SET price = 1 WHERE id = 1;
+
+statement ok
+CALL scenario_create('s_keyless');
+
+statement ok
+ATTACH 's_keyless' AS skl (TYPE scenario);
+
+statement ok
+UPDATE skl.k SET b = 2;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%\_pre\_%' ESCAPE '\'
+  AND (table_name LIKE 's10\_%' ESCAPE '\' OR table_name LIKE 's11\_%' ESCAPE '\');
+----
+0
+
+# diffs and summaries never see the pre-image tables
+statement ok
+CALL scenario_create('s_diff');
+
+statement ok
+ATTACH 's_diff' AS sd (TYPE scenario);
+
+statement ok
+UPDATE sd.p SET price = 7 WHERE id = 4;
+
+query TIII
+SELECT * FROM scenario_diff_summary('s_diff');
+----
+p	0	1	0
+
+query ITTTT
+SELECT * FROM scenario_diff('s_diff', 'p');
+----
+4	modified	price	40	7

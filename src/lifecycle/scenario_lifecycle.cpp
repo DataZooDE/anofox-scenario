@@ -353,6 +353,21 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		auto &delta = ScenarioDelta::EnsureDeltaTable(context, host_catalog, entry.scenario_id, base_table.get(),
 		                                              &inherited_keys);
 		ScenarioDelta::CopyTableData(context, *parent_delta, delta);
+		// pre-images (#53): the branch's merge checks the rows the parent
+		// changed against the parent's pre-images, and its own first touches
+		// add to them (the delta exists already, so the first write will not
+		// create the table). Parents without pre-images (materialized, or
+		// deltas written before they existed) leave the inherited rows
+		// without drift detection.
+		if (effective_base.empty() && !inherited_keys.empty()) {
+			auto &pre = ScenarioDelta::EnsurePreTable(context, host_catalog, entry.scenario_id, base_table.get(),
+			                                          inherited_keys, logical_name);
+			auto parent_pre =
+			    ScenarioDelta::TryGetPreTable(context, host_catalog, parent->scenario_id, logical_name);
+			if (parent_pre) {
+				ScenarioDelta::CopyTableData(context, *parent_pre, pre);
+			}
+		}
 	}
 }
 
@@ -372,7 +387,7 @@ void ThrowIfAttached(ClientContext &context, const string &scenario_name) {
 	}
 }
 
-//! Drop all physical tables of a scenario (s<id>_delta_* and s<id>_mat_*)
+//! Drop all physical tables of a scenario (s<id>_delta_*, s<id>_mat_* and s<id>_pre_*)
 void DropDeltaTables(ClientContext &context, Catalog &host_catalog, int64_t scenario_id) {
 	auto schema = host_catalog.GetSchema(context, ScenarioRegistry::SCHEMA_NAME, OnEntryNotFound::RETURN_NULL);
 	if (!schema) {
@@ -380,10 +395,13 @@ void DropDeltaTables(ClientContext &context, Catalog &host_catalog, int64_t scen
 	}
 	string delta_prefix = "s" + to_string(scenario_id) + "_delta_";
 	string mat_prefix = "s" + to_string(scenario_id) + "_mat_";
+	string pre_prefix = "s" + to_string(scenario_id) + "_pre_";
 	vector<string> to_drop;
 	schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
-		if (entry.type == CatalogType::TABLE_ENTRY && (StringUtil::StartsWith(dc::Str(entry.name), delta_prefix) ||
-		                                               StringUtil::StartsWith(dc::Str(entry.name), mat_prefix))) {
+		auto name = dc::Str(entry.name);
+		if (entry.type == CatalogType::TABLE_ENTRY &&
+		    (StringUtil::StartsWith(name, delta_prefix) || StringUtil::StartsWith(name, mat_prefix) ||
+		     StringUtil::StartsWith(name, pre_prefix))) {
 			to_drop.push_back(dc::Str(entry.name));
 		}
 	});
