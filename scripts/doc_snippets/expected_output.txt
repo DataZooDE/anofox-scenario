@@ -28,3 +28,4 @@ plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	BEGIN;	fr
 plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	CALL scenario_create('optimistic_approved', 'optimistic, approved 2026-03-14', mode := 'materialized');	differences\n0\nA|EU|80\nA|US|110\nB|US|60
 plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/recipes.md	INSTALL ducklake;	count_star()\n2
 plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/recipes.md	SELECT coalesce(a.cost_center, l.cost_center) AS cost_center,	CC-300|NULL|9000.00
+plugins/anofox-scenario/skills/anofox-scenario-reference/behaviour.md	CREATE TABLE prices (id INTEGER PRIMARY KEY, price INTEGER);	1|11|EUR\n2|20|USD

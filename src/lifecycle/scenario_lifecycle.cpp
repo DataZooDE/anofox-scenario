@@ -325,9 +325,10 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		                                    declared.second);
 	}
 	if (bind_data.mode == "materialized" || parent) {
-		MetaTransaction::Get(context).ModifyDatabase(host_catalog.GetAttached(),
-		                                             DatabaseModificationType::CREATE_CATALOG_ENTRY |
-		                                                 DatabaseModificationType::INSERT_DATA);
+		MetaTransaction::Get(context).ModifyDatabase(
+		    host_catalog.GetAttached(),
+		    DatabaseModificationType::CREATE_CATALOG_ENTRY | DatabaseModificationType::ALTER_TABLE |
+		        DatabaseModificationType::DROP_CATALOG_ENTRY | DatabaseModificationType::INSERT_DATA);
 	}
 
 	for (auto &base_table : base_tables) {
@@ -342,6 +343,16 @@ void ScenarioCreateVerb(ClientContext &context, const LifecycleBindData &bind_da
 		auto parent_delta = ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id, logical_name);
 		if (!parent_delta) {
 			continue; // the parent never wrote it: nothing to inherit
+		}
+		if (effective_base.empty()) {
+			// the rows are copied column for column into a delta laid out like
+			// the base table: the parent's must be too. Columns the base gained
+			// while the extension was not loaded are added to the parent first;
+			// columns it dropped, renamed or retyped are an error (#62)
+			ScenarioDelta::SyncTableShape(context, host_catalog, parent->scenario_id, logical_name, true);
+			parent_delta = ScenarioDelta::TryGetDeltaTable(context, host_catalog, parent->scenario_id, logical_name);
+			ScenarioDelta::ThrowIfShapeDiffers(dc::Str(parent->name), logical_name, *parent_delta, true,
+			                                   base_table.get().GetColumns());
 		}
 		// inherit the parent's modifications by copying its delta rows into a
 		// delta of the same shape (cheap - deltas are small by invariant). A

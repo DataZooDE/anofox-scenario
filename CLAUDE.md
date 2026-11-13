@@ -260,6 +260,7 @@ src/
     scenario_delta.cpp                 #   delta/mat table management + copy helpers
     scenario_registry.cpp              #   registry v2 (caller-transaction catalog ops)
     scenario_internal_guard.cpp        #   rejects SQL writes/DDL on __anofox_scenario (#55)
+    scenario_schema_change.cpp         #   base ALTER/DROP TABLE vs. internal tables: ADD COLUMN widening, refusals (#62)
     scenario_transaction.cpp           #   transaction shim (ACID rides the host)
     include under src/include/catalog/
   lifecycle/
@@ -310,6 +311,7 @@ test/sql/
   scenario_merge_empty.test       # merging an empty plan is a no-op: 0|0|0, scenario stays open (not frozen, merged_at NULL)
   scenario_delta_drift.test       # delta scenarios: pre-images, drift conflicts at merge/preview, branches, legacy (#53)
   scenario_merge_fk_order.test    # merge applies parents first; in-place updates of referenced rows (#54)
+  scenario_base_schema_change.test # base ALTER/DROP TABLE of tables scenarios changed: ADD COLUMN reaches every scenario, other shape changes refused (#62)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
   test_internal_guard.cpp         # internal-schema guard on client-API prepared statements; connections open before LOAD (#55)

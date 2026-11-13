@@ -138,11 +138,30 @@ CALL scenario_drop('optimistic');                    -- refuses while attached o
 - **DDL:** not permitted inside scenarios (`DDL operations are not permitted in scenarios`).
   Change the base schema instead: new base tables show up in delta scenarios automatically.
   Materialized scenarios (and their branches) keep the copy made at creation and DuckLake-based
-  ones their creation snapshot, so schema changes reach them only through a new scenario; the
-  error's hint says which case applies. Altering a base table that a scenario has already written (it has a
-  delta for it) currently breaks that scenario with an INTERNAL error that invalidates the
-  database ([#62](https://github.com/DataZooDE/anofox-scenario/issues/62)); undo the base
-  change to recover. Alter only tables no open scenario has written.
+  ones their creation snapshot, so other schema changes reach them only through a new scenario;
+  the error's hint says which case applies.
+- **Base schema changes of tables a scenario changed** (#62):
+  - `ALTER TABLE t ADD COLUMN` on the base works whether the scenarios are attached or not, and
+    reaches every scenario over the host: delta and materialized ones, branches, keyed and
+    keyless tables. The same statement adds the column to the scenarios' stored changes
+    (deltas, pre-images, materialized copies). Rows a scenario changed before show the value
+    the base rows got: the column's `DEFAULT`, NULL without one, and also NULL for a volatile
+    default (`nextval(...)`, `random()`, `uuid()`), whose per-row values cannot be repeated.
+    A materialized copy gets the column filled the same way; later base *data* changes still do
+    not reach it. Scenarios can then read and write the column (`INSERT`, `UPDATE`, `MERGE INTO`,
+    `ON CONFLICT`), and `scenario_diff`, `scenario_merge_preview` and `scenario_merge` include
+    it (drift detection compares it like any other column).
+  - `DROP COLUMN`, `RENAME COLUMN`, a column type change (also of a struct field),
+    `RENAME TO` and `DROP TABLE` on the base fail while any scenario over the host has unmerged
+    changes to the table: `Cannot drop a column of table 't': scenario 's' has unmerged changes
+    to it, ...`. Merge (`scenario_merge`) or drop the scenario first. Scenarios without changes
+    to the table do not block; materialized copies keep their old columns. Other `ALTER`s
+    (defaults, `NOT NULL`, comments) are unaffected.
+  - A change made without the extension loaded (plain DuckDB, another process) is caught when a
+    scenario next uses the table: `Scenario 's' cannot use table 't' ...`. A gained column is
+    added at the next `ATTACH` of the scenario (autocommit, writable, no other transaction
+    active on the host) or by `scenario_merge`; for a dropped, renamed or retyped column,
+    restore it or drop the scenario.
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time. So after `USE alias` (a scenario) the `scenario_*` functions look in the
   scenario catalog and find nothing: `scenario_list()` returns no rows and the other functions
@@ -162,6 +181,7 @@ CALL scenario_drop('optimistic');                    -- refuses while attached o
 | A scenario that deletes a referenced parent row together with its children cannot be merged: DuckDB refuses deleting a row referenced by FOREIGN KEY in the transaction that deletes the referencing rows (plain DuckDB behaves the same). The same holds for an update that changes a referenced parent's key or another indexed column | merge the child deletions first (a scenario of their own), then the parent's |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC) | the lake commit is tagged; if the host bookkeeping fails afterwards, re-running `scenario_merge` finishes it without re-applying. Refused if the scenario was written to in between |
+| Base schema changes other than `ADD COLUMN` (drop/rename/retype a column, rename/drop the table) of a table a scenario has unmerged changes to | refused at the `ALTER` / `DROP`: merge or drop the scenario first. `CREATE OR REPLACE TABLE` and `DROP SCHEMA ... CASCADE` are not intercepted: a replaced table with other columns fails the scenario's next use of it with `cannot use table`, a dropped one fails `scenario_merge` with `base table '…' no longer exists` |
 | Keyless scenarios written before v0.4.1: keyless `UPDATE`/`DELETE` needs the delta upgraded first, which happens on a plain `ATTACH` (autocommit or a transaction already writing the host, not `READ_ONLY`, no other transaction active on the host). Otherwise ATTACH succeeds, reads are correct, and the DML error asks to re-`ATTACH` | reads and `INSERT` are unaffected |
 
 ## Function Reference

@@ -451,6 +451,80 @@ added to the host base automatically. Materialized scenarios only see their copi
 keyless tables that are not tracked yet (no `scenario_tables` row and no delta), or replaces a
 declared key whose column vanished from the base before any delta was built from it.
 
+### Base schema changes (#62)
+
+Every internal table mirrors the table it belongs to *column for column, by position*: a delta
+holds `_op`, `_ts`, then the base columns in base order (then a bag delta's multiplicity), a
+pre-image table and a mat copy hold exactly the base columns. Every reader and writer relies on
+that (scan, sinks, UNIQUE probe, diff, merge, branching copy), so a base schema change must
+either reach the internal tables or be refused - a delta that silently lags the base is how
+#62 read column 4 of a 4-column delta.
+
+**Interception.** `ScenarioClientState::OnFinalizePrepare` runs for every prepared statement
+(see *Write attribution*). After the internal-schema guard, `ScenarioBaseSchemaChange::WrapPlan`
+(`catalog/scenario_schema_change.cpp`) looks at the plan root: a `PhysicalAlter` of a table
+(`ALTER TABLE`) or a `PhysicalDrop` of a table. It replaces the root with
+`PhysicalScenarioBaseChange`, a source operator that holds the original operator (not as a
+child: a source with a child would be planned as an intermediate operator) and calls its
+`GetData` between its own checks. Everything therefore runs at execution, in the statement's
+own transaction: a failed or rolled-back `ALTER` takes the internal changes with it, and the
+state is the one at execution, not at `PREPARE`. The wrapper only acts when the target is a
+DuckDB table that some scenario has an internal table for (`ScenarioDelta::ScenariosWithTable`
+parses the `s<id>_<kind>_<logical>` names); internal tables are changed through the catalog API,
+never SQL, so the internal-schema guard (#55) is not involved.
+
+**ADD COLUMN** runs the base `ALTER`, then `ScenarioDelta::SyncTableShape` for every scenario
+over the host that has an internal table for the table:
+
+- The reference is the base table, or for a scenario with a materialized ancestor that
+  ancestor's mat copy. A mat copy whose columns are a prefix of the base's gets the new columns
+  first (the copy follows added columns, not data changes); a copy that diverged (a column
+  dropped in the base while it held no unmerged changes) stays the scenario's own schema.
+- Each delta and pre-image table that is a strict prefix of its reference (`Shape::NARROW`)
+  gets the missing columns. Keyed deltas, pre-image tables and mat copies get one
+  `ALTER TABLE ... ADD COLUMN` each (via `scenario_compat::MakeAddColumnInfo`: 1.5.6 and 2.0
+  build `AlterEntryData` / `AddColumnInfo` differently). A bag delta is rebuilt like the legacy
+  keyless upgrade, because its multiplicity column must stay last: rows buffered, table dropped
+  and recreated with the new payload columns before the multiplicity (renamed `__count` when the
+  new column is called `_count`), rows re-appended.
+- The value existing internal rows get is the value the base rows got: the column's `DEFAULT`,
+  bound with a `ConstantBinder` and evaluated once, set as a constant default on the internal
+  column. A volatile default (`nextval`, `random()`) gave each base row its own value; the
+  internal column then gets NULL and no default, so no internal table depends on a user
+  sequence. This keeps every reader consistent: a `U` row reads the default like its base
+  row, a keyless `D` row still matches (and suppresses) the base copy it deleted, a pre-image
+  equals an untouched base row (no false drift), and a merge writes what the base would hold
+  anyway.
+
+The per-transaction scenario table entries (`ScenarioTransaction`) are cached by name. An entry
+whose `base_entry` is not the table's current entry (the transaction itself altered the base)
+is rebuilt and the stale one retired, not freed: plans bound before the `ALTER` may still
+reference it.
+
+**Other shape changes** - `DROP COLUMN`, `RENAME COLUMN`, `ALTER COLUMN ... TYPE`, struct field
+changes, `RENAME TO`, `DROP TABLE` - are refused before the base operator runs when a scenario
+over the host has a non-empty delta for the table (`… has unmerged changes to it`): those
+changes are stored in the old columns, and mapping them onto the new ones would guess
+(position cannot tell a rename from a drop plus an add). Otherwise the base change runs, and the
+empty deltas and pre-image tables of scenarios that mirror the base directly are dropped: a
+table without a delta reads as never written (#34), and the next write recreates them in the
+new shape. Mat copies are kept with their old columns; the scenario reads them as before, and
+its delta matches the copy.
+
+**Backstop.** Changes the wrapper cannot see - an `ALTER` from a process without the
+extension, `CREATE OR REPLACE TABLE`, `DROP SCHEMA ... CASCADE` - are caught where internal
+tables are used: `ScenarioDelta::ThrowIfShapeDiffers` in the scan bind (delta vs. table entry),
+`GetOrCreateWriteDelta` (delta and pre-images), `scenario_diff`, `scenario_merge_preview` /
+`scenario_merge` (every non-empty delta, its pre-images and mat copy vs. the live base) and
+branching (the parent delta vs. the base). `NARROW` names the missing columns and points to
+`ATTACH`, which widens under the same conditions as the legacy keyless upgrade
+(`TryWidenAtAttach`: writable, autocommit, no older transaction on the host);
+`scenario_merge` and branching widen too, since they write the host anyway. `MISMATCH` names the
+column and asks to restore it or drop the scenario.
+
+Scenarios over another catalog (DuckLake) are left alone: they read a pinned snapshot, and the
+lake schema is changed through the lake.
+
 ---
 
 ## Storage layout
@@ -713,6 +787,7 @@ anything else.
 | `catalog/scenario_delta.cpp` | Delta and materialized table management |
 | `catalog/scenario_registry.cpp` | Registry and `scenario_tables`, caller-transaction catalog ops, `ScenarioClientState` |
 | `catalog/scenario_internal_guard.cpp` | Rejects SQL that writes the internal schema (#55) |
+| `catalog/scenario_schema_change.cpp` | Base `ALTER`/`DROP TABLE` interception, internal-table shape checks and widening (#62) |
 | `catalog/scenario_transaction.cpp` | Transaction shim |
 | `lifecycle/scenario_lifecycle.cpp` | create / drop / freeze / unfreeze / list / refresh (deprecated) |
 | `lifecycle/scenario_diff.cpp` | Streaming diff engine |

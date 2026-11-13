@@ -28,6 +28,22 @@ CatalogEntry &ScenarioTransaction::PublishEntry(const string &name, unique_ptr<C
 	return *inserted.first->second;
 }
 
+CatalogEntry &ScenarioTransaction::ReplaceEntry(const string &name, CatalogEntry &stale,
+                                                unique_ptr<CatalogEntry> entry, bool enumeration) {
+	lock_guard<mutex> guard(table_entries_lock);
+	auto &entries = enumeration ? enumeration_entries : table_entries;
+	auto existing = entries.find(name);
+	if (existing == entries.end()) {
+		return *entries.emplace(name, std::move(entry)).first->second;
+	}
+	if (existing->second.get() != &stale) {
+		return *existing->second; // a sibling pipeline replaced it already
+	}
+	retired_entries.push_back(std::move(existing->second));
+	existing->second = std::move(entry);
+	return *existing->second;
+}
+
 ScenarioTransactionManager::ScenarioTransactionManager(AttachedDatabase &db) : TransactionManager(db) {
 }
 

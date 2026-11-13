@@ -6,3 +6,4 @@ docs/API_REFERENCE.md	UPDATE __anofox_scenario.registry SET frozen = false WHERE
 plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	UPDATE __anofox_scenario.registry SET frozen = false WHERE name = 'budget_2026_approved';	Cannot modify __anofox_scenario.registry with SQL (UPDATE)
 plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	SELECT * FROM scenario_merge('fix_amount');	the base changed underneath it (e.g. the copies of row (x, 1) of keyless table 'tally')
 plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	ALTER TABLE bt.orders ADD COLUMN tax DECIMAL(10,2);	DDL operations are not permitted in scenarios
+plugins/anofox-scenario/skills/anofox-scenario-reference/behaviour.md	ALTER TABLE prices DROP COLUMN currency;	Cannot drop a column of table 'prices': scenario 'repricing' has unmerged changes to it

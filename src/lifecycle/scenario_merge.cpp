@@ -104,6 +104,48 @@ vector<string> ListPreTables(ClientContext &context, Catalog &host, int64_t scen
 	return result;
 }
 
+//! Merge-back applies delta rows (and compares pre-images) column for column
+//! with the live base table: every non-empty delta must mirror it (#62). A
+//! scenario over the host whose tables gained columns while the extension was
+//! not loaded gets them first when the caller may write (scenario_merge).
+void CheckMergeShapes(ClientContext &context, Catalog &host, const ScenarioRegistryEntry &entry, bool may_widen) {
+	if (!entry.base_catalog.empty()) {
+		return; // DuckLake / foreign bases: applied by column name over SQL
+	}
+	if (may_widen && ScenarioDelta::ScenarioNeedsWidening(context, host, entry.scenario_id)) {
+		MetaTransaction::Get(context).ModifyDatabase(
+		    host.GetAttached(), DatabaseModificationType::ALTER_TABLE | DatabaseModificationType::DROP_CATALOG_ENTRY |
+		                            DatabaseModificationType::CREATE_CATALOG_ENTRY |
+		                            DatabaseModificationType::INSERT_DATA);
+		ScenarioDelta::SyncScenarioShapes(context, host, entry.scenario_id, true, false);
+	}
+	for (auto &delta_pair : ListDeltaTables(context, host, entry.scenario_id)) {
+		auto &logical_name = delta_pair.second;
+		string schema_name, table_name;
+		ScenarioDelta::SplitLogicalName(logical_name, schema_name, table_name);
+		auto base_entry =
+		    dc::GetEntry<TableCatalogEntry>(host, context, schema_name, table_name, OnEntryNotFound::RETURN_NULL);
+		auto delta_entry = ScenarioDelta::TryGetDeltaTable(context, host, entry.scenario_id, logical_name);
+		if (!base_entry || !delta_entry || !ScenarioDelta::HasRows(context, *delta_entry)) {
+			continue; // a vanished base table is reported by the merge itself
+		}
+		ScenarioDelta::ThrowIfShapeDiffers(dc::Str(entry.name), logical_name, *delta_entry, true,
+		                                   base_entry->GetColumns());
+		auto pre_entry = ScenarioDelta::TryGetPreTable(context, host, entry.scenario_id, logical_name);
+		if (pre_entry) {
+			ScenarioDelta::ThrowIfShapeDiffers(dc::Str(entry.name), logical_name, *pre_entry, false,
+			                                   base_entry->GetColumns());
+		}
+		if (entry.mode == "materialized") {
+			auto mat_entry = ScenarioDelta::TryGetMatTable(context, host, entry.scenario_id, logical_name);
+			if (mat_entry) {
+				ScenarioDelta::ThrowIfShapeDiffers(dc::Str(entry.name), logical_name, *mat_entry, false,
+				                                   base_entry->GetColumns());
+			}
+		}
+	}
+}
+
 //! Delete every row of a table, in the caller's transaction
 void DeleteAllRows(ClientContext &context, DuckTableEntry &table) {
 	vector<row_t> row_ids_all;
@@ -210,6 +252,7 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 	if (!entry) {
 		throw InvalidInputException("Scenario '%s' not found", scenario_name);
 	}
+	CheckMergeShapes(context, host, *entry, false);
 
 	string sql;
 	auto host_prefix = QM(dc::Str(host.GetName())) + ".";
@@ -901,6 +944,8 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	};
 	// nothing to merge (the preview's plan is empty): a no-op that leaves the
 	// scenario open - not frozen, merged_at NULL, deltas untouched
+	// the deltas must still fit the base's columns (#62)
+	CheckMergeShapes(context, host, *entry, true);
 	bool has_plan = ScenarioHasMergePlan(context, host, *entry);
 	if (!has_plan && entry->base_catalog.empty()) {
 		emit_counts(0, 0, 0);
