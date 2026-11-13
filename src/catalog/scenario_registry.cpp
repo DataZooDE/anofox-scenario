@@ -528,7 +528,8 @@ vector<ScenarioRegistryEntry> ScenarioRegistry::List(ClientContext &context, Cat
 }
 
 int64_t ScenarioRegistry::NextId(ClientContext &context, Catalog &host_catalog) {
-	auto &seq = host_catalog.GetEntry<SequenceCatalogEntry>(context, SCHEMA_NAME, SEQUENCE_NAME);
+	auto &seq = *dc::GetEntry<SequenceCatalogEntry>(host_catalog, context, SCHEMA_NAME, SEQUENCE_NAME,
+	                                                OnEntryNotFound::THROW_EXCEPTION);
 	return seq.NextValue(DuckTransaction::Get(context, host_catalog));
 }
 

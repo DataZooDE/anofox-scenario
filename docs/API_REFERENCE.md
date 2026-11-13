@@ -224,6 +224,9 @@ loaded:
 - `CREATE` of anything in it (`TABLE`, `TABLE AS`, `VIEW`, `SEQUENCE`, `MACRO`, `TYPE`,
   `INDEX`, `SCHEMA __anofox_scenario`), `ALTER` and `COMMENT ON` of its entries, `DROP` of its
   entries or of the schema;
+- on DuckDB 2.0, `CREATE TRIGGER` on its tables. A trigger on one of your tables whose body
+  writes to `__anofox_scenario` can be created, but every statement that fires it fails (the
+  body runs as part of that statement);
 - `COPY FROM DATABASE` from a database that holds scenarios (it would re-create the schema in
   the target), and `IMPORT DATABASE` of an export that contains it.
 

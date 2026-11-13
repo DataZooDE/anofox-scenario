@@ -505,10 +505,21 @@ schema named `__anofox_scenario` in any catalog: `PhysicalInsert` / `PhysicalBat
 `PhysicalDelete` (also `TRUNCATE`), the action sinks of `PhysicalMergeInto`, `PhysicalCreateTable`,
 `PhysicalCreateIndex`, `PhysicalCreateView` / `Sequence` / `Function` / `Type` / `Schema`,
 `PhysicalDrop` (entries and the schema itself), `PhysicalAlter` (also `COMMENT ON`),
-`PhysicalCopyDatabase` (the entries it creates) and `PhysicalExecute` (the plan of an executed
-prepared statement). Catalog and schema names are read through duckdb-compat
+`PhysicalCopyDatabase` (the entries it creates), `PhysicalExecute` (the plan of an executed
+prepared statement) and, on DuckDB 2.0, `PhysicalCreateTrigger` (the trigger is created in the
+schema of its table). Catalog and schema names are read through duckdb-compat
 (`SchemaTarget` / `CreateTarget`), which covers 1.5's `catalog`/`schema` fields and 2.0's
-qualified names.
+qualified names. The trigger operator exists only on 2.0, so the shared source does not name
+it: `dc::CreateTriggerTarget` (`duckdb_compat/create_trigger.hpp`) returns its bound
+catalog/schema/table, and nothing on 1.5. It is compiled in when `CMakeLists.txt` finds
+`physical_create_trigger.hpp` in the DuckDB tree being built and defines
+`DUCKDB_COMPAT_CREATE_TRIGGER` (a `static_assert` fails the build if a DuckDB with
+`PhysicalOperatorType::CREATE_TRIGGER` is built without it). A trigger body is not checked when
+the trigger is created: 2.0 binds it into every statement that fires the trigger, where its DML
+is an ordinary operator of the checked plan, so those statements are rejected. The other
+operator types 2.0 adds (`CONNECT`, `DISCONNECT`, `EXTERNAL_RESOURCE`, `SECURE_VIEW`,
+`LIMITED_DISTINCT`, `RECURSIVE_KEY_JOIN`, `MERGE_ACTION_SOURCE`) create or change no schema
+entries.
 
 It runs from `ScenarioClientState::OnFinalizePrepare`, on the client state that is already on
 every connection. DuckDB calls that hook for every statement once a registered state answers
@@ -531,9 +542,7 @@ through the client API before the extension was loaded and executed after (it is
 sessions that turn
 the setting on (unless `lock_configuration` is set after loading); side-effecting functions in a
 `SELECT` (`nextval` on `registry_seq` only burns ids); index types or catalog operations from
-other extensions that plan their own physical operators; and, on DuckDB 2.0, `CREATE TRIGGER`
-on an internal table (a 2.0-only operator type the shared source does not name; whether a
-trigger body's DML shows up in the checked plan is not verified).
+other extensions that plan their own physical operators.
 
 ---
 

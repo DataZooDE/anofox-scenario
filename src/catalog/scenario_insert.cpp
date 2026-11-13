@@ -125,7 +125,7 @@ void ScenarioVerifyNotNullAndCheck(ClientContext &context, TableCatalogEntry &en
 		switch (constraint->type) {
 		case ConstraintType::NOT_NULL: {
 			auto &not_null = constraint->Cast<BoundNotNullConstraint>();
-			if (VectorOperations::HasNull(chunk.data[not_null.index.index], chunk.size())) {
+			if (dc::HasNull(chunk.data[not_null.index.index], chunk.size())) {
 				throw ConstraintException("NOT NULL constraint failed: %s.%s", dc::Str(entry.name),
 				                          dc::Str(entry.GetColumn(LogicalIndex(not_null.index.index)).Name()));
 			}
@@ -137,7 +137,7 @@ void ScenarioVerifyNotNullAndCheck(ClientContext &context, TableCatalogEntry &en
 			Vector result(LogicalType::INTEGER);
 			executor.ExecuteExpression(chunk, result);
 			UnifiedVectorFormat format;
-			result.ToUnifiedFormat(chunk.size(), format);
+			dc::ToUnifiedFormat(result, chunk.size(), format);
 			auto result_data = UnifiedVectorFormat::GetData<int32_t>(format);
 			for (idx_t i = 0; i < chunk.size(); i++) {
 				auto idx = format.sel->get_index(i);
@@ -268,7 +268,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	if (!gstate.pk_columns.empty()) {
 		vector<idx_t> key_positions;
 		for (auto pk_col : gstate.pk_columns) {
-			if (VectorOperations::HasNull(chunk.data[pk_col], chunk.size())) {
+			if (dc::HasNull(chunk.data[pk_col], chunk.size())) {
 				throw ConstraintException("NOT NULL constraint failed: %s.%s (PRIMARY KEY)", dc::Str(entry.name),
 				                          dc::Str(entry.GetColumn(LogicalIndex(pk_col)).Name()));
 			}

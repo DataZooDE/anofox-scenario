@@ -883,7 +883,7 @@ void ScenarioDeltaIndexProbe::FetchRow(ClientContext &context, row_t row_id, con
 	auto &storage = delta_table->GetStorage();
 	auto &transaction = DuckTransaction::Get(context, delta_table->catalog);
 	auto row_ids = dc::MakeValueVector(Value::BIGINT(row_id), 1);
-	row_ids.Flatten(1);
+	dc::Flatten(row_ids, 1);
 	ColumnFetchState fetch_state;
 	result.Reset();
 	if (row_id >= MAX_ROW_ID) {

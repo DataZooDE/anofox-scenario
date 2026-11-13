@@ -23,8 +23,10 @@ compat_include=$root/duckdb-compat/include
 cxx=${CXX:-c++}
 
 # The compat headers to compile: duckdb-compat's umbrella header (it includes
-# duckdb_compat/dispatch.hpp) and this extension's own src/include/catalog/scenario_compat.hpp.
-headers="duckdb_compat.hpp catalog/scenario_compat.hpp"
+# duckdb_compat/dispatch.hpp), its CREATE TRIGGER header (2.0's operator header must
+# come only from DUCKDB_COMPAT_CREATE_TRIGGER, never from a later include path) and this
+# extension's own src/include/catalog/scenario_compat.hpp.
+headers="duckdb_compat.hpp duckdb_compat/create_trigger.hpp catalog/scenario_compat.hpp"
 
 if [ ! -f "$duckdb_include/duckdb.hpp" ]; then
 	echo "no DuckDB headers at $duckdb_include (git submodule update --init duckdb)" >&2
@@ -40,8 +42,9 @@ tu=$(mktemp -d)
 trap 'rm -rf "$stray" "$tu"' EXIT
 
 # (a) Headers of DuckDB 2.0 that the bundled v1.5.6 lacks and that duckdb-compat
-#     or this extension once probed for.
-known="duckdb/common/types/size.hpp duckdb/planner/table_filter_set.hpp duckdb/common/identifier.hpp"
+#     or this extension once probed for, or that a compat header includes on 2.0.
+known="duckdb/common/types/size.hpp duckdb/planner/table_filter_set.hpp duckdb/common/identifier.hpp
+	duckdb/execution/operator/schema/physical_create_trigger.hpp"
 # (b) Every header the sources or the duckdb-compat submodule probe for.
 probed=$(grep -rhoE '__has_include[[:space:]]*\([[:space:]]*["<]duckdb[^">]*[">]' "$root/src" "$compat_include" |
 	sed -E 's/.*["<](duckdb[^">]*)[">]$/\1/' || true)
