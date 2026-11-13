@@ -131,8 +131,11 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
   filtered on, but they are not part of the table and not stable identifiers: `__scenario_rowno`
   is numbered afresh by every scan (scenario rows first), so a value read by one statement may
   name a different row in the next. Don't store or page by it.
-- **DDL:** not permitted inside scenarios (one canonical error). Change the base schema instead;
-  new base tables show up in overlay scenarios automatically.
+- **DDL:** not permitted inside scenarios (`DDL operations are not permitted in scenarios`).
+  Change the base schema instead: new base tables show up in delta scenarios automatically.
+  Materialized scenarios (and their branches) keep the copy made at creation and DuckLake-based
+  ones their creation snapshot, so schema changes reach them only through a new scenario; the
+  error's hint says which case applies.
 - **Host database:** the scenario registry lives in the session's *default* database at
   `scenario_create` / `ATTACH` time.
 

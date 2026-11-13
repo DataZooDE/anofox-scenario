@@ -237,58 +237,58 @@ optional_ptr<CatalogEntry> ScenarioSchemaEntry::LookupEntry(CatalogTransaction t
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateIndex(CatalogTransaction transaction, CreateIndexInfo &info,
                                                             TableCatalogEntry &table) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateFunction(CatalogTransaction transaction,
                                                                CreateFunctionInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateTable(CatalogTransaction transaction,
                                                             BoundCreateTableInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateSequence(CatalogTransaction transaction,
                                                                CreateSequenceInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateTableFunction(CatalogTransaction transaction,
                                                                     CreateTableFunctionInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateCopyFunction(CatalogTransaction transaction,
                                                                    CreateCopyFunctionInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreatePragmaFunction(CatalogTransaction transaction,
                                                                      CreatePragmaFunctionInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateCollation(CatalogTransaction transaction,
                                                                 CreateCollationInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 optional_ptr<CatalogEntry> ScenarioSchemaEntry::CreateType(CatalogTransaction transaction, CreateTypeInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 void ScenarioSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 void ScenarioSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(GetScenarioCatalog());
 }
 
 } // namespace duckdb

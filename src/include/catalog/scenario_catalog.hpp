@@ -26,7 +26,10 @@ class ScenarioSchemaEntry;
 class ViewCatalogEntry;
 
 //! The one canonical error for any DDL attempted inside a scenario.
-[[noreturn]] void ThrowScenarioDDLError();
+class ScenarioCatalog;
+//! DDL on a scenario catalog is always rejected; the hint depends on where the
+//! scenario's schema comes from (live base, materialized copy, versioned snapshot)
+[[noreturn]] void ThrowScenarioDDLError(const ScenarioCatalog &catalog);
 
 //===----------------------------------------------------------------------===//
 // Transaction shim
@@ -213,6 +216,8 @@ public:
 	//! (self for materialized scenarios, nearest materialized ancestor for
 	//! branches of one). Phase 4 adds the versioned-DuckLake variant.
 	const int64_t mat_base_scenario_id;
+	//! The base catalog is versioned (DuckLake): reads are pinned to created_at
+	bool base_is_versioned = false;
 
 public:
 	void Initialize(bool load_builtin) override;

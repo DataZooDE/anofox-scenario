@@ -17,10 +17,24 @@
 
 namespace duckdb {
 
-void ThrowScenarioDDLError() {
-	throw NotImplementedException(
-	    "DDL operations are not permitted in scenarios. Modify the base schema instead: tables added to the "
-	    "base become readable and writable in the scenario automatically");
+void ThrowScenarioDDLError(const ScenarioCatalog &catalog) {
+	const string prefix = "DDL operations are not permitted in scenarios. ";
+	if (catalog.mat_base_scenario_id >= 0) {
+		throw NotImplementedException(prefix + "Scenario '%s' reads a copy of the base made when it was created, so "
+		                                       "later schema changes do not reach it: change the base schema, then "
+		                                       "create a new scenario",
+		                              catalog.scenario_name);
+	}
+	if (catalog.base_is_versioned) {
+		throw NotImplementedException(prefix + "Scenario '%s' reads '%s' as of its creation snapshot, so later "
+		                                       "schema changes do not reach it: change the schema in '%s', then "
+		                                       "create a new scenario",
+		                              catalog.scenario_name, catalog.base_catalog_name, catalog.base_catalog_name);
+	}
+	auto base = catalog.base_catalog_name.empty() ? string("the base database") : "'" + catalog.base_catalog_name + "'";
+	throw NotImplementedException(prefix + "Change the schema in %s instead: tables added there appear in "
+	                                       "scenario '%s' automatically",
+	                              base, catalog.scenario_name);
 }
 
 //! Serializes the write registrations and delta creations of one
@@ -49,11 +63,11 @@ string ScenarioCatalog::GetCatalogType() {
 }
 
 optional_ptr<CatalogEntry> ScenarioCatalog::CreateSchema(CatalogTransaction transaction, CreateSchemaInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(*this);
 }
 
 void ScenarioCatalog::DropSchema(ClientContext &context, DropInfo &info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(*this);
 }
 
 ScenarioSchemaEntry &ScenarioCatalog::GetOrCreateMirroredSchema(const string &schema_name) {
@@ -115,7 +129,7 @@ void ScenarioCatalog::ScanSchemas(ClientContext &context, std::function<void(Sch
 
 PhysicalOperator &ScenarioCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                      LogicalCreateTable &op, PhysicalOperator &plan) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(*this);
 }
 
 unique_ptr<LogicalOperator> ScenarioCatalog::BindCreateIndex(Binder &binder, CreateStatement &stmt,
@@ -123,14 +137,14 @@ unique_ptr<LogicalOperator> ScenarioCatalog::BindCreateIndex(Binder &binder, Cre
                                                              unique_ptr<LogicalOperator> plan) {
 	// Without this override, the default implementation would build the index
 	// on the *base* table's storage (GetStorage() forwards to the base).
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(*this);
 }
 
 unique_ptr<LogicalOperator> ScenarioCatalog::BindAlterAddIndex(Binder &binder, TableCatalogEntry &table_entry,
                                                                unique_ptr<LogicalOperator> plan,
                                                                unique_ptr<CreateIndexInfo> create_info,
                                                                unique_ptr<AlterTableInfo> alter_info) {
-	ThrowScenarioDDLError();
+	ThrowScenarioDDLError(*this);
 }
 
 DatabaseSize ScenarioCatalog::GetDatabaseSize(ClientContext &context) {
