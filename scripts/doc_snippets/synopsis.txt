@@ -1,0 +1,2 @@
+# <file><TAB><first SQL line of the block>
+# Blocks that are signatures or placeholders (e.g. contain `...`) and are never executed.

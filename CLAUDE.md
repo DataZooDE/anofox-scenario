@@ -29,8 +29,9 @@ See `docs/spec/architecture.md` for the full picture.
 **Delta-Main Pattern:** Base data stays immutable (DuckDB columnar), scenario modifications stored in delta tables, merged on read.
 
 ```
-User SQL --> DuckDB --> OptimizerExtension intercepts writes --> Delta tables
-                    --> Scenario views merge base + delta on read
+ATTACH 'name' (TYPE scenario) --> StorageExtension "scenario" --> ScenarioCatalog
+User SQL on alias.<table>     --> scenario table entry: merge-on-read scan over base + delta
+                              --> insert/update/delete sinks write the delta tables
 ```
 
 ---
@@ -57,7 +58,9 @@ Build feature-by-feature with each increment demonstrably working:
 Work is tracked in GitHub issues. Every implementation change that touches the
 user-facing surface needs a companion documentation update in the same PR —
 `docs/API_REFERENCE.md` for the SQL API, `docs/spec/architecture.md` when the
-internals change.
+internals change, and **the affected skill(s) under `plugins/anofox-scenario/skills/`**
+(see "Claude Code Plugin" below). A PR that touches README.md, `docs/` or a skill must
+pass `make check-docs`.
 
 ### Git Worktrees for Parallelism
 
@@ -305,6 +308,48 @@ test/cpp/                         # Catch tests linked into unittest (see test/R
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
 ```
 
+### Claude Code Plugin
+
+```
+.claude-plugin/marketplace.json                 # marketplace manifest (repo = marketplace)
+plugins/anofox-scenario/.claude-plugin/plugin.json  # plugin manifest; version = CalVer release
+plugins/anofox-scenario/skills/<skill>/SKILL.md # one skill per usage pattern
+scripts/check_doc_snippets.py                   # `make check-docs`: runs every ```sql block
+scripts/doc_snippets/                           #   fixtures, expected errors, synopses, allowed names
+```
+
+Skills are organised by **usage pattern**, not by API area: scenario's few functions are
+used together in every task, so each pattern skill is a complete playbook and edge cases
+live once in the reference skill.
+
+| Skill | Covers |
+|-------|--------|
+| `anofox-scenario-what-if` | plan variants, branches, KPI / row comparisons, forecast per scenario |
+| `anofox-scenario-safe-change` | dry run, diff, merge preview, merge + conflict policies, discard, DuckLake merge |
+| `anofox-scenario-snapshot-audit` | materialized + frozen snapshots, DuckLake pinning, diff vs. approved, audit notes, migration |
+| `anofox-scenario-reference` | signatures, row identity, constraints, transactions, concurrency, error -> cause -> fix |
+
+Rules:
+- A change to the SQL surface or to an error message updates the skill that teaches it.
+  Error texts quoted in skills are pinned in `scripts/doc_snippets/expected_errors.txt`
+  (third column), so rewording an error fails `make check-docs` until the docs follow.
+- `make check-docs` needs a release build (`GEN=ninja make release`). It runs each page's
+  blocks as one session (a block sees what earlier blocks created); start a fresh session
+  with a first line `-- doc-snippets: new session`, or, where a visible comment would be
+  noise (README), a `<!-- doc-snippets: new session -->` line before the fence. Tables
+  headed `Error contains` are checked too: each quoted error text must exist in `src/` or
+  `duckdb/src/`, and so are prose quotes like "fails with `...`". Blocks run sandboxed
+  (file access only in a temp dir, locked configuration, no `.` dot-commands).
+- Blocks needing DuckLake or another extension (`INSTALL x`, `ducklake:`, a first line
+  `-- requires: <ext>`) are skipped by `make check-docs` and run by `make check-docs-all`
+  and in CI (DuckLake integration job). Examples whose point is a result (conflict policy,
+  diff direction, rollback) get an entry in `scripts/doc_snippets/expected_output.txt`;
+  `--show-output FILE` prints block outputs to write one.
+- `plugin.json`'s version must match every SKILL.md `version:` and banner (checked).
+- On a release, bump `version` in `plugin.json` and in every SKILL.md frontmatter and banner
+  to the new CalVer tag.
+- In-repo testing: `claude --plugin-dir ./plugins/anofox-scenario`.
+
 ### Configuration Files
 
 ```
@@ -368,6 +413,7 @@ gh issue create --title="..." --body="..."
 
 # 2. Run quality gates (if code changed)
 GEN=ninja make && make test
+make check-docs   # if README.md, docs/ or a skill changed (needs a release build)
 
 # 3. Close completed issues
 gh issue close <number>
@@ -393,14 +439,14 @@ git status  # MUST show "up to date with origin"
 
 ### Function Registration (Modern API)
 
+All SQL verbs (`scenario_create`, `scenario_drop`, `scenario_merge`, ...) are table
+functions, so they work with both `CALL` and `SELECT * FROM`. See
+`src/lifecycle/scenario_lifecycle.cpp` (`ScenarioLifecycle::RegisterFunctions`):
+
 ```cpp
-// In LoadInternal():
-ExtensionLoader::RegisterFunction(loader, ScalarFunction(
-    "scenario_create",                              // Function name
-    {LogicalType::VARCHAR, LogicalType::VARCHAR},   // Parameters
-    LogicalType::BOOLEAN,                           // Return type
-    ScenarioCreateFunction                          // Implementation
-));
+TableFunction fn("scenario_freeze", {LogicalType::VARCHAR}, Execute, Bind, Init);
+CreateTableFunctionInfo info(std::move(fn));
+loader.RegisterFunction(std::move(info));
 ```
 
 ### Table Functions
@@ -416,22 +462,13 @@ ExtensionLoader::RegisterFunction(loader, TableFunction(
 ));
 ```
 
-### OptimizerExtension for Write Interception
+### Storage Extension for the Scenario Catalog
 
-```cpp
-class ScenarioOptimizerExtension : public OptimizerExtension {
-public:
-    ScenarioOptimizerExtension() {
-        pre_optimize_function = InterceptScenarioWrites;
-    }
-
-    static void InterceptScenarioWrites(OptimizerExtensionInput &input,
-                                        unique_ptr<LogicalOperator> &plan) {
-        // Transform INSERT/UPDATE/DELETE to scenario schemas
-        // into delta table operations
-    }
-};
-```
+Writes are not intercepted by an optimizer rule: `ATTACH ... (TYPE scenario)` goes through a
+`StorageExtension` registered as `"scenario"` (`src/anofox_scenario_extension.cpp`,
+`src/catalog/scenario_storage_extension.cpp`), which returns a `ScenarioCatalog`. Its table
+entries plan the merge-on-read scan and the insert/update/delete sinks
+(`src/catalog/scenario_*.cpp`).
 
 ### Error Handling
 

@@ -12,6 +12,7 @@
   <a href="https://github.com/DataZooDE/anofox-scenario/actions/workflows/MainDistributionPipeline.yml"><img src="https://github.com/DataZooDE/anofox-scenario/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main" alt="Build Status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL_1.1-blue.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/DuckDB-v1.5.5%2B%20%7C%202.0-green.svg" alt="DuckDB Compatibility">
+  <a href="#-claude-code-skills-ai-pair-programming"><img src="https://img.shields.io/badge/Claude_Code-AI_skills_plugin-8A2BE2.svg" alt="Claude Code AI skills plugin"></a>
 </p>
 
 ---
@@ -39,6 +40,13 @@ SELECT * FROM scenario_diff('optimistic', 'forecast');  -- exactly what differs
 That's the whole idea. Only the rows you actually change are stored, so a scenario over a
 100-million-row table costs you the rows you touched — not a copy.
 
+> **🤖 Built for AI pair-programming.** anofox-scenario ships an installable
+> **[Claude Code plugin](#-claude-code-skills-ai-pair-programming)** whose skills follow the
+> ways people use scenarios — what-if planning, dry-running a change before merging it,
+> freezing an approved plan — so your assistant writes correct branching, diff and merge SQL
+> from a plain-English request. Install with
+> `/plugin marketplace add DataZooDE/anofox-scenario` → `/plugin install anofox-scenario@anofox-scenario`.
+
 ### Is this for you?
 
 **A good fit if** you want to model what-ifs on data that fits on one machine, test a change
@@ -48,7 +56,7 @@ single file containing both a baseline and the alternatives. Typical uses:
 - **S&OP and demand planning** — model demand shifts, supply disruptions, or price changes
 - **Budget planning** — keep optimistic, pessimistic, and baseline variants side by side
 - **Data validation** — try an ETL or migration change in a branch before applying it for real
-- **Audit trails** — freeze an approved plan as an immutable record you can diff against later
+- **Audit trails** — freeze an approved plan as a point-in-time record you can diff against later
 
 **Not a fit if** you need multiple people writing to the same scenario concurrently, you're
 working at data-lake scale across a cluster, or you need to change the *schema* inside a
@@ -144,8 +152,8 @@ CALL scenario_create('price_increase_eu', from_scenario := 'price_increase');
 -- Full copy instead of a delta: immune to later base changes
 CALL scenario_create('q2_approved', mode := 'materialized');
 
--- Reject further writes; reads keep working. A frozen materialized
--- scenario is effectively an immutable snapshot.
+-- Reject further writes through the scenario; reads keep working. A frozen
+-- materialized scenario is a point-in-time snapshot.
 CALL scenario_freeze('q2_approved');
 ```
 
@@ -172,6 +180,10 @@ SELECT * FROM scenario_merge('price_increase', on_conflict := 'abort');
 
 On success the scenario ends up frozen with an empty delta. Use `on_conflict := 'ours'` to let
 the scenario win or `'theirs'` to let the base win, instead of aborting.
+
+> **Note:** a default (delta) scenario does not detect a base edit to a row it also updated:
+> the scenario's row overwrites it ([#53](https://github.com/DataZooDE/anofox-scenario/issues/53)).
+> Merge soon after the dry run, or use `mode := 'materialized'`, which reports such rows as conflicts.
 
 ```sql
 DETACH pi;  -- handle gone, scenario data persists
@@ -241,7 +253,7 @@ scenario_create()                      Register a scenario
         │
         ├── scenario_diff()            Diff against baseline or another scenario
         │
-        ├── scenario_freeze()          Make it read-only (immutable when materialized)
+        ├── scenario_freeze()          Reject writes (a point-in-time snapshot when materialized)
         │
         ├── scenario_merge()           Apply changes back to the base
         │
@@ -280,7 +292,8 @@ scenario_create()                      Register a scenario
 | `SELECT * FROM scenario_diff_summary(scenario)` | Per-table `rows_added / rows_modified / rows_removed` |
 
 Diffs stream through the engine, so filters and aggregates compose normally and PK columns
-keep their native types. Requires a PK or a declared `key_columns` on the table.
+keep their native types. Tables without a PK or a declared `key_columns` are compared as bags
+of rows: every column is the identity and a changed row shows as `removed` + `added`.
 
 ### Merge-Back
 
@@ -291,9 +304,10 @@ keep their native types. Requires a PK or a declared `key_columns` on the table.
 
 ### Snapshots and Audit Notes
 
-There is no separate snapshot or protocol API. For an immutable point-in-time capture, create a
+There is no separate snapshot or protocol API. For a point-in-time capture, create a
 materialized scenario and freeze it:
 
+<!-- doc-snippets: new session -->
 ```sql
 CALL scenario_create('q2_approved', mode := 'materialized');
 CALL scenario_freeze('q2_approved');
@@ -304,6 +318,37 @@ For audit notes, use a plain table — see the recipe in
 
 For complete API documentation, including isolation tiers and current limitations, see
 [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+
+---
+
+## 🤖 Claude Code Skills (AI pair-programming)
+
+**Branching is easier when your AI assistant knows the semantics.** anofox-scenario ships an
+installable [Claude Code](https://claude.com/claude-code) plugin. Its skills are organised by
+what you are trying to do rather than by function, and every SQL example in them is executed
+against the extension before a release. Ask for *"model US demand +10% and EU -20% as two
+variants and compare them by region"* or *"dry-run this price import, show me the diff, and
+merge it with base winning conflicts"*, and Claude writes the `scenario_create` / `ATTACH` /
+`scenario_diff` / `scenario_merge` SQL.
+
+Install in any Claude Code session:
+
+```
+/plugin marketplace add DataZooDE/anofox-scenario
+/plugin install anofox-scenario@anofox-scenario
+```
+
+| Skill | Use it to |
+|-------|-----------|
+| `anofox-scenario-what-if` | Build plan variants (S&OP, budgets), branch them, compare KPIs and rows across variants, forecast per scenario with `anofox_forecast` |
+| `anofox-scenario-safe-change` | Dry-run an ETL step, migration or bulk fix, review the diff and merge preview, merge with a conflict policy or discard |
+| `anofox-scenario-snapshot-audit` | Freeze an approved plan, pin to a DuckLake snapshot, see what changed since approval, keep audit notes |
+| `anofox-scenario-reference` | Look up signatures, row identity, constraints, transactions and concurrency, and the cause and fix for each error message |
+
+The skills live in [`plugins/anofox-scenario/`](plugins/anofox-scenario/). For in-repo
+development, load them directly with `claude --plugin-dir ./plugins/anofox-scenario`.
+Combine with the [anofox-forecast plugin](https://github.com/DataZooDE/anofox-forecast#-claude-code-skills-ai-pair-programming)
+for forecasting inside scenarios.
 
 ---
 
@@ -386,14 +431,11 @@ This project is licensed under the **Business Source License 1.1 (BSL)**.
 | | |
 |---|---|
 | 📜 **License** | [BSL 1.1](LICENSE) |
-| ✅ **Non-Production Use** | Allowed — development, testing, evaluation |
-| ✅ **Modification** | Allowed |
-| ✅ **Distribution** | Allowed — under BSL terms |
-| 🏢 **Production Use** | Requires commercial license from [DataZoo GmbH](https://www.datazoo.de) |
-| 📅 **Change Date** | 4 years from release → Apache 2.0 |
-| ℹ️ **Attribution** | Required — include copyright notice |
-
-**In short:** Free for non-production use. Contact [DataZoo GmbH](https://www.datazoo.de) for production licensing.
+| ✅ **Production Use** | Allowed — use it internally in your business |
+| ✅ **Development, research, evaluation** | Allowed |
+| ✅ **Modification and distribution** | Allowed — under BSL terms |
+| ❌ **Hosted or embedded offering** | Not allowed — no SaaS offering or embedding in a product for third parties without a commercial license from [DataZoo GmbH](https://www.datazoo.de) |
+| 📅 **Change Date** | 5 years from first publication → MPL 2.0 |
 
 See the [LICENSE](LICENSE) file for the complete license text.
 
