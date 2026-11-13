@@ -427,14 +427,11 @@ This project is licensed under the **Business Source License 1.1 (BSL)**.
 | | |
 |---|---|
 | 📜 **License** | [BSL 1.1](LICENSE) |
-| ✅ **Non-Production Use** | Allowed — development, testing, evaluation |
-| ✅ **Modification** | Allowed |
-| ✅ **Distribution** | Allowed — under BSL terms |
-| 🏢 **Production Use** | Requires commercial license from [DataZoo GmbH](https://www.datazoo.de) |
-| 📅 **Change Date** | 4 years from release → Apache 2.0 |
-| ℹ️ **Attribution** | Required — include copyright notice |
-
-**In short:** Free for non-production use. Contact [DataZoo GmbH](https://www.datazoo.de) for production licensing.
+| ✅ **Production Use** | Allowed — use it internally in your business |
+| ✅ **Development, research, evaluation** | Allowed |
+| ✅ **Modification and distribution** | Allowed — under BSL terms |
+| ❌ **Hosted or embedded offering** | Not allowed — no SaaS offering or embedding in a product for third parties without a commercial license from [DataZoo GmbH](https://www.datazoo.de) |
+| 📅 **Change Date** | 5 years from first publication → MPL 2.0 |
 
 See the [LICENSE](LICENSE) file for the complete license text.
 
