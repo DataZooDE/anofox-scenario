@@ -1,0 +1,3 @@
+# Error texts the docs quote from a DuckDB version other than the duckdb/ submodule checkout.
+# One per line; exempt from the src/ / duckdb/src/ lookup.
+... same target row more than once

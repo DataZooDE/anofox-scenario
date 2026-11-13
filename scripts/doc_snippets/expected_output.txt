@@ -1,0 +1,12 @@
+# <file><TAB><first SQL line of the block><TAB><expected lines, separated by \n>
+# Each expected line must be a substring of a line of the block's own output (-list mode,
+# `a|b|c`), in this order. Pin examples whose point is a result, not just that they run.
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	SELECT id, change_type, column_name, old_value, new_value	2|modified|price|24.50|26.00\n4|removed\n5|added
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	CALL scenario_create('retire_gizmo');	count_star()\n3\ncount_star()\n4
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	CREATE TABLE stock (sku VARCHAR PRIMARY KEY, qty INTEGER);	B|update|false\nC|insert|true
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	SELECT * FROM scenario_merge('restock', on_conflict := 'theirs');	1|1|1\nA|10\nB|25\nC|7
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	CREATE TABLE item (id INTEGER PRIMARY KEY, name VARCHAR, price INTEGER);	1|update|false\n1|old name|11
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	CREATE TABLE plan (id INTEGER PRIMARY KEY, v INTEGER);	1|2|0\n1|10\n2|20
+plugins/anofox-scenario/skills/anofox-scenario-what-if/SKILL.md	SELECT * FROM scenario_diff('optimistic', 'pessimistic', 'demand') ORDER BY ALL;	A|US|2026-01-01|modified|qty|110.00|100.00\nB|EU|2026-01-01|removed
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	SELECT * FROM scenario_diff('budget_2026_approved', 'main', 'budget') ORDER BY cost_center;	CC-200|modified|amount|72000.00|80000.00\nCC-300|removed\nCC-400|added
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	INSTALL ducklake;	count_star()\n2

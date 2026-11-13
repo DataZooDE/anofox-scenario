@@ -1,15 +1,13 @@
 ---
 name: anofox-scenario-what-if
 description: >
-  What-if planning with the anofox_scenario DuckDB extension: branch a table into named
-  scenario variants (optimistic / pessimistic / baseline), change data in each with
-  ordinary SQL, and compare the variants side by side or against the real data. Use when
-  the user wants to model a demand, price, budget or capacity change without touching the
-  real table, keep several plan variants next to each other (S&OP, budgeting), compare
-  KPIs across variants, or run anofox_forecast forecasts per scenario. Covers
-  scenario_create (modes, from_scenario branches), ATTACH ... (TYPE scenario),
-  scenario_diff (2- and 3-argument), scenario_diff_summary, scenario_list and cleanup
-  with scenario_drop.
+  What-if planning with the anofox_scenario DuckDB extension: branch tables into named
+  plan variants (optimistic / pessimistic / baseline), change each with ordinary SQL, and
+  compare them side by side or against the real data. Use when the user wants to model a
+  demand, price, budget or capacity change without touching the real table, keep several
+  plan variants next to each other (S&OP, budgeting), compare KPIs across variants, or run
+  anofox_forecast forecasts per scenario. Main tools: scenario_create (with from_scenario
+  for variants of a variant), ATTACH ... (TYPE scenario), and scenario_diff between variants.
 version: 2026.10.21
 user-invocable: false
 ---

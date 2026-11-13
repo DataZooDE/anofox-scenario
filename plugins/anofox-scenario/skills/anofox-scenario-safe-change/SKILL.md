@@ -4,11 +4,10 @@ description: >
   Dry-run a data change in an anofox_scenario branch, review exactly what it would do,
   then apply it to the real tables or throw it away. Use when the user wants to test an
   ETL step, migration, bulk UPDATE/DELETE/MERGE, price change or data fix before applying
-  it, asks for a "dry run" or "preview", wants to merge a scenario back into the base, or
-  needs to resolve merge conflicts. Covers scenario_create + ATTACH, DML in the branch,
-  validation queries, scenario_diff / scenario_diff_summary, scenario_merge_preview,
-  scenario_merge with on_conflict := 'abort' | 'ours' | 'theirs', transactions around a
-  merge, DuckLake merge-back, and discarding with scenario_drop.
+  it, asks for a "dry run" or "preview", wants to apply (merge) a scenario or a chosen
+  plan variant to the real data, or needs to resolve merge conflicts. Main tools:
+  scenario_merge_preview, scenario_merge with on_conflict := 'abort' | 'ours' | 'theirs',
+  and scenario_drop to discard.
 version: 2026.10.21
 user-invocable: false
 ---
@@ -140,8 +139,9 @@ DELETE FROM rg.products WHERE id = 3;
 
 BEGIN;
 SELECT * FROM scenario_merge('retire_gizmo');
-SELECT count(*) FROM products;   -- check before anyone else sees it
+SELECT count(*) FROM products;   -- 3: check before anyone else sees it
 ROLLBACK;                        -- or COMMIT
+SELECT count(*) FROM products;   -- 4 again: the merge is undone
 ```
 
 After the `ROLLBACK` the base and the scenario are both back to their state before the merge,

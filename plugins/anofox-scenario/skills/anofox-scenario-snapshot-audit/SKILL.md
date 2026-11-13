@@ -3,12 +3,11 @@ name: anofox-scenario-snapshot-audit
 description: >
   Frozen snapshots and audit trails with the anofox_scenario DuckDB extension: freeze an
   approved plan, keep a point-in-time copy that later base changes cannot alter, show what
-  changed since approval, and keep notes on why. Use when the user wants to freeze or
-  lock a plan / budget / forecast version, keep an auditable record, compare today's data
-  with an approved state, pin a scenario to a DuckLake snapshot, document decisions, or
-  migrate a legacy v0.1 scenario database. Covers scenario_create(mode := 'materialized'),
-  scenario_create(base := <ducklake>), scenario_freeze / scenario_unfreeze, scenario_diff
-  against 'main', scenario_list, an append-only audit-notes recipe and scenario_migrate.
+  changed since approval, and keep a log of why. Use when the user wants to freeze or lock
+  a plan / budget / forecast version, keep an auditable record, compare today's data with
+  an approved state, pin a scenario to a DuckLake snapshot, document decisions, or migrate
+  a legacy v0.1 scenario database. Main tools: scenario_create(mode := 'materialized') or
+  (base := <ducklake>), scenario_freeze / scenario_unfreeze, and scenario_migrate.
 version: 2026.10.21
 user-invocable: false
 ---
