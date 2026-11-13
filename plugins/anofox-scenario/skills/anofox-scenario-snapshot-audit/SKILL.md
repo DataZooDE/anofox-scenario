@@ -8,13 +8,13 @@ description: >
   an approved state, pin a scenario to a DuckLake snapshot, document decisions, or migrate
   a legacy v0.1 scenario database. Main tools: scenario_create(mode := 'materialized') or
   (base := <ducklake>), scenario_freeze / scenario_unfreeze, and scenario_migrate.
-version: 2026.10.21
+version: 2026.11.13
 user-invocable: false
 ---
 
 # Anofox Scenario — Snapshot & Audit Playbook
 
-**Extension:** `anofox_scenario` v2026.10.21 | **DuckDB:** v1.5.5+ and v2.0
+**Extension:** `anofox_scenario` v2026.11.13 | **DuckDB:** v1.5.5+ and v2.0
 
 There is no separate snapshot API: a snapshot is a scenario that does not move with the base
 (materialized, or pinned to a DuckLake snapshot) and is frozen so nobody writes to it. For

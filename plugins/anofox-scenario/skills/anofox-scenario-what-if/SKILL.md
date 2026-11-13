@@ -8,13 +8,13 @@ description: >
   plan variants next to each other (S&OP, budgeting), compare KPIs across variants, or run
   anofox_forecast forecasts per scenario. Main tools: scenario_create (with from_scenario
   for variants of a variant), ATTACH ... (TYPE scenario), and scenario_diff between variants.
-version: 2026.10.21
+version: 2026.11.13
 user-invocable: false
 ---
 
 # Anofox Scenario — What-If Planning Playbook
 
-**Extension:** `anofox_scenario` v2026.10.21 | **DuckDB:** v1.5.5+ and v2.0 | **Install:** `INSTALL anofox_scenario FROM community; LOAD anofox_scenario;`
+**Extension:** `anofox_scenario` v2026.11.13 | **DuckDB:** v1.5.5+ and v2.0 | **Install:** `INSTALL anofox_scenario FROM community; LOAD anofox_scenario;`
 
 A scenario is a named, Git-like branch of the tables in your database. You attach it as a
 catalog and use plain SQL on it; only the rows you change are stored, the real tables are

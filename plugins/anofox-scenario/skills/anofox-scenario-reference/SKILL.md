@@ -10,13 +10,13 @@ description: >
   scenario_unfreeze / scenario_list / scenario_diff / scenario_diff_summary /
   scenario_merge_preview / scenario_merge / scenario_refresh / scenario_migrate are
   needed, or when a question is about edge-case semantics rather than a workflow.
-version: 2026.10.21
+version: 2026.11.13
 user-invocable: false
 ---
 
 # Anofox Scenario — Reference & Troubleshooting
 
-**Extension:** `anofox_scenario` v2026.10.21 | **DuckDB:** v1.5.5+ and v2.0
+**Extension:** `anofox_scenario` v2026.11.13 | **DuckDB:** v1.5.5+ and v2.0
 
 Workflows live in `anofox-scenario-what-if`, `anofox-scenario-safe-change` and
 `anofox-scenario-snapshot-audit`. This page is the lookup table behind them. The complete
