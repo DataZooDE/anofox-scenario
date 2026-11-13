@@ -156,7 +156,7 @@ CALL scenario_drop('optimistic');                    -- refuses while attached o
 | --- | --- | --- |
 | `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog], [key_columns := MAP {'table': ['col', ...]}])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes; `base` uses another attached catalog's tables as the base (DuckLake bases are pinned to creation time - true snapshot isolation); `key_columns` declares row identity for tables without a PRIMARY KEY (validated up front - unknown or repeated columns are refused, errors name the table as `schema.table` - and recorded in `__anofox_scenario.scenario_tables`). Delta mode is O(1): no delta tables are created until a table's first write. A branch copies only the parent deltas that exist, plus the parent's declared keys, and may not change an inherited identity; it inherits the parent's base catalog and DuckLake snapshot pin. `from_scenario` and `base` each exclude `mode := 'materialized'`, and each other. Returns `success`. |
 | `CALL scenario_drop(name)` | verb | Remove the scenario, its delta/materialized tables and its declared keys. Refuses while attached or while branches exist. |
-| `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | verb | Reject/allow writes through any attached handle (reads keep working). A frozen materialized scenario is a snapshot. |
+| `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | verb | Reject/allow writes through any attached handle (reads keep working). A frozen materialized scenario is a snapshot. Plain SQL cannot flip the flag or edit the frozen data behind the extension's back either: the internal schema is read-only for SQL (see [SQL access to the internal schema](#sql-access-to-the-internal-schema)). |
 | `SELECT * FROM scenario_list()` | table | `scenario_id, name, mode, frozen, parent, created_at, description` (`parent` is the parent scenario's name). |
 | `SELECT * FROM scenario_diff(scenario, table)` | table | Compare to origin (`table` is matched like a scenario table: `main.t` and `t` are the same): `<pk cols>` (native types), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value`. Streams through the engine. Keyless tables (no PK, no `key_columns`) get a bag diff: every column is the identity, a changed row is `removed` + `added`, and duplicates appear once per copy. |
 | `SELECT * FROM scenario_diff(a, b, table)` | table | Generic diff between two merged relations (`'main'` or any scenario). `old` = side a, `new` = side b. `'main'` is the origin table of the scenario on the other side, in its base catalog: pinned to the scenario's creation snapshot for DuckLake bases, live otherwise. DuckLake-based scenarios are always diffed at their snapshot, so later lake changes never show as scenario changes. |
@@ -209,6 +209,64 @@ string: the `scenario_diff` table argument, `key_columns :=` keys, and the `tabl
 The delta table is a stable changelog contract: `scenario_diff` reads it, branching copies it,
 and `scenario_merge` replays it.
 
+### SQL access to the internal schema
+
+`__anofox_scenario` is read-only for SQL (#55). `SELECT` works; every statement that would
+write to it or change its schema fails with `Cannot modify … with SQL` (a permission error),
+in every attached database and on every connection of a database that has the extension
+loaded:
+
+- `INSERT` (also `COPY ... FROM`, `INSERT ... ON CONFLICT`), `UPDATE`, `DELETE`, `TRUNCATE`
+  and `MERGE INTO` on its tables;
+- `CREATE` of anything in it (`TABLE`, `TABLE AS`, `VIEW`, `SEQUENCE`, `MACRO`, `TYPE`,
+  `INDEX`, `SCHEMA __anofox_scenario`), `ALTER` and `COMMENT ON` of its entries, `DROP` of its
+  entries or of the schema;
+- `COPY FROM DATABASE` from a database that holds scenarios (it would re-create the schema in
+  the target), and `IMPORT DATABASE` of an export that contains it.
+
+<!-- doc-snippets: new session -->
+```sql
+CREATE TABLE plan (id INTEGER PRIMARY KEY, qty INTEGER);
+CALL scenario_create('approved', mode := 'materialized');
+CALL scenario_freeze('approved');
+SELECT name, frozen FROM __anofox_scenario.registry;
+```
+
+```sql
+UPDATE __anofox_scenario.registry SET frozen = false WHERE name = 'approved';
+```
+
+Scenarios change only through the scenario functions and attached scenarios, which do not
+go through SQL. The check runs when a statement is planned, independent of the optimizer and
+of the statement form (a prepared statement that was allowed with the setting on is checked
+again at every execution). A rejected
+statement fails like a binder error: an open transaction stays usable.
+
+The escape hatch is a per-connection setting:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `anofox_scenario_allow_internal_writes` | `false` | `true` lets SQL on this connection write to and change the schema of `__anofox_scenario`. For backup/restore (`IMPORT DATABASE`, `COPY FROM DATABASE`), manual repair, or wiping every scenario (`DROP SCHEMA __anofox_scenario CASCADE`). Hand-made changes are not validated: a wrong row or column breaks the affected scenarios. |
+
+`EXPORT DATABASE` needs no setting (it only reads). To restore an export that contains
+scenarios, import with the setting on and turn it off again:
+
+```
+SET anofox_scenario_allow_internal_writes = true;
+IMPORT DATABASE 'backup_dir';
+RESET anofox_scenario_allow_internal_writes;
+```
+
+Without it, `IMPORT DATABASE` stops at `CREATE SCHEMA __anofox_scenario` and imports nothing.
+
+Limits: the guard lives in the extension, so it protects the internal schema only in sessions
+that have `anofox_scenario` loaded. A process that opens the database file without the
+extension (or an older version of it) can still change those tables. Any session can also
+turn the setting on unless the configuration is locked: for tamper resistance within DuckDB,
+load the extension and then run `SET lock_configuration = true`. Functions with side effects
+in a `SELECT` are not statements the guard sees (`nextval('__anofox_scenario.registry_seq')`
+only skips scenario ids).
+
 ## Protocols / Audit Notes
 
 Protocol notes are plain SQL over plain tables - no dedicated API. Recommended recipe: an
@@ -230,8 +288,12 @@ COPY (SELECT '## ' || scenario || ' / ' || event || chr(10) || coalesce(note, ''
 TO 'audit_events.md' (FORMAT csv, QUOTE '', HEADER false);
 ```
 
-Freezing guards writes through scenario catalogs; it is not tamper protection against direct
-host SQL on the internal `__anofox_scenario` tables (#55). For tamper evidence keep an
-external copy (`EXPORT DATABASE` plus a checksum) or use DuckLake snapshots with retention.
+Freezing rejects writes through scenario catalogs, and the internal `__anofox_scenario` tables
+reject SQL writes in every session that has the extension loaded (see
+[SQL access to the internal schema](#sql-access-to-the-internal-schema)). That is not tamper
+evidence: a process that opens the file without the extension, or a session that sets
+`anofox_scenario_allow_internal_writes`, can still change them. For tamper evidence keep an
+external copy (`EXPORT DATABASE` plus a checksum stored elsewhere) or use DuckLake snapshots
+with retention.
 
 (Databases migrated from v0.1 keep their existing `_scenario_protocols` rows unchanged.)

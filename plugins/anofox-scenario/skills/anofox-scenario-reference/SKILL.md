@@ -30,7 +30,7 @@ Every verb is a table function: `CALL f(...)` and `SELECT * FROM f(...)` both wo
 |---|---|---|
 | `scenario_create(name, [description], mode := 'delta'\|'materialized', from_scenario := parent, base := catalog, key_columns := MAP {'table': ['col', ...]})` | `success` | Name: letters, digits and `_` only, starting with a letter or `_`, at most 63 characters. `delta` (default) is O(1). `materialized` copies every base table. `from_scenario` branches: a delta scenario over the parent's current state that inherits its changes, declared keys, base catalog and DuckLake snapshot. `base` uses another attached catalog as the base (DuckLake: pinned to creation time). `from_scenario` and `base` each exclude `mode := 'materialized'`, and each other. `key_columns` gives keyless tables a row identity. |
 | `scenario_drop(name)` | `success` | Removes deltas, copies and declared keys. Refuses while attached or while branches exist. |
-| `scenario_freeze(name)` / `scenario_unfreeze(name)` | `success` | Rejects / allows writes through every scenario handle; reads keep working. A merged scenario cannot be unfrozen. Freeze does not stop direct host SQL on the internal `__anofox_scenario` tables (issue #55). |
+| `scenario_freeze(name)` / `scenario_unfreeze(name)` | `success` | Rejects / allows writes through every scenario handle; reads keep working. A merged scenario cannot be unfrozen. SQL on the internal `__anofox_scenario` tables cannot undo it: that schema is read-only for SQL (see Storage below). |
 | `scenario_list()` | `scenario_id, name, mode, frozen, parent, created_at, description` | `parent` is the parent's name. |
 | `ATTACH 'name' AS alias (TYPE scenario [, READ_ONLY])` / `DETACH alias` | | The whole read/write surface. `USE alias` makes unqualified table names resolve to the scenario. |
 | `scenario_diff(scenario, table)` | `<key columns>, change_type, column_name, old_value, new_value` | Scenario vs. its origin. Key columns keep their types; values are VARCHAR. `change_type`: `added` / `removed` / `modified` (one row per changed column). |
@@ -50,7 +50,12 @@ delta's index instead (less memory, no parallel scan). `0` always uses the index
 **Storage.** Everything lives in the host database (the session's default database at
 `scenario_create` / `ATTACH` time) under the `__anofox_scenario` schema: the registry, one delta
 table per (scenario, table) created by that table's first write, and for materialized
-scenarios a copy per table. Copying the `.duckdb` file copies its scenarios.
+scenarios a copy per table. Copying the `.duckdb` file copies its scenarios. That schema is
+read-only for SQL: `SELECT` works, but `INSERT` / `UPDATE` / `DELETE` / DDL on it fail with
+`Cannot modify … with SQL` (only the scenario functions and attached scenarios change it). For
+`IMPORT DATABASE` of an export that contains scenarios, manual repair, or wiping all scenarios,
+`SET anofox_scenario_allow_internal_writes = true` on that connection, then `RESET` it.
+`EXPORT DATABASE` needs no setting.
 
 **Reads.** A scenario table is the base table with the scenario's inserts, updates and
 deletes applied (delta mode reads the live base; materialized reads its copy; DuckLake reads
@@ -128,6 +133,7 @@ a name part containing a dot is double-quoted: `'"a.b"'` is the main table `a.b`
 | Error contains | Cause | Fix |
 |---|---|---|
 | `DDL operations are not permitted in scenarios` | `CREATE` / `ALTER` / `DROP` against a scenario catalog | change the base schema; new base tables appear in delta scenarios automatically |
+| `Cannot modify … with SQL` | plain SQL writes or DDL on the internal `__anofox_scenario` schema (also `IMPORT DATABASE` of an export with scenarios, `COPY FROM DATABASE` of a database with scenarios) | use the scenario functions; for restore or repair `SET anofox_scenario_allow_internal_writes = true`, then `RESET` it |
 | `Scenario '…' not found in database '…'` (ATTACH) | no scenario with that name in the session's default database | `CALL scenario_create('…')` first, or `USE` the database that holds it |
 | `Scenario '…' already exists` | name taken | pick another name or `scenario_drop` the old one |
 | `Invalid scenario name` | only letters, digits and `_`, starting with a letter or `_` (`price-import` fails) | rename, e.g. `price_import` |

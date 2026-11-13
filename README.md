@@ -218,7 +218,11 @@ anofox-scenario uses the **Delta-Main pattern** for efficient copy-on-write stor
 
 Delta tables live in the host database under the internal `__anofox_scenario` schema, named
 `s<scenario_id>_delta_<table>`. Because everything is inside the host database, a `.duckdb` file
-carries its scenarios with it — copy the file and the branches come along.
+carries its scenarios with it — copy the file and the branches come along. With the extension
+loaded, that schema is read-only for SQL: only the scenario functions and attached scenarios
+change it, so a frozen scenario cannot be unfrozen or edited with a plain `UPDATE` (restores and
+repairs use the `anofox_scenario_allow_internal_writes` setting, see the
+[API reference](docs/API_REFERENCE.md#sql-access-to-the-internal-schema)).
 
 **Benefits:**
 - **Cheap scenario creation** — delta mode writes one registry row, whatever the size of the schema; a table's delta is created by its first write

@@ -259,6 +259,7 @@ src/
     scenario_update_delete.cpp         #   update/delete sinks (op-transition matrix)
     scenario_delta.cpp                 #   delta/mat table management + copy helpers
     scenario_registry.cpp              #   registry v2 (caller-transaction catalog ops)
+    scenario_internal_guard.cpp        #   rejects SQL writes/DDL on __anofox_scenario (#55)
     scenario_transaction.cpp           #   transaction shim (ACID rides the host)
     include under src/include/catalog/
   lifecycle/
@@ -302,12 +303,14 @@ test/sql/
   attach_double_touch.test        # repeat touches: DELETE no-ops, UPDATE/MERGE "same row twice", keyed + keyless (#39)
   attach_virtual_columns.test     # __scenario_* virtual columns in user WHERE clauses; DELETE row-id positions (#39)
   attach_write_checks.test        # read-only / frozen / single-writer checks at EXECUTE, not PREPARE (#39)
+  attach_internal_guard.test      # host SQL may read __anofox_scenario but not write it / change its schema; escape-hatch setting, IMPORT (#55)
   scenario_merge_keyless_drift.test # 3-way drift for keyless tables in materialized scenarios (#39)
   scenario_ducklake_merge_hardening.test # legacy deltas, rowid columns, net-plan preview, idempotent lake re-merge (#39)
   scenario_delta_drift.test       # delta scenarios: pre-images, drift conflicts at merge/preview, branches, legacy (#53)
   scenario_merge_fk_order.test    # merge applies parents first; in-place updates of referenced rows (#54)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
+  test_internal_guard.cpp         # internal-schema guard on client-API prepared statements; connections open before LOAD (#55)
 ```
 
 ### Claude Code Plugin

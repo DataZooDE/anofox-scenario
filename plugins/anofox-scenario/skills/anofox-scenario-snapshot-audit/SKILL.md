@@ -30,10 +30,14 @@ error messages see `anofox-scenario-reference`.
   scenario catalog; reads keep working. `scenario_unfreeze` reverses it (except for a merged
   scenario, which stays frozen). Treat unfreezing an approved plan as an audited action and
   record it (see "Audit notes").
-- **Frozen is not tamper-proof.** Anyone with write access to the host database can change
-  the internal `__anofox_scenario` tables directly, and nothing would show it (issue #55).
-  For tamper evidence keep an external copy: `EXPORT DATABASE` plus a checksum stored
-  elsewhere, or DuckLake snapshots with a retention policy.
+- **Frozen is guarded, not sealed.** SQL cannot edit the internal `__anofox_scenario` tables
+  (registry, deltas, materialized copies) in a session that has the extension loaded: such
+  writes fail with `Cannot modify … with SQL`, so `UPDATE __anofox_scenario.registry SET
+  frozen = false` does not work. But a process that opens the file without the extension, or
+  a session that sets `anofox_scenario_allow_internal_writes = true`, can change them, and
+  nothing would show it. Add `SET lock_configuration = true` after loading the extension to
+  keep the setting off. For real tamper evidence keep an external copy: `EXPORT DATABASE`
+  plus a checksum stored elsewhere, or DuckLake snapshots with a retention policy.
 - **Materialized creation copies all base tables** of the host database, and tables added to
   the base later are not part of the snapshot. `mode := 'materialized'` cannot be combined
   with `base :=` (a DuckLake base is pinned already) or `from_scenario` (a branch is always a
@@ -64,6 +68,12 @@ Writes are rejected while it is frozen:
 
 ```sql
 UPDATE approved.budget SET amount = 0;
+```
+
+So is plain SQL on the internal tables behind it, such as flipping the flag:
+
+```sql
+UPDATE __anofox_scenario.registry SET frozen = false WHERE name = 'budget_2026_approved';
 ```
 
 ### 3. The base moves on
