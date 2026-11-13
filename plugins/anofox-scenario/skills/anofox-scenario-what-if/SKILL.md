@@ -11,13 +11,13 @@ description: >
   anofox_forecast. Not for applying a variant to the real tables
   (anofox-scenario-safe-change) or for approved, signed-off versions
   (anofox-scenario-snapshot-audit).
-version: 2026.10.21
+version: 2026.11.13
 user-invocable: false
 ---
 
 # Anofox Scenario — What-If Planning Playbook
 
-**Extension:** `anofox_scenario` v2026.10.21 | **DuckDB:** v1.5.5+ and v2.0 | **Install:** `INSTALL anofox_scenario FROM community; LOAD anofox_scenario;`
+**Extension:** `anofox_scenario` v2026.11.13 | **DuckDB:** v1.5.5+ and v2.0 | **Install:** `INSTALL anofox_scenario FROM community; LOAD anofox_scenario;`
 
 A scenario is a named, Git-like branch of the tables in your database. Attach it as a catalog
 and use plain SQL on it; only changed rows are stored, the real tables are never written.

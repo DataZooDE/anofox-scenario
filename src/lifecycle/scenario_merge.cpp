@@ -30,7 +30,7 @@
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
-#include "duckdb/parser/keyword_helper.hpp"
+#include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
@@ -50,7 +50,7 @@ namespace duckdb {
 namespace {
 
 string QM(const string &identifier) {
-	return KeywordHelper::WriteOptionallyQuoted(identifier);
+	return SQLIdentifier::ToString(identifier);
 }
 
 //! SQL single-quoted string literal with proper escaping

@@ -11,13 +11,13 @@ description: >
   identity; which tables a scenario changed; using a scenario from Python; sharing one with
   a colleague. Not a workflow on its own: plan variants -> anofox-scenario-what-if, dry run
   and merge -> anofox-scenario-safe-change, approved versions -> anofox-scenario-snapshot-audit.
-version: 2026.10.21
+version: 2026.11.13
 user-invocable: false
 ---
 
 # Anofox Scenario — Reference & Troubleshooting
 
-**Extension:** `anofox_scenario` v2026.10.21 | **DuckDB:** v1.5.5+ and v2.0
+**Extension:** `anofox_scenario` v2026.11.13 | **DuckDB:** v1.5.5+ and v2.0
 
 Lookup table behind the workflow skills `anofox-scenario-what-if`,
 `anofox-scenario-safe-change` and `anofox-scenario-snapshot-audit`. Longer semantics, Python
@@ -96,7 +96,7 @@ it was when the scenario first touched it. Exceptions:
   value; `ours` deletes the copies that remain). Not flagged: a delete that still finds enough
   copies. Keyless inserts always apply, so with `ours` / `theirs` a changed row can end up in
   both versions.
-- **Deltas written by v2026.10.21 or earlier** (before pre-images): a base edit is overwritten.
+- **Deltas written by v2026.11.13 or earlier** (before pre-images): a base edit is overwritten.
 - **Rows a branch inherited from a materialized parent**: a base edit is overwritten.
 
 Remedy: declare `key_columns`, merge right after the dry run, or redo the change in a fresh

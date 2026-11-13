@@ -114,7 +114,7 @@ void HashKeyColumns(ClientContext &context, DataChunk &chunk, const vector<idx_t
 			VectorOperations::CombineHash(hashes, input.get(), count);
 		}
 	}
-	hashes.Flatten(count);
+	dc::Flatten(hashes, count);
 }
 
 struct ScenarioScanBindData : public TableFunctionData {
@@ -522,7 +522,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			}
 			auto emit_delta_chunk = [&](DataChunk &chunk) {
 				UnifiedVectorFormat op_format;
-				chunk.data[0].ToUnifiedFormat(chunk.size(), op_format);
+				dc::ToUnifiedFormat(chunk.data[0], chunk.size(), op_format);
 				auto op_data = UnifiedVectorFormat::GetData<string_t>(op_format);
 				SelectionVector sel(chunk.size());
 				idx_t kept = 0;
@@ -646,7 +646,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 				ScenarioDelta::ScanTableChunks(
 				    context, delta_table, std::move(delta_column_ids), delta_types, [&](DataChunk &chunk) {
 					    UnifiedVectorFormat op_format;
-					    chunk.data[0].ToUnifiedFormat(chunk.size(), op_format);
+					    dc::ToUnifiedFormat(chunk.data[0], chunk.size(), op_format);
 					    auto op_data = UnifiedVectorFormat::GetData<string_t>(op_format);
 					    bool hashed = false;
 					    for (idx_t row = 0; row < chunk.size(); row++) {

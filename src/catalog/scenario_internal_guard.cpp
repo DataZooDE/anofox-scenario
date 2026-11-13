@@ -1,6 +1,7 @@
 #include "catalog/scenario_internal_guard.hpp"
 #include "catalog/scenario_compat.hpp"
 #include "catalog/scenario_registry.hpp"
+#include "duckdb_compat/create_trigger.hpp"
 #include "duckdb_compat/sql_ast.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -89,6 +90,12 @@ private:
 	}
 
 	void CheckOperator(const PhysicalOperator &op) {
+		// CREATE TRIGGER (DuckDB 2.0 only, so not a case below): the trigger is
+		// created in the schema of the table it is on
+		if (auto trigger = dc::CreateTriggerTarget(op)) {
+			Found("CREATE TRIGGER", (*trigger)[1], (*trigger)[2]);
+			return;
+		}
 		switch (op.type) {
 		case PhysicalOperatorType::INSERT:
 		case PhysicalOperatorType::CREATE_TABLE_AS:

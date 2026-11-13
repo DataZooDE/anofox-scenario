@@ -17,6 +17,17 @@ include_directories(src/include)
 # INTERFACE target would fail the generate step ("not in any export set").
 add_subdirectory(duckdb-compat)
 include_directories(duckdb-compat/include)
+# duckdb_compat/create_trigger.hpp: DuckDB 2.0 plans CREATE TRIGGER with an
+# operator 1.5 lacks. Detected from the DuckDB tree being built (the top-level
+# project), not with __has_include, which a system DuckDB could satisfy.
+if(DEFINED DuckDB_SOURCE_DIR)
+  set(ANOFOX_SCENARIO_DUCKDB_SOURCE_DIR "${DuckDB_SOURCE_DIR}")
+else()
+  set(ANOFOX_SCENARIO_DUCKDB_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/duckdb")
+endif()
+if(EXISTS "${ANOFOX_SCENARIO_DUCKDB_SOURCE_DIR}/src/include/duckdb/execution/operator/schema/physical_create_trigger.hpp")
+  add_definitions(-DDUCKDB_COMPAT_CREATE_TRIGGER)
+endif()
 
 # Add PostHog telemetry library (requires OpenSSL, not available for WASM/MinGW/cross-compile)
 set(TELEMETRY_SUPPORTED TRUE)

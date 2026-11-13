@@ -1,23 +1,23 @@
 # name: test/sql/feedback.test
-# description: The feedback banner's two contracts: errors from user-facing entry
-#              points carry an issue link, and the banner never writes anything
-#              under a test runner.
+# description: The feedback banner's contracts: user errors carry no issue link,
+#              and the banner never writes anything under a test runner.
 # group: [anofox_scenario]
 
 require anofox_scenario
 
-# --- Errors from the lifecycle entry points pick up the issue link, so a user
-#     who hits one is told where to report it without going looking.
+# --- A user's own mistake (here: an unknown scenario name) is not a bug, so it
+#     carries no "please report" issue link: only unexpected error types
+#     (internal errors, plain std::exceptions) are annotated by the banner.
 statement error
 SELECT * FROM scenario_refresh('does_not_exist');
 ----
-https://github.com/DataZooDE/anofox-scenario/issues
+<!REGEX>:.*github.com/DataZooDE/anofox-scenario/issues.*
 
-# The link is appended, not substituted: the real diagnostic must survive.
+# The real diagnostic is reported unchanged.
 statement error
 SELECT * FROM scenario_refresh('does_not_exist');
 ----
-not found
+Scenario 'does_not_exist' not found
 
 # --- Errors DuckDB raises before dispatch (binder, catalog, arity) are
 #     deliberately NOT annotated -- they are not ours, and claiming them would

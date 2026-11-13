@@ -97,3 +97,60 @@ TEST_CASE("test/cpp/internal_guard_prepared", "[anofox_scenario]") {
 	}
 	DeleteDatabase(db_path);
 }
+
+// CREATE TRIGGER exists only on DuckDB 2.0, which plans it with an operator
+// type 1.5 lacks (duckdb_compat/create_trigger.hpp). On 1.5 the statement does
+// not parse and the test case is skipped. In memory: 2.0 refuses triggers in
+// database files of an older storage version.
+TEST_CASE("test/cpp/internal_guard_trigger", "[anofox_scenario]") {
+	auto config = GetTestConfig();
+	DuckDB db(nullptr, config.get());
+	if (!LoadGuardTestExtension(db)) {
+		return;
+	}
+	Connection con(db);
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE audit_log (n INTEGER)"));
+	REQUIRE_NO_FAIL(con.Query("CALL scenario_create('evidence')"));
+	REQUIRE_NO_FAIL(con.Query("CALL scenario_freeze('evidence')"));
+
+	// a trigger on a user table is not the guard's business
+	auto user_trigger = con.Query("CREATE TRIGGER forecast_audit AFTER INSERT ON forecast FOR EACH STATEMENT "
+	                              "INSERT INTO audit_log VALUES (1)");
+	if (user_trigger->HasError() && user_trigger->GetError().find("syntax error") != string::npos) {
+		WARN("skipped: this DuckDB has no CREATE TRIGGER (" << user_trigger->GetError() << ")");
+		return;
+	}
+	REQUIRE_NO_FAIL(*user_trigger);
+	REQUIRE_NO_FAIL(con.Query("INSERT INTO forecast VALUES (1, 100)"));
+
+	// a trigger on an internal table: rejected, schema-qualified or not
+	auto on_registry = con.Query("CREATE TRIGGER registry_audit AFTER UPDATE ON __anofox_scenario.registry "
+	                             "FOR EACH STATEMENT INSERT INTO audit_log VALUES (2)");
+	REQUIRE(on_registry->HasError());
+	REQUIRE(on_registry->GetError().find("Cannot modify __anofox_scenario.registry with SQL (CREATE TRIGGER)") !=
+	        string::npos);
+	REQUIRE_NO_FAIL(con.Query("SET search_path = '__anofox_scenario,main'"));
+	auto unqualified = con.Query("CREATE TRIGGER registry_audit AFTER DELETE ON registry "
+	                             "FOR EACH STATEMENT INSERT INTO main.audit_log VALUES (3)");
+	REQUIRE(unqualified->HasError());
+	REQUIRE(unqualified->GetError().find("Cannot modify __anofox_scenario.registry with SQL (CREATE TRIGGER)") !=
+	        string::npos);
+	REQUIRE_NO_FAIL(con.Query("RESET search_path"));
+	REQUIRE(FrozenCount(con) == 1);
+	auto triggers = con.Query("SELECT count(*) FROM duckdb_triggers() WHERE schema_name = '__anofox_scenario'");
+	if (!triggers->HasError()) {
+		auto chunk = triggers->Fetch();
+		REQUIRE(chunk);
+		REQUIRE(chunk->GetValue(0, 0).GetValue<int64_t>() == 0);
+	}
+
+	// a trigger on a user table whose body writes an internal table: the body
+	// is bound into every statement that fires it, so those are rejected
+	REQUIRE_NO_FAIL(con.Query("CREATE TRIGGER thaw AFTER INSERT ON audit_log FOR EACH STATEMENT "
+	                          "UPDATE __anofox_scenario.registry SET frozen = false"));
+	auto fired = con.Query("INSERT INTO audit_log VALUES (4)");
+	REQUIRE(fired->HasError());
+	REQUIRE(fired->GetError().find("Cannot modify __anofox_scenario.registry with SQL (UPDATE)") != string::npos);
+	REQUIRE(FrozenCount(con) == 1);
+}
