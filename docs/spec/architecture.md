@@ -341,9 +341,10 @@ in `OnFinalizePrepare`, demotes the scenario catalogs an `INSERT`/`UPDATE`/`DELE
 registered as modified to reads (same catalog identity, so prepared statements still re-bind on
 catalog changes). Execution then proceeds exactly as on 1.5: the sinks' `BeginWrite` names the
 host. Other statement types (`COPY FROM DATABASE ... TO <scenario>`) keep the registration, as on
-1.5. The state is registered on every connection when it opens (an `ExtensionCallback`), and
-lazily on `ATTACH` and on every scenario lookup for connections that predate `LOAD`. On 1.5.6
-the hook finds nothing to demote.
+1.5. The state is registered on every connection when it opens (an `ExtensionCallback`), on
+every connection already open at `LOAD` (`ConnectionManager::GetConnectionList`), and lazily on
+`ATTACH` and on every scenario lookup. On 1.5.6 the hook finds nothing to demote. The same hook
+runs the internal-schema guard (see [Storage layout](#the-internal-schema-is-read-only-for-sql)).
 
 **MERGE actions run concurrently on 2.0.** Each `WHEN` action of a `MERGE INTO` is its own sink.
 1.5 feeds them one after the other from the merge operator; 2.0 runs them as separate pipelines
@@ -486,6 +487,53 @@ table names (`scenario_diff`, `key_columns`, `table_name` outputs) use the same 
 
 The registry and `scenario_tables` are manipulated in the **caller's** transaction, so a
 rolled-back `scenario_create` leaves nothing behind.
+
+### The internal schema is read-only for SQL
+
+Everything the extension writes to `__anofox_scenario` goes through the catalog and storage APIs
+(`Catalog::CreateTable` / `DropEntry`, `DataTable` appends, updates and deletes, the scenario
+sinks' own operators), never through SQL. The one internal SQL connection, the DuckLake merge
+(`MergeIntoForeignBase`), only reads the internal tables and writes the lake and temp tables. So
+any SQL statement whose plan writes the internal schema came from a user, and is rejected (#55):
+otherwise `UPDATE __anofox_scenario.registry SET frozen = false` would silently unfreeze a
+scenario, and an edit of a delta or materialized copy would change it without a trace.
+
+`ScenarioInternalGuard::Check` (`catalog/scenario_internal_guard.cpp`) walks the physical plan of
+every prepared statement and throws a `PermissionException` on the first operator that targets a
+schema named `__anofox_scenario` in any catalog: `PhysicalInsert` / `PhysicalBatchInsert`
+(`INSERT`, `COPY ... FROM`, and `CREATE TABLE AS`, which share the classes), `PhysicalUpdate`,
+`PhysicalDelete` (also `TRUNCATE`), the action sinks of `PhysicalMergeInto`, `PhysicalCreateTable`,
+`PhysicalCreateIndex`, `PhysicalCreateView` / `Sequence` / `Function` / `Type` / `Schema`,
+`PhysicalDrop` (entries and the schema itself), `PhysicalAlter` (also `COMMENT ON`),
+`PhysicalCopyDatabase` (the entries it creates) and `PhysicalExecute` (the plan of an executed
+prepared statement). Catalog and schema names are read through duckdb-compat
+(`SchemaTarget` / `CreateTarget`), which covers 1.5's `catalog`/`schema` fields and 2.0's
+qualified names.
+
+It runs from `ScenarioClientState::OnFinalizePrepare`, on the client state that is already on
+every connection. DuckDB calls that hook for every statement once a registered state answers
+`CanRequestRebind`, after planning and optimization, so the check holds with
+`PRAGMA disable_optimizer`, inside explicit transactions, and for SQL `EXECUTE` (whose plan
+embeds the prepared one). A statement with unbound parameters has no physical plan yet; it is
+checked when it is planned with its values. A client-API prepared statement is planned once and
+may run long after the setting was turned off again, and DuckDB 2.0 has no execute-time hook for
+client states (1.5's `OnExecutePrepared` is gone), so an internal write that the setting allowed
+is marked `always_require_rebind`: every execution re-plans it and checks it again.
+
+The check throws before execution and before any write. On DuckDB 1.5 that leaves an explicit
+transaction usable, like a binder error; DuckDB 2.0 invalidates the transaction for errors raised
+from `OnFinalizePrepare`, so a later `COMMIT` rolls back (the test only relies on `ROLLBACK`). `anofox_scenario_allow_internal_writes` (session-scoped, default off) disables it
+for restores (`IMPORT DATABASE` re-creates the schema through SQL), `COPY FROM DATABASE` and
+manual repair.
+
+What it cannot cover: a process that opens the file without the extension; a statement prepared
+through the client API before the extension was loaded and executed after (it is not re-planned);
+sessions that turn
+the setting on (unless `lock_configuration` is set after loading); side-effecting functions in a
+`SELECT` (`nextval` on `registry_seq` only burns ids); index types or catalog operations from
+other extensions that plan their own physical operators; and, on DuckDB 2.0, `CREATE TRIGGER`
+on an internal table (a 2.0-only operator type the shared source does not name; whether a
+trigger body's DML shows up in the checked plan is not verified).
 
 ---
 
@@ -642,7 +690,8 @@ anything else.
 | `catalog/scenario_update_delete.cpp` | Update/delete sinks, op-transition matrix |
 | `catalog/scenario_merge_into.cpp` | `MERGE INTO` support |
 | `catalog/scenario_delta.cpp` | Delta and materialized table management |
-| `catalog/scenario_registry.cpp` | Registry and `scenario_tables`, caller-transaction catalog ops |
+| `catalog/scenario_registry.cpp` | Registry and `scenario_tables`, caller-transaction catalog ops, `ScenarioClientState` |
+| `catalog/scenario_internal_guard.cpp` | Rejects SQL that writes the internal schema (#55) |
 | `catalog/scenario_transaction.cpp` | Transaction shim |
 | `lifecycle/scenario_lifecycle.cpp` | create / drop / freeze / unfreeze / list / refresh (deprecated) |
 | `lifecycle/scenario_diff.cpp` | Streaming diff engine |

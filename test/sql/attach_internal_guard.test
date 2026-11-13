@@ -1,0 +1,502 @@
+# name: test/sql/attach_internal_guard.test
+# description: host SQL may read the internal __anofox_scenario schema but not write it or change its schema (#55)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# `require` loaded the extension into the already-open default connection:
+# the guard must cover it, and connections opened later (con1)
+
+statement ok
+CREATE TABLE forecast (id INTEGER PRIMARY KEY, qty INTEGER);
+
+statement ok
+INSERT INTO forecast VALUES (1, 100), (2, 200);
+
+statement ok
+CREATE TABLE events (kind VARCHAR, n INTEGER);
+
+statement ok
+INSERT INTO events VALUES ('a', 1), ('b', 2);
+
+statement ok
+CALL scenario_create('locked', 'frozen evidence', mode := 'materialized');
+
+statement ok
+CALL scenario_create('open', 'delta scenario', key_columns := MAP {'events': ['kind']});
+
+# guarded before this connection ever attached a scenario
+statement error
+UPDATE __anofox_scenario.registry SET description = 'early';
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+statement ok
+ATTACH 'locked' AS lk (TYPE scenario);
+
+statement ok
+ATTACH 'open' AS op (TYPE scenario);
+
+statement ok
+UPDATE lk.forecast SET qty = 111 WHERE id = 1;
+
+statement ok
+UPDATE op.events SET n = 20 WHERE kind = 'b';
+
+statement ok
+CALL scenario_freeze('locked');
+
+# --- reads stay allowed ------------------------------------------------------------
+
+query TT
+SELECT name, frozen FROM __anofox_scenario.registry ORDER BY name;
+----
+locked	true
+open	false
+
+query II
+SELECT id, qty FROM __anofox_scenario.s1_mat_forecast ORDER BY id;
+----
+1	100
+2	200
+
+query TI
+SELECT _op, id FROM __anofox_scenario.s1_delta_forecast;
+----
+U	1
+
+query TT
+SELECT table_name, key_columns::VARCHAR FROM __anofox_scenario.scenario_tables;
+----
+events	[kind]
+
+statement ok
+EXPLAIN UPDATE __anofox_scenario.registry SET frozen = false;
+
+statement ok
+EXPORT DATABASE '__TEST_DIR__/internal_guard_export';
+
+# --- DML on registry, declared keys, delta and materialized tables -----------------
+
+statement error
+UPDATE __anofox_scenario.registry SET frozen = false WHERE name = 'locked';
+----
+<REGEX>:Permission Error: Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*scenario_unfreeze.*anofox_scenario_allow_internal_writes.*
+
+statement error
+DELETE FROM __anofox_scenario.registry;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(DELETE\).*
+
+statement error
+INSERT INTO __anofox_scenario.registry (scenario_id, name, mode, frozen, created_at)
+VALUES (99, 'forged', 'delta', false, TIMESTAMP '2026-01-01');
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(INSERT\).*
+
+statement error
+DELETE FROM __anofox_scenario.scenario_tables;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.scenario_tables with SQL \(DELETE\).*
+
+statement error
+UPDATE __anofox_scenario.s1_mat_forecast SET qty = 0;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_mat_forecast with SQL \(UPDATE\).*
+
+statement error
+INSERT INTO __anofox_scenario.s1_delta_forecast VALUES ('I', TIMESTAMP '2026-01-01', 7, 700);
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_delta_forecast with SQL \(INSERT\).*
+
+statement error
+DELETE FROM __anofox_scenario.s2_delta_events;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s2_delta_events with SQL \(DELETE\).*
+
+# pre-images of overlay updates (#53)
+statement error
+DELETE FROM __anofox_scenario.s2_pre_events;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s2_pre_events with SQL \(DELETE\).*
+
+statement error
+TRUNCATE __anofox_scenario.s1_delta_forecast;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_delta_forecast with SQL \(DELETE\).*
+
+statement error
+MERGE INTO __anofox_scenario.s1_mat_forecast m USING forecast f ON m.id = f.id
+WHEN MATCHED THEN UPDATE SET qty = 0;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_mat_forecast with SQL \(UPDATE\).*
+
+statement error
+INSERT INTO __anofox_scenario.s1_mat_forecast VALUES (9, 900) ON CONFLICT DO NOTHING;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_mat_forecast with SQL \(INSERT\).*
+
+statement ok
+COPY (SELECT 9 AS id, 900 AS qty) TO '__TEST_DIR__/internal_guard_rows.csv';
+
+statement error
+COPY __anofox_scenario.s1_mat_forecast FROM '__TEST_DIR__/internal_guard_rows.csv';
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_mat_forecast with SQL \(INSERT\).*
+
+# unqualified, through the search path
+statement ok
+SET search_path = '__anofox_scenario';
+
+statement error
+UPDATE registry SET frozen = false;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+statement ok
+RESET search_path;
+
+# --- DDL ---------------------------------------------------------------------------
+
+statement error
+DROP TABLE __anofox_scenario.s1_delta_forecast;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_delta_forecast with SQL \(DROP\).*
+
+statement error
+DROP SEQUENCE __anofox_scenario.registry_seq;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry_seq with SQL \(DROP\).*
+
+statement error
+DROP SCHEMA __anofox_scenario CASCADE;
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(DROP SCHEMA\).*
+
+statement error
+ALTER TABLE __anofox_scenario.registry ADD COLUMN note VARCHAR;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(ALTER\).*
+
+statement error
+ALTER TABLE __anofox_scenario.s1_mat_forecast RENAME TO forecast_copy;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_mat_forecast with SQL \(ALTER\).*
+
+statement error
+COMMENT ON TABLE __anofox_scenario.registry IS 'tampered';
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(ALTER\).*
+
+statement error
+CREATE TABLE __anofox_scenario.s3_delta_forecast (_op VARCHAR, _ts TIMESTAMP, id INTEGER, qty INTEGER);
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(CREATE TABLE\).*
+
+statement error
+CREATE TABLE __anofox_scenario.scratch AS SELECT * FROM forecast;
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(CREATE TABLE AS\).*
+
+statement error
+CREATE VIEW __anofox_scenario.v AS SELECT 1;
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(CREATE VIEW\).*
+
+statement error
+CREATE SEQUENCE __anofox_scenario.seq2;
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(CREATE SEQUENCE\).*
+
+statement error
+CREATE MACRO __anofox_scenario.m() AS 1;
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(CREATE MACRO\).*
+
+statement error
+CREATE TYPE __anofox_scenario.mood AS ENUM ('ok');
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(CREATE TYPE\).*
+
+statement error
+CREATE INDEX qty_idx ON __anofox_scenario.s1_mat_forecast (qty);
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s1_mat_forecast with SQL \(CREATE INDEX\).*
+
+# any attached database, not only the one holding scenarios today
+statement ok
+ATTACH ':memory:' AS other;
+
+statement error
+CREATE SCHEMA other.__anofox_scenario;
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(CREATE SCHEMA\).*
+
+# COPY FROM DATABASE would clone the internal schema into the target
+statement error
+COPY FROM DATABASE memory TO other;
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(COPY FROM DATABASE\).*
+
+# --- the guard does not depend on the optimizer, statement form or transaction -----
+
+statement ok
+PRAGMA disable_optimizer;
+
+statement error
+UPDATE __anofox_scenario.registry SET frozen = false;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+statement ok
+PRAGMA enable_optimizer;
+
+statement error
+EXPLAIN ANALYZE DELETE FROM __anofox_scenario.registry;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(DELETE\).*
+
+statement error
+WITH flip AS (SELECT name FROM __anofox_scenario.registry)
+UPDATE __anofox_scenario.registry SET frozen = false WHERE name IN (SELECT name FROM flip);
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+# inside a transaction: rejected, nothing written. DuckDB 1.5 keeps the
+# transaction usable, 2.0 aborts it, so only ROLLBACK is portable.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO forecast VALUES (3, 300);
+
+statement error
+UPDATE __anofox_scenario.registry SET frozen = false;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM forecast;
+----
+2
+
+query I
+SELECT count(*) FROM __anofox_scenario.registry WHERE frozen;
+----
+1
+
+# prepared statements: SQL PREPARE only plans the statement, EXECUTE runs the
+# guard (client-API prepared statements: test/cpp/test_internal_guard.cpp)
+statement ok
+PREPARE flip AS UPDATE __anofox_scenario.registry SET frozen = false;
+
+statement error
+EXECUTE flip;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+statement ok
+DEALLOCATE flip;
+
+statement ok
+PREPARE drop_one AS DELETE FROM __anofox_scenario.registry WHERE name = $1;
+
+statement error
+EXECUTE drop_one('locked');
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(DELETE\).*
+
+# prepared while the escape hatch was on, executed after it was turned off
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
+statement ok
+PREPARE flip AS UPDATE __anofox_scenario.registry SET frozen = false;
+
+statement ok
+RESET anofox_scenario_allow_internal_writes;
+
+statement error
+EXECUTE flip;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+statement ok
+DEALLOCATE flip;
+
+# --- a second connection is guarded too -------------------------------------------
+
+statement error con1
+UPDATE __anofox_scenario.registry SET frozen = false;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+query T con1
+SELECT name FROM __anofox_scenario.registry WHERE frozen;
+----
+locked
+
+# --- nothing changed: the frozen scenario is intact --------------------------------
+
+query TT
+SELECT name, frozen FROM scenario_list() ORDER BY name;
+----
+locked	true
+open	false
+
+query IIIT
+SELECT id, old_value::INTEGER, new_value::INTEGER, change_type FROM scenario_diff('locked', 'forecast');
+----
+1	100	111	modified
+
+statement error
+UPDATE lk.forecast SET qty = 0;
+----
+<REGEX>:.*frozen.*
+
+# --- every scenario function keeps working with the guard on ----------------------
+
+statement ok
+CALL scenario_unfreeze('locked');
+
+statement ok
+UPDATE lk.forecast SET qty = 112 WHERE id = 1;
+
+statement ok
+CALL scenario_freeze('locked');
+
+statement ok
+INSERT INTO op.events VALUES ('c', 3);
+
+statement ok
+DELETE FROM op.events WHERE kind = 'a';
+
+query TT rowsort
+SELECT kind, change_type FROM scenario_diff('open', 'events');
+----
+a	removed
+b	modified
+c	added
+
+query I
+SELECT count(*) FROM scenario_diff_summary('open');
+----
+1
+
+statement ok
+CALL scenario_create('branch', from_scenario := 'open');
+
+statement ok
+SELECT * FROM scenario_refresh('branch');
+
+statement ok
+CALL scenario_drop('branch');
+
+statement ok
+SELECT * FROM scenario_merge_preview('open');
+
+statement ok
+SELECT * FROM scenario_merge('open');
+
+query TI
+SELECT kind, n FROM events ORDER BY kind;
+----
+b	20
+c	3
+
+statement ok
+SELECT * FROM scenario_migrate();
+
+statement ok
+DETACH op;
+
+statement ok
+CALL scenario_drop('open');
+
+query T
+SELECT name FROM scenario_list() ORDER BY name;
+----
+locked
+
+# --- the escape hatch: per session, off by default --------------------------------
+
+query T
+SELECT current_setting('anofox_scenario_allow_internal_writes');
+----
+false
+
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
+# only this session: con1 is still guarded
+statement error con1
+UPDATE __anofox_scenario.registry SET description = 'x';
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+statement ok
+UPDATE __anofox_scenario.registry SET description = 'repaired' WHERE name = 'locked';
+
+query T
+SELECT description FROM scenario_list() WHERE name = 'locked';
+----
+repaired
+
+statement ok
+RESET anofox_scenario_allow_internal_writes;
+
+statement error
+UPDATE __anofox_scenario.registry SET description = 'again';
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*
+
+# --- backup/restore: IMPORT DATABASE re-creates the internal schema ----------------
+
+statement ok
+ATTACH ':memory:' AS restored;
+
+statement ok
+USE restored;
+
+# without the setting the import stops at CREATE SCHEMA __anofox_scenario
+statement error
+IMPORT DATABASE '__TEST_DIR__/internal_guard_export';
+----
+<REGEX>:.*Cannot modify schema __anofox_scenario with SQL \(CREATE SCHEMA\).*
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'restored';
+----
+0
+
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
+statement ok
+IMPORT DATABASE '__TEST_DIR__/internal_guard_export';
+
+statement ok
+RESET anofox_scenario_allow_internal_writes;
+
+query TT
+SELECT name, frozen FROM scenario_list() ORDER BY name;
+----
+locked	true
+open	false
+
+statement ok
+ATTACH 'locked' AS lk2 (TYPE scenario);
+
+query II
+SELECT id, qty FROM lk2.forecast ORDER BY id;
+----
+1	111
+2	200
+
+statement error
+UPDATE restored.__anofox_scenario.registry SET frozen = false;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.registry with SQL \(UPDATE\).*

@@ -2,3 +2,5 @@
 # Blocks that are supposed to fail. With a substring, the error text is pinned: if the
 # extension rewords the error, the gate fails until the docs quoting it are updated.
 plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	UPDATE approved.budget SET amount = 0;	is frozen. Unfreeze it with CALL scenario_unfreeze
+docs/API_REFERENCE.md	UPDATE __anofox_scenario.registry SET frozen = false WHERE name = 'approved';	Cannot modify __anofox_scenario.registry with SQL (UPDATE)
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	UPDATE __anofox_scenario.registry SET frozen = false WHERE name = 'budget_2026_approved';	Cannot modify __anofox_scenario.registry with SQL (UPDATE)

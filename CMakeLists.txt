@@ -78,6 +78,7 @@ endif()
 set(EXTENSION_SOURCES
     src/anofox_scenario_extension.cpp
     src/catalog/scenario_registry.cpp
+    src/catalog/scenario_internal_guard.cpp
     src/catalog/scenario_catalog.cpp
     src/catalog/scenario_schema_entry.cpp
     src/catalog/scenario_table_entry.cpp

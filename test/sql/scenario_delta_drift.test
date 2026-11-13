@@ -407,9 +407,16 @@ SELECT scenario_id FROM scenario_list() WHERE name = 's_legacy';
 ----
 9
 
-# simulate the old layout: no pre-image table
+# simulate the old layout: no pre-image table (plain SQL on the internal
+# schema needs the internal-schema guard's escape hatch, #55)
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
 statement ok
 DROP TABLE __anofox_scenario.s9_pre_l;
+
+statement ok
+RESET anofox_scenario_allow_internal_writes;
 
 statement ok
 UPDATE l SET name = 'renamed';

@@ -160,6 +160,9 @@ public:
 	bool CanRequestRebind() override {
 		return true;
 	}
+	//!
+	//! It also runs the internal-schema guard (#55, ScenarioInternalGuard) on
+	//! every planned statement
 	RebindQueryInfo OnFinalizePrepare(ClientContext &context, PreparedStatementData &prepared,
 	                                  PreparedStatementMode mode) override;
 
