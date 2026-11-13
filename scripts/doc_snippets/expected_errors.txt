@@ -1,0 +1,4 @@
+# <file><TAB><first SQL line of the block>[<TAB><substring the error must contain>]
+# Blocks that are supposed to fail. With a substring, the error text is pinned: if the
+# extension rewords the error, the gate fails until the docs quoting it are updated.
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	UPDATE approved.budget SET amount = 0;	is frozen. Unfreeze it with CALL scenario_unfreeze

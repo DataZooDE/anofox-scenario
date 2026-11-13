@@ -1,0 +1,5 @@
+# name<TAB>reason
+# scenario_* identifiers that appear in backticks or before '(' in docs/skills but are
+# not functions (columns, internal tables). Anything else must be a registered function.
+scenario_compat	C++ namespace of the compatibility header (docs/UPDATING.md, architecture.md)
+scenario_tables	internal table __anofox_scenario.scenario_tables (declared keys)
