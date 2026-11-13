@@ -6,6 +6,11 @@ require anofox_scenario
 
 load __TEST_DIR__/keyless_upgrade.db
 
+# the fabricated legacy deltas below are written with plain SQL, which the
+# internal-schema guard rejects by default (#55)
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
 # A pre-v0.4.1 keyless delta was s<id>_delta_<t>(_op, _ts, <base columns>):
 # no PRIMARY KEY, no trailing _count, the base's secondary UNIQUE constraints
 # mirrored, and only 'I' rows (UPDATE/DELETE on keyless tables were gated, so

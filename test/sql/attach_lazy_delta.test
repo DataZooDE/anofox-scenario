@@ -540,8 +540,15 @@ SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND
 # --- existing scenarios need no migration: a delta without a key row ------------
 # (pre-#34 scenarios recorded a declared key only as the delta's PRIMARY KEY)
 
+# (plain SQL on the internal schema needs the guard's escape hatch, #55)
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
 statement ok
 DELETE FROM __anofox_scenario.scenario_tables WHERE scenario_id = 1;
+
+statement ok
+RESET anofox_scenario_allow_internal_writes;
 
 statement ok
 DETACH s;

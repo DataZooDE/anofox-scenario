@@ -1,6 +1,7 @@
 #include "catalog/scenario_registry.hpp"
 
 #include "catalog/scenario_delta.hpp"
+#include "catalog/scenario_internal_guard.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/catalog/catalog.hpp"
@@ -218,6 +219,7 @@ DuckTableEntry &ScenarioRegistry::EnsureTablesTable(ClientContext &context, Cata
 
 RebindQueryInfo ScenarioClientState::OnFinalizePrepare(ClientContext &context, PreparedStatementData &prepared,
                                                        PreparedStatementMode mode) {
+	ScenarioInternalGuard::Check(context, prepared);
 	switch (prepared.statement_type) {
 	case StatementType::INSERT_STATEMENT:
 	case StatementType::UPDATE_STATEMENT:

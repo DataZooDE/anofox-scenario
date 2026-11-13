@@ -36,6 +36,10 @@ SELECT scenario_id FROM scenario_list() WHERE name = 'legacy_lake';
 
 # a pre-v0.4.1 keyless delta: no _count, insert rows only (each one copy).
 # It is never re-ATTACHed, so the ATTACH-time upgrade does not run.
+# (fabricated with plain SQL: needs the internal-schema guard's escape hatch, #55)
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
 statement ok
 DROP TABLE IF EXISTS __anofox_scenario.s1_delta_page_views;
 
@@ -48,6 +52,9 @@ INSERT INTO __anofox_scenario.s1_delta_page_views VALUES
     ('I', TIMESTAMP '2026-07-01 08:00:00', '/home', 'v1'),
     ('I', TIMESTAMP '2026-07-01 08:00:00', '/pricing', NULL),
     ('I', TIMESTAMP '2026-07-01 08:00:00', '/pricing', NULL);
+
+statement ok
+RESET anofox_scenario_allow_internal_writes;
 
 query TTT rowsort
 SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('legacy_lake');
@@ -217,6 +224,9 @@ DETACH rt;
 # row, so the merge's host bookkeeping hits a write-write conflict after the
 # lake transaction has already committed
 statement ok con2
+SET anofox_scenario_allow_internal_writes = true;
+
+statement ok con2
 BEGIN;
 
 statement ok con2
@@ -303,6 +313,9 @@ ATTACH 'changed_after' AS ca (TYPE scenario);
 
 statement ok
 INSERT INTO ca.notes VALUES ('n2');
+
+statement ok con2
+SET anofox_scenario_allow_internal_writes = true;
 
 statement ok con2
 BEGIN;

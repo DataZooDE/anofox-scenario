@@ -10,6 +10,8 @@
 #include "duckdb/main/extension_callback_manager.hpp"
 #include "duckdb/planner/extension_callback.hpp"
 #include "catalog/scenario_registry.hpp"
+#include "catalog/scenario_internal_guard.hpp"
+#include "duckdb/main/connection_manager.hpp"
 #include "anofox_scenario_banner.hpp"
 
 #ifdef HAS_POSTHOG_TELEMETRY
@@ -44,6 +46,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// ATTACH 'name' (TYPE scenario)
 	StorageExtension::Register(config, "scenario", make_shared_ptr<ScenarioStorageExtension>());
 	ExtensionCallbackManager::Get(loader.GetDatabaseInstance()).Register(make_shared_ptr<ScenarioConnectionCallback>());
+	// connections opened before LOAD (including the loading one) never saw
+	// the callback: give them the state now, so the internal-schema guard
+	// covers them too
+	for (auto &connection : ConnectionManager::Get(loader.GetDatabaseInstance()).GetConnectionList()) {
+		if (connection) {
+			ScenarioClientState::Get(*connection);
+		}
+	}
 	// CALL scenario_create/drop/freeze/unfreeze + scenario_list()
 	ScenarioLifecycle::RegisterFunctions(loader);
 	// scenario_diff / scenario_diff_summary (streaming, bind-replaced)
@@ -61,6 +71,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                          "Maximum number of updated/deleted scenario keys per table for which scans suppress base "
 	                          "rows through an in-memory hash set instead of per-row delta index probes",
 	                          LogicalType::UBIGINT, Value::UBIGINT(4194304));
+
+	// Internal-schema guard (#55): user SQL may read __anofox_scenario but not
+	// write it or change its schema. Off only for backup/restore (IMPORT
+	// DATABASE, COPY FROM DATABASE) and manual repair; combine the default
+	// with SET lock_configuration = true to keep it on
+	config.AddExtensionOption(ScenarioInternalGuard::SETTING_NAME,
+	                          "Allow SQL statements to write to and change the schema of the internal "
+	                          "__anofox_scenario schema (backup/restore, manual repair). Off by default: only the "
+	                          "scenario functions and attached scenarios change scenario state",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 
 	// PostHog telemetry (schema 2): envelope-only extension_loaded event.
 	// Respects DATAZOO_DISABLE_TELEMETRY and the opt-out setting below.
