@@ -272,6 +272,10 @@ public:
 	//! retryable TransactionException; a table of a DuckLake base that is not
 	//! in the scenario's pinned snapshot cannot be written.
 	DuckTableEntry &GetOrCreateWriteDelta(ClientContext &context, ScenarioTableEntry &entry);
+	//! True when writes to this table record base pre-images (#53): a keyed
+	//! table of a scenario over the host that is not itself materialized.
+	//! The pre-image table is created together with the delta.
+	bool KeepsPreImages(ScenarioTableEntry &entry) const;
 
 private:
 	//! The checks of BeginWrite

@@ -1,0 +1,225 @@
+# name: test/sql/scenario_merge_fk_order.test
+# description: scenario_merge applies tables in FOREIGN KEY order and updates referenced rows in place (issue #54)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# Merge-back used to apply tables in catalog order with immediate FK checks,
+# so a scenario adding a new parent row and a child referencing it failed when
+# the child table came first. And an update of a referenced parent row was
+# applied as delete + append, which DuckDB refuses while children reference it.
+
+# --- new parent + new child, child table first in name order ------------------
+
+statement ok
+CREATE TABLE z_parent (id INTEGER PRIMARY KEY, name VARCHAR);
+
+statement ok
+CREATE TABLE a_child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES z_parent(id));
+
+statement ok
+INSERT INTO z_parent VALUES (1, 'one');
+
+statement ok
+INSERT INTO a_child VALUES (100, 1);
+
+statement ok
+CALL scenario_create('fk1');
+
+statement ok
+ATTACH 'fk1' AS fk1 (TYPE scenario);
+
+statement ok
+INSERT INTO fk1.z_parent VALUES (2, 'two');
+
+statement ok
+INSERT INTO fk1.a_child VALUES (200, 2);
+
+query III
+SELECT * FROM scenario_merge('fk1');
+----
+2	2	0
+
+query II
+SELECT * FROM a_child ORDER BY id;
+----
+100	1
+200	2
+
+statement ok
+DETACH fk1;
+
+statement ok
+CALL scenario_drop('fk1');
+
+# --- the other name order -----------------------------------------------------
+
+statement ok
+CREATE TABLE a_parent (id INTEGER PRIMARY KEY);
+
+statement ok
+CREATE TABLE z_child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES a_parent(id));
+
+statement ok
+CALL scenario_create('fk2');
+
+statement ok
+ATTACH 'fk2' AS fk2 (TYPE scenario);
+
+statement ok
+INSERT INTO fk2.z_child VALUES (1, 7);
+
+statement ok
+INSERT INTO fk2.a_parent VALUES (7);
+
+query III
+SELECT * FROM scenario_merge('fk2');
+----
+2	2	0
+
+statement ok
+DETACH fk2;
+
+statement ok
+CALL scenario_drop('fk2');
+
+# --- moving a child to a new parent --------------------------------------------
+
+statement ok
+CALL scenario_create('fk3');
+
+statement ok
+ATTACH 'fk3' AS fk3 (TYPE scenario);
+
+statement ok
+INSERT INTO fk3.z_parent VALUES (3, 'three');
+
+statement ok
+UPDATE fk3.a_child SET pid = 3 WHERE id = 100;
+
+query III
+SELECT * FROM scenario_merge('fk3');
+----
+2	2	0
+
+query II
+SELECT * FROM a_child ORDER BY id;
+----
+100	3
+200	2
+
+statement ok
+DETACH fk3;
+
+statement ok
+CALL scenario_drop('fk3');
+
+# --- updating a referenced parent row (non-key column): applied in place --------
+
+statement ok
+CALL scenario_create('fk4');
+
+statement ok
+ATTACH 'fk4' AS fk4 (TYPE scenario);
+
+statement ok
+UPDATE fk4.z_parent SET name = 'TWO' WHERE id = 2;
+
+query III
+SELECT * FROM scenario_merge('fk4');
+----
+1	1	0
+
+query IT
+SELECT * FROM z_parent ORDER BY id;
+----
+1	one
+2	TWO
+3	three
+
+statement ok
+DETACH fk4;
+
+statement ok
+CALL scenario_drop('fk4');
+
+# in-place updates keep NOT NULL / CHECK enforcement and ROLLBACK
+statement ok
+CREATE TABLE checked (id INTEGER PRIMARY KEY, v INTEGER CHECK (v > 0), u VARCHAR UNIQUE);
+
+statement ok
+INSERT INTO checked VALUES (1, 1, 'a'), (2, 2, 'b');
+
+statement ok
+CALL scenario_create('fk5');
+
+statement ok
+ATTACH 'fk5' AS fk5 (TYPE scenario);
+
+# changes a non-indexed column (in place) and a UNIQUE column (delete + append)
+statement ok
+UPDATE fk5.checked SET v = 10 WHERE id = 1;
+
+statement ok
+UPDATE fk5.checked SET u = 'bb' WHERE id = 2;
+
+statement ok
+BEGIN;
+
+query III
+SELECT * FROM scenario_merge('fk5');
+----
+1	2	0
+
+query IIT
+SELECT * FROM checked ORDER BY id;
+----
+1	10	a
+2	2	bb
+
+statement ok
+ROLLBACK;
+
+query IIT
+SELECT * FROM checked ORDER BY id;
+----
+1	1	a
+2	2	b
+
+query III
+SELECT * FROM scenario_merge('fk5');
+----
+1	2	0
+
+statement ok
+DETACH fk5;
+
+statement ok
+CALL scenario_drop('fk5');
+
+# --- known limit: DuckDB refuses deleting a referenced row in the transaction ---
+# that deletes its children (plain DuckDB behaves the same), so a scenario that
+# deletes a parent and its children cannot be merged in one step
+
+statement ok
+CALL scenario_create('fk6');
+
+statement ok
+ATTACH 'fk6' AS fk6 (TYPE scenario);
+
+statement ok
+DELETE FROM fk6.a_child WHERE pid = 2;
+
+statement ok
+DELETE FROM fk6.z_parent WHERE id = 2;
+
+statement error
+SELECT * FROM scenario_merge('fk6');
+----
+still referenced by a foreign key
+
+# nothing was applied
+query I
+SELECT count(*) FROM z_parent;
+----
+3

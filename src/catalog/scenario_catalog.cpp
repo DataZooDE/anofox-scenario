@@ -217,6 +217,16 @@ static bool SameColumns(const TableCatalogEntry &a, const TableCatalogEntry &b) 
 	return true;
 }
 
+bool ScenarioCatalog::KeepsPreImages(ScenarioTableEntry &entry) const {
+	// Pre-images (#53) give merge-back a creation-time view of each base row
+	// the scenario touched. Materialized scenarios have their mat copy and
+	// DuckLake bases their pinned snapshot; keyless tables have no key to
+	// pin a row to. Branches of a materialized scenario read their parent's
+	// mat copy, so their pre-images are the mat rows they changed.
+	return base_catalog_name.empty() && mat_base_scenario_id != scenario_id && !entry.key_columns.empty() &&
+	       entry.base_entry.IsDuckTable();
+}
+
 DuckTableEntry &ScenarioCatalog::GetOrCreateWriteDelta(ClientContext &context, ScenarioTableEntry &entry) {
 	auto &host_catalog = GetHostCatalog(context);
 	auto logical_name = ScenarioDelta::LogicalName(entry);
@@ -276,8 +286,13 @@ DuckTableEntry &ScenarioCatalog::GetOrCreateWriteDelta(ClientContext &context, S
 	auto writer = MetaTransaction::Get(context).ModifiedDatabase();
 	bool host_is_not_writer = writer && writer.get() == &GetAttached();
 	try {
-		return ScenarioDelta::EnsureDeltaTable(context, host_catalog, scenario_id, entry.base_entry, &identity_keys,
-		                                       &logical_name, host_is_not_writer);
+		auto &delta = ScenarioDelta::EnsureDeltaTable(context, host_catalog, scenario_id, entry.base_entry,
+		                                              &identity_keys, &logical_name, host_is_not_writer);
+		if (KeepsPreImages(entry)) {
+			ScenarioDelta::EnsurePreTable(context, host_catalog, scenario_id, entry.base_entry, identity_keys,
+			                              logical_name, host_is_not_writer);
+		}
+		return delta;
 	} catch (std::exception &ex) {
 		if (!scenario_compat::IsException(ex, ExceptionType::TRANSACTION)) {
 			throw;

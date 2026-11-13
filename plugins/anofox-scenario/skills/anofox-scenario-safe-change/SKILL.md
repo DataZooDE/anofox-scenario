@@ -39,20 +39,19 @@ and edge cases see `anofox-scenario-reference`.
 - **Merging a branch applies its parent's changes too** (a branch starts from its parent's
   state). See "Merging a branch".
 - **Foreign keys are checked at merge time, not inside the scenario**, and the whole merge
-  rolls back on a violation. Tables are applied one after another with immediate checks, so
-  a scenario that inserts a new parent *and* a new child row referencing it currently fails
-  to merge (issue #54). Add the new parent rows to the base (or merge them in a scenario of
-  their own) first.
+  rolls back on a violation. Referenced tables are applied first, so new parent rows and the
+  children that reference them merge together. One case DuckDB itself refuses: deleting a
+  referenced parent row together with its children in one transaction. Merge the child
+  deletions first (a scenario of their own), then the parent's.
 - **Host-database merges run in your transaction.** Wrap `scenario_merge` in
   `BEGIN ... COMMIT` to check the result before it becomes visible, or `ROLLBACK` to undo it.
   DuckLake bases are different: the lake side commits on its own and needs autocommit (no
   surrounding `BEGIN`).
-- **Default (delta) scenarios do not detect base edits to rows they changed.** If someone
-  edits a row in the base after the scenario updated it, the merge writes the scenario's whole
-  row back and the base edit is lost, even with `'abort'`; the preview shows no conflict
-  (issue #53). Merge right after the dry run, or create the scenario with
-  `mode := 'materialized'` when the base may change in between: materialized and DuckLake
-  scenarios flag such rows as conflicts. Rows the scenario did not touch keep any base change.
+- **Base edits after the dry run are conflicts.** If someone edits a row in the base after the
+  scenario updated or deleted it, the preview flags it and `'abort'` refuses the merge; choose
+  `'ours'` or `'theirs'` (see "Conflicts"). Rows the scenario did not touch simply keep any base
+  change. Exception: keyless tables of default (delta) scenarios, where such an edit is
+  overwritten; declare `key_columns` or use `mode := 'materialized'` if the base may change.
 
 ## The playbook
 
@@ -160,12 +159,16 @@ CALL scenario_drop('bad_idea');   -- the base was never touched
 ## Conflicts
 
 A conflict means the base changed under the scenario in a way that collides with one of its
-changes. Which ones are detected depends on the mode:
+changes:
 
-| Scenario | Conflict when |
+| Conflict | When |
 |---|---|
-| delta (default) | an `insert` whose key now exists in the base; an `update` whose key no longer exists. **Not detected:** a base edit to a row the scenario updated; the scenario's row overwrites it (issue #53) |
-| materialized / DuckLake (have a creation snapshot) | additionally *drift*: the base row of a key the scenario touched changed since the snapshot |
+| insert over an existing key | the scenario inserts a key that now exists in the base |
+| update of a vanished row | the scenario updates a row the base has deleted since |
+| *drift* | the base row of a key the scenario updated or deleted changed since the scenario's snapshot of it: the creation copy (materialized), the pinned lake snapshot (DuckLake), or the row as it was when the scenario first touched it (default delta scenarios) |
+
+Keyless tables of delta scenarios (no PRIMARY KEY, no `key_columns`) only get the first two;
+a base edit to a row such a scenario also changed is overwritten.
 
 `on_conflict` decides what happens:
 
@@ -200,7 +203,7 @@ SELECT * FROM scenario_merge('restock', on_conflict := 'theirs');
 SELECT * FROM stock ORDER BY sku;   -- B = 25 from the scenario, C = 7 kept from the base
 ```
 
-The undetected case in a delta scenario, for comparison (the base's `name` edit is lost):
+Drift: someone edits a row the scenario changed, after the dry run:
 
 ```sql
 -- doc-snippets: new session
@@ -210,12 +213,14 @@ CALL scenario_create('reprice');
 ATTACH 'reprice' AS rp (TYPE scenario);
 UPDATE rp.item SET price = 11;
 UPDATE item SET name = 'new name';                    -- base edit after the dry run
-SELECT key, action, conflict FROM scenario_merge_preview('reprice');   -- conflict = false
-SELECT * FROM scenario_merge('reprice');
-SELECT * FROM item;                                   -- (1, 'old name', 11)
+SELECT key, action, conflict FROM scenario_merge_preview('reprice');   -- conflict = true
+SELECT * FROM scenario_merge('reprice', on_conflict := 'theirs');
+SELECT * FROM item;                                   -- (1, 'new name', 10)
 ```
 
-With `mode := 'materialized'` the same preview reports `conflict = true`.
+Both policies decide per row, not per column: `'ours'` would write the scenario's whole row
+`(1, 'old name', 11)` and undo the rename. To keep both edits, redo the change in a new
+scenario over the current base.
 
 ## Merging a branch
 

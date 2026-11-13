@@ -181,9 +181,8 @@ SELECT * FROM scenario_merge('price_increase', on_conflict := 'abort');
 On success the scenario ends up frozen with an empty delta. Use `on_conflict := 'ours'` to let
 the scenario win or `'theirs'` to let the base win, instead of aborting.
 
-> **Note:** a default (delta) scenario does not detect a base edit to a row it also updated:
-> the scenario's row overwrites it ([#53](https://github.com/DataZooDE/anofox-scenario/issues/53)).
-> Merge soon after the dry run, or use `mode := 'materialized'`, which reports such rows as conflicts.
+A base edit to a row the scenario also changed, made after the scenario's change, is reported
+as a conflict too: the scenario remembers each base row as it was when it first touched it.
 
 ```sql
 DETACH pi;  -- handle gone, scenario data persists

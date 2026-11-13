@@ -128,6 +128,38 @@ public:
 	idx_t affected_count = 0;
 	//! Buffer for delta appends, in delta layout
 	DataChunk delta_chunk;
+	//! Pre-image table (#53): base rows as of the scenario's first touch of
+	//! their key; null when the table keeps none (see KeepsPreImages)
+	optional_ptr<DuckTableEntry> pre_table;
+	vector<unique_ptr<BoundConstraint>> pre_constraints;
+
+	//! Record the pre-images of base rows this statement touches for the first
+	//! time (rows with __scenario_origin = 0: the key is not in the delta
+	//! yet, so no pre-image exists for it either). Appended in the caller's
+	//! transaction, next to the delta rows.
+	void RecordPreImages(ClientContext &client, ScenarioTableEntry &entry, const vector<row_t> &base_row_ids) {
+		if (!pre_table || base_row_ids.empty()) {
+			return;
+		}
+		auto rows = FetchBaseRows(client, entry, base_row_ids);
+		auto &storage = pre_table->GetStorage();
+		DataChunk pre_chunk;
+		pre_chunk.Initialize(Allocator::Get(client), storage.GetTypes());
+		idx_t offset = 0;
+		while (offset < rows.size()) {
+			pre_chunk.Reset();
+			idx_t batch = MinValue<idx_t>(rows.size() - offset, STANDARD_VECTOR_SIZE);
+			for (idx_t i = 0; i < batch; i++) {
+				auto &row = rows[offset + i];
+				for (idx_t col = 0; col < row.size(); col++) {
+					pre_chunk.SetValue(col, i, row[col]);
+				}
+			}
+			pre_chunk.SetChildCardinality(batch);
+			storage.LocalAppend(*pre_table, client, pre_chunk, pre_constraints);
+			offset += batch;
+		}
+	}
 
 	void LazyInit(ClientContext &client, ScenarioTableEntry &entry) {
 		if (delta_table) {
@@ -164,6 +196,16 @@ public:
 		}
 		delta_count_column = ScenarioDelta::CountColumnIndex(*delta_ptr);
 		delta_chunk.Initialize(Allocator::Get(client), delta_ptr->GetStorage().GetTypes());
+		auto &scenario_catalog = entry.GetScenarioCatalog();
+		if (scenario_catalog.KeepsPreImages(entry)) {
+			// absent for a delta written before pre-images existed: that
+			// table keeps the overlay conflict model
+			pre_table = ScenarioDelta::TryGetPreTable(client, scenario_catalog.GetHostCatalog(client),
+			                                          scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
+			if (pre_table) {
+				pre_constraints = binder->BindConstraints(*pre_table);
+			}
+		}
 	}
 
 	//! Verify rows (full table layout) against the base's PRIMARY KEY
@@ -548,6 +590,7 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 		row_t old_row_id;
 	};
 	vector<SecCandidate> sec_candidates;
+	vector<row_t> pre_rowids; // base rows touched for the first time (#53)
 	bool check_secondary = gstate.base_probe.HasSecondary();
 	idx_t base_rowid_pos = row_id_start + 1 + gstate.pk_columns.size();
 	auto null_payload_row = [&](DataChunk &keys_chunk, const vector<idx_t> &positions, idx_t row) {
@@ -577,6 +620,10 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 		vector<Value> row_values;
 		for (idx_t col = 0; col < column_count; col++) {
 			row_values.push_back(full_chunk.GetValue(col, i));
+		}
+		if (origin == 0 && gstate.pre_table) {
+			// first touch of a base row: keep its pre-image (#53)
+			pre_rowids.push_back(chunk.GetValue(base_rowid_pos, i).GetValue<row_t>());
 		}
 		if (new_key == old_key) {
 			if (origin == 0) {
@@ -746,6 +793,7 @@ SinkResultType PhysicalScenarioUpdate::Sink(ExecutionContext &context, DataChunk
 	auto removed_rows = gstate.FetchDeltaRows(client, entry, rows_to_remove);
 	gstate.FlushDeletes(client, rows_to_remove);
 	gstate.FlushAppends(client, entry, append_ops, append_rows, rows_to_remove, removed_rows);
+	gstate.RecordPreImages(client, entry, pre_rowids);
 	if (return_chunk) {
 		if (!gstate.return_collection) {
 			gstate.return_collection = make_uniq<ColumnDataCollection>(Allocator::Get(client), entry.GetTypes());
@@ -945,10 +993,14 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 	vector<char> append_ops;
 	vector<vector<Value>> append_rows;
 	vector<row_t> rows_to_remove;
+	vector<row_t> pre_rowids; // base rows touched for the first time (#53)
 	for (auto i : doomed) {
 		auto origin = chunk.GetValue(origin_pos, i).GetValue<int8_t>();
 		auto key = ScenarioDelta::MakeKey(chunk, i, key_positions);
 
+		if (origin == 0 && gstate.pre_table) {
+			pre_rowids.push_back(chunk.GetValue(row_id_positions[1 + gstate.pk_columns.size()], i).GetValue<row_t>());
+		}
 		if (origin == 0) {
 			// base row: tombstone (keys set, other payload NULL)
 			vector<Value> row_values;
@@ -993,6 +1045,7 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 	auto removed_rows = gstate.FetchDeltaRows(client, entry, rows_to_remove);
 	gstate.FlushDeletes(client, rows_to_remove);
 	gstate.FlushAppends(client, entry, append_ops, append_rows, rows_to_remove, removed_rows);
+	gstate.RecordPreImages(client, entry, pre_rowids);
 
 	if (return_chunk && !returning_rows.empty()) {
 		if (!gstate.return_collection) {
