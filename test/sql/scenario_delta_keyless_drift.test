@@ -134,9 +134,10 @@ DETACH pt;
 statement ok
 DETACH po;
 
+# (DuckDB 2.0 renders a one-field row as (a,); keys are normalised to (a))
 # no drift yet: every delete still finds its copies
 query TTT rowsort
-SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('pt');
+SELECT regexp_replace(key, ',\)$', ')') AS key, action, conflict::VARCHAR FROM scenario_merge_preview('pt');
 ----
 (a)	delete	false
 (a)	delete	false
@@ -150,7 +151,7 @@ DELETE FROM p2 WHERE rowid = (SELECT min(rowid) FROM p2 WHERE v = 'a');
 
 # both planned copies of (a) conflict - the base holds 1 of the 2; (b) is clean
 query TTT rowsort
-SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('pt');
+SELECT regexp_replace(key, ',\)$', ')') AS key, action, conflict::VARCHAR FROM scenario_merge_preview('pt');
 ----
 (a)	delete	true
 (a)	delete	true
@@ -249,7 +250,7 @@ statement ok
 DELETE FROM m WHERE rowid = (SELECT min(rowid) FROM m WHERE v = 'a');
 
 query TTT rowsort
-SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('match');
+SELECT regexp_replace(key, ',\)$', ')') AS key, action, conflict::VARCHAR FROM scenario_merge_preview('match');
 ----
 (a)	delete	false
 (a)	delete	false
@@ -309,7 +310,7 @@ statement ok
 DELETE FROM prices WHERE sku = 'p2';
 
 query TTT rowsort
-SELECT key, action, conflict::VARCHAR FROM scenario_merge_preview('ups');
+SELECT regexp_replace(key, ',\)$', ')') AS key, action, conflict::VARCHAR FROM scenario_merge_preview('ups');
 ----
 (p1, 10)	delete	true
 (p1, 11)	insert	false
