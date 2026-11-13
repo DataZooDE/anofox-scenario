@@ -44,6 +44,12 @@ static unique_ptr<Catalog> ScenarioAttach(optional_ptr<StorageExtensionInfo> sto
 	// content is unchanged.
 	ScenarioDelta::TryUpgradeLegacyKeylessDeltas(context, host_catalog, entry->scenario_id,
 	                                             options.access_mode == AccessMode::READ_ONLY);
+	// Base tables that gained columns while the extension was not loaded
+	// (#62): add them to the scenario's internal tables, under the same
+	// conditions; otherwise the scenario's next use of such a table raises an
+	// error that points back here
+	ScenarioDelta::TryWidenAtAttach(context, host_catalog, entry->scenario_id,
+	                                options.access_mode == AccessMode::READ_ONLY);
 
 	// BaseSource resolution: the nearest materialized scenario in the parent
 	// chain (including self) provides the base tables; otherwise the live host.

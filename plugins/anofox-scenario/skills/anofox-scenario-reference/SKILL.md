@@ -37,7 +37,8 @@ Rarer errors (`key_columns`, DuckLake pins, creation options, policy typos): [be
 | `Scenario '…' not found` (any scenario function) | a typo, or `USE <scenario alias>` is active and the functions search the scenario catalog (also: empty `scenario_list()`, DDL error from `scenario_create`) | check `scenario_list()`; after `USE alias`, `USE <host db>` (`memory` or the file's stem); prefer `alias.t` |
 | `Scenario '…' not found in database '…'` (ATTACH) | not in the session's default database | create it, or `USE` the database holding it |
 | `DDL operations are not permitted in scenarios` | `CREATE` / `ALTER` / `DROP` on a scenario catalog | change the base schema ("Schema changes" below) |
-| `Logical column index … out of range` (INTERNAL, then "database has been invalidated") | a base table was `ALTER`ed after a scenario wrote it (#62) | restart, undo the base change (`ALTER TABLE t DROP COLUMN c`) |
+| `Cannot … table '…': scenario '…' has unmerged changes to it` | base `DROP COLUMN` / `RENAME COLUMN` / column type change / `RENAME TO` / `DROP TABLE` on a table a scenario changed | merge the scenario (or drop it, *ask first*), then change the base; `ADD COLUMN` works anyway |
+| `Scenario '…' cannot use table '…'` | the base table changed shape without the extension loaded (another process, plain DuckDB) | for a gained column: `DETACH`, then `ATTACH` the scenario in autocommit; for a dropped/renamed/retyped column: restore it, or drop the scenario *(ask first)* |
 | `Cannot modify … with SQL` | SQL write/DDL on `__anofox_scenario` (also `IMPORT DATABASE` / `COPY FROM DATABASE` with scenarios) | use the functions; for restore/repair set `anofox_scenario_allow_internal_writes`, then `RESET` |
 | `Scenario '…' already exists` | name taken | pick another name, or `scenario_drop` the old one *(ask first)* |
 | `Invalid scenario name` / `exceeds the maximum length of 63 characters` | letters, digits, `_` only, starting with a letter or `_`, ≤ 63 chars | e.g. `price_import` instead of `price-import` |
@@ -116,6 +117,17 @@ Example: [behaviour.md](behaviour.md), "Transactions".
 
 ## Schema changes
 
-DDL inside a scenario is rejected. New base tables appear in delta scenarios automatically.
-Do not alter a base table an open scenario has written (its `scenario_diff_summary` lists it):
-that scenario breaks ([#62](https://github.com/DataZooDE/anofox-scenario/issues/62)).
+DDL inside a scenario is rejected; change the base instead. New base tables appear in delta
+scenarios automatically (materialized ones keep their table set).
+
+- **`ALTER TABLE t ADD COLUMN`** on the base reaches every scenario, attached or not, also
+  when it has changed `t`, and in materialized scenarios and branches. Rows the scenario
+  changed before show the value the base rows got: the column's `DEFAULT`, NULL without one
+  (also NULL for a volatile default such as `nextval(...)`). Scenarios can then write the
+  column, and `scenario_diff` / `scenario_merge` include it.
+- **`DROP COLUMN`, `RENAME COLUMN`, a column type change, `RENAME TO`, `DROP TABLE`** on a base
+  table are refused while any scenario has unmerged changes to it (`… has unmerged changes to
+  it`): merge the scenario first. A scenario without changes to the table does not block it.
+  Materialized copies keep their old columns.
+
+Example: [behaviour.md](behaviour.md), "Base schema changes".

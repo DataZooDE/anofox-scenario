@@ -174,6 +174,10 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	// a table the scenario never wrote has no delta yet (#34): it diffs as
 	// an empty changelog, provided the scenario has the table at all
 	auto delta = ScenarioDelta::TryGetDeltaTable(context, host_catalog, entry->scenario_id, table_name);
+	if (delta) {
+		// the delta must mirror the table it diffs against (#62)
+		ScenarioDelta::ThrowIfShapeDiffers(dc::Str(entry->name), table_name, *delta, true, base_entry->GetColumns());
+	}
 	target.delta_name = host_prefix + Q(ScenarioRegistry::SCHEMA_NAME) + "." +
 	                    Q(ScenarioDelta::DeltaTableName(entry->scenario_id, table_name));
 

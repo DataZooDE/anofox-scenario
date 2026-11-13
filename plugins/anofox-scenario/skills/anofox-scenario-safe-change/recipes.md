@@ -186,9 +186,10 @@ Tell the user, then offer one of:
 - **Test the whole migration on a copy of the database file** with plain DuckDB (no scenario).
 - **Split it:** the additive schema part on the real table (a nullable `ADD COLUMN`: existing
   readers see NULL), the data part in a scenario, reviewed and merged as usual. The base change
-  is real, so ask first; and only alter a table no open scenario has written yet (check their
-  `scenario_diff_summary`): altering a table with a scenario delta breaks that scenario
-  ([#62](https://github.com/DataZooDE/anofox-scenario/issues/62)).
+  is real, so ask first. It is safe while scenarios hold changes to the table: every scenario
+  gets the column, and rows it changed earlier show the column's default (NULL here).
+  Dropping, renaming or retyping a column, renaming or dropping the table is refused while a
+  scenario has unmerged changes to it (`has unmerged changes to it`): merge those first.
 
 ```sql
 ALTER TABLE orders ADD COLUMN tax DECIMAL(10,2);         -- real table, after the user's yes

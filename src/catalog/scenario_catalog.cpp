@@ -21,7 +21,8 @@ void ThrowScenarioDDLError(const ScenarioCatalog &catalog) {
 	const string prefix = "DDL operations are not permitted in scenarios. ";
 	if (catalog.mat_base_scenario_id >= 0) {
 		throw NotImplementedException(prefix + "Scenario '%s' reads a copy of the base made when it was created, so "
-		                                       "later schema changes do not reach it: change the base schema, then "
+		                                       "later schema changes do not reach it, except columns added to a base "
+		                                       "table (ALTER TABLE ... ADD COLUMN): change the base schema, then "
 		                                       "create a new scenario",
 		                              catalog.scenario_name);
 	}
@@ -249,6 +250,13 @@ DuckTableEntry &ScenarioCatalog::GetOrCreateWriteDelta(ClientContext &context, S
 	lock_guard<mutex> guard(ScenarioWriteLock(context));
 	auto existing = ScenarioDelta::TryGetDeltaTable(context, host_catalog, scenario_id, logical_name);
 	if (existing) {
+		// the sinks write rows in the table's layout: the delta and the
+		// pre-images must mirror it (#62)
+		ScenarioDelta::ThrowIfShapeDiffers(scenario_name, logical_name, *existing, true, entry.GetColumns());
+		auto pre = ScenarioDelta::TryGetPreTable(context, host_catalog, scenario_id, logical_name);
+		if (pre) {
+			ScenarioDelta::ThrowIfShapeDiffers(scenario_name, logical_name, *pre, false, entry.GetColumns());
+		}
 		return *existing;
 	}
 	if (!base_catalog_name.empty()) {

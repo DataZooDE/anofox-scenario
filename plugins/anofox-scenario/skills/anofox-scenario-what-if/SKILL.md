@@ -217,5 +217,6 @@ the reference skill's [behaviour.md](../anofox-scenario-reference/behaviour.md).
 
 - Several people writing the *same* scenario at once: concurrent writes to the same rows
   conflict like in any DuckDB table.
-- Schema experiments (new columns or tables inside the branch): DDL is rejected by design.
+- Schema experiments (new columns or tables inside the branch): DDL is rejected by design. A
+  column added to the base table (`ALTER TABLE ... ADD COLUMN`) does reach every scenario.
 - Data that does not fit one DuckDB process.

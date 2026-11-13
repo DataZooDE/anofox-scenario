@@ -1,0 +1,915 @@
+# name: test/sql/scenario_base_schema_change.test
+# description: base ALTER TABLE / DROP TABLE of tables scenarios changed (#62): ADD COLUMN reaches every
+#              scenario (delta, pre-images, materialized copies, bag deltas, branches); other shape changes are
+#              refused while a scenario has unmerged changes, and never leave an INTERNAL error behind
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+load __TEST_DIR__/scenario_base_schema_change.db
+
+#--------------------------------------------------------------------------------------------------
+# Keyed table (PRIMARY KEY), scenario attached while the base gains a column
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO p VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+CALL scenario_create('vw');
+
+statement ok
+ATTACH 'vw' AS vw (TYPE scenario);
+
+statement ok
+UPDATE vw.p SET v = 11 WHERE id = 1;
+
+statement ok
+DELETE FROM vw.p WHERE id = 3;
+
+statement ok
+INSERT INTO vw.p VALUES (4, 40);
+
+statement ok
+ALTER TABLE p ADD COLUMN w INTEGER DEFAULT 7;
+
+# rows the scenario wrote before the column existed read the value every base row got: the default
+query III
+SELECT * FROM vw.p ORDER BY id;
+----
+1	11	7
+2	20	7
+4	40	7
+
+# the delta and the pre-images gained the column
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_delta_p' ORDER BY column_index;
+----
+_op
+_ts
+id
+v
+w
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name = 's1_pre_p' ORDER BY column_index;
+----
+id
+v
+w
+
+# base rows the scenario never touched show the base's value
+statement ok
+UPDATE p SET w = 8 WHERE id = 2;
+
+# writes to the new column: UPDATE, INSERT (explicit, default), upsert, MERGE INTO
+statement ok
+UPDATE vw.p SET w = 99 WHERE id = 4;
+
+statement ok
+INSERT INTO vw.p VALUES (5, 50, 55);
+
+statement ok
+INSERT INTO vw.p (id, v) VALUES (6, 60);
+
+statement ok
+INSERT INTO vw.p VALUES (5, 51, 56) ON CONFLICT (id) DO UPDATE SET w = excluded.w;
+
+statement ok
+MERGE INTO vw.p USING (VALUES (6, 66), (7, 77)) AS s(id, w) ON p.id = s.id
+WHEN MATCHED THEN UPDATE SET w = s.w
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, 70, s.w);
+
+query III
+SELECT * FROM vw.p ORDER BY id;
+----
+1	11	7
+2	20	8
+4	40	99
+5	50	56
+6	60	66
+7	70	77
+
+query ITTTT
+SELECT * FROM scenario_diff('vw', 'p') ORDER BY ALL;
+----
+1	modified	v	10	11
+3	removed	NULL	NULL	NULL
+4	added	NULL	NULL	NULL
+5	added	NULL	NULL	NULL
+6	added	NULL	NULL	NULL
+7	added	NULL	NULL	NULL
+
+query TIII
+SELECT * FROM scenario_diff_summary('vw');
+----
+p	4	1	1
+
+query TTTT
+SELECT * FROM scenario_merge_preview('vw') ORDER BY ALL;
+----
+p	1	update	false
+p	3	delete	false
+p	4	insert	false
+p	5	insert	false
+p	6	insert	false
+p	7	insert	false
+
+#--------------------------------------------------------------------------------------------------
+# Persistence: the widened internal tables survive a restart
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+DETACH vw;
+
+restart
+
+statement ok
+ATTACH 'vw' AS vw (TYPE scenario);
+
+query III
+SELECT * FROM vw.p ORDER BY id;
+----
+1	11	7
+2	20	8
+4	40	99
+5	50	56
+6	60	66
+7	70	77
+
+statement ok
+DETACH vw;
+
+query III
+SELECT * FROM scenario_merge('vw');
+----
+1	6	0
+
+query III
+SELECT * FROM p ORDER BY id;
+----
+1	11	7
+2	20	8
+4	40	99
+5	50	56
+6	60	66
+7	70	77
+
+#--------------------------------------------------------------------------------------------------
+# The issue's repro: the scenario is detached while the base gains a column
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE d (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO d VALUES (1, 10), (2, 20);
+
+statement ok
+CALL scenario_create('det');
+
+statement ok
+ATTACH 'det' AS det (TYPE scenario);
+
+statement ok
+UPDATE det.d SET v = 11 WHERE id = 1;
+
+statement ok
+DETACH det;
+
+statement ok
+ALTER TABLE d ADD COLUMN w INTEGER;
+
+query ITTTT
+SELECT * FROM scenario_diff('det', 'd') ORDER BY ALL;
+----
+1	modified	v	10	11
+
+statement ok
+ATTACH 'det' AS det (TYPE scenario);
+
+query III
+SELECT * FROM det.d ORDER BY id;
+----
+1	11	NULL
+2	20	NULL
+
+statement ok
+UPDATE det.d SET w = 5 WHERE id = 1;
+
+query ITTTT
+SELECT * FROM scenario_diff('det', 'd') ORDER BY ALL;
+----
+1	modified	v	10	11
+1	modified	w	NULL	5
+
+statement ok
+DETACH det;
+
+#--------------------------------------------------------------------------------------------------
+# Drift detection with pre-images (#53) across the added column
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE dr (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO dr VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+CALL scenario_create('drift');
+
+statement ok
+ATTACH 'drift' AS drift (TYPE scenario);
+
+statement ok
+UPDATE drift.dr SET v = v + 1 WHERE id IN (1, 2);
+
+statement ok
+DELETE FROM drift.dr WHERE id = 3;
+
+statement ok
+DETACH drift;
+
+statement ok
+ALTER TABLE dr ADD COLUMN w VARCHAR DEFAULT 'x';
+
+# the pre-images got the default the base rows got: no drift yet
+query TTTT
+SELECT * FROM scenario_merge_preview('drift') ORDER BY ALL;
+----
+dr	1	update	false
+dr	2	update	false
+dr	3	delete	false
+
+# the base changes the new column of a row the scenario touched: drift
+statement ok
+UPDATE dr SET w = 'base' WHERE id = 2;
+
+statement ok
+UPDATE dr SET w = 'base' WHERE id = 3;
+
+query TTTT
+SELECT * FROM scenario_merge_preview('drift') ORDER BY ALL;
+----
+dr	1	update	false
+dr	2	update	true
+dr	3	delete	true
+
+statement error
+CALL scenario_merge('drift');
+----
+conflict
+
+query III
+SELECT * FROM scenario_merge('drift', on_conflict := 'theirs');
+----
+1	1	2
+
+query ITT
+SELECT * FROM dr ORDER BY id;
+----
+1	11	x
+2	20	base
+3	30	base
+
+#--------------------------------------------------------------------------------------------------
+# Declared key_columns on a table without a PRIMARY KEY
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE dk (code VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO dk VALUES ('a', 1), ('b', 2);
+
+statement ok
+CALL scenario_create('declared', key_columns := MAP {'dk': ['code']});
+
+statement ok
+ATTACH 'declared' AS declared (TYPE scenario);
+
+statement ok
+UPDATE declared.dk SET qty = 10 WHERE code = 'a';
+
+statement ok
+ALTER TABLE dk ADD COLUMN note VARCHAR;
+
+statement ok
+UPDATE declared.dk SET note = 'n' WHERE code = 'b';
+
+statement ok
+INSERT INTO declared.dk VALUES ('c', 3, 'new');
+
+query TIT
+SELECT * FROM declared.dk ORDER BY code;
+----
+a	10	NULL
+b	2	n
+c	3	new
+
+query TTTTT
+SELECT * FROM scenario_diff('declared', 'dk') ORDER BY ALL;
+----
+a	modified	qty	1	10
+b	modified	note	NULL	n
+c	added	NULL	NULL	NULL
+
+statement ok
+DETACH declared;
+
+query III
+SELECT * FROM scenario_merge('declared');
+----
+1	3	0
+
+query TIT
+SELECT * FROM dk ORDER BY code;
+----
+a	10	NULL
+b	2	n
+c	3	new
+
+#--------------------------------------------------------------------------------------------------
+# Keyless (bag) table: the multiplicity column stays last, also when the new column is named _count
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE k (a INTEGER, b VARCHAR);
+
+statement ok
+INSERT INTO k VALUES (1, 'x'), (1, 'x'), (2, 'y');
+
+statement ok
+CALL scenario_create('bag');
+
+statement ok
+ATTACH 'bag' AS bag (TYPE scenario);
+
+statement ok
+DELETE FROM bag.k WHERE a = 2;
+
+statement ok
+UPDATE bag.k SET b = 'z' WHERE rowid = (SELECT min(rowid) FROM bag.k WHERE a = 1);
+
+statement ok
+INSERT INTO bag.k VALUES (3, 'w');
+
+statement ok
+ALTER TABLE k ADD COLUMN c INTEGER DEFAULT 5;
+
+statement ok
+ALTER TABLE k ADD COLUMN _count INTEGER;
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%_delta_k' ORDER BY column_index;
+----
+_op
+_ts
+a
+b
+c
+_count
+__count
+
+# the deleted copy (2, y) stays suppressed: its tombstone got the default its base copy got
+query ITII
+SELECT * FROM bag.k ORDER BY ALL;
+----
+1	x	5	NULL
+1	z	5	NULL
+3	w	5	NULL
+
+statement ok
+INSERT INTO bag.k VALUES (4, 'v', 6, 1);
+
+statement ok
+UPDATE bag.k SET c = 9 WHERE a = 3;
+
+query ITII
+SELECT * FROM bag.k ORDER BY ALL;
+----
+1	x	5	NULL
+1	z	5	NULL
+3	w	9	NULL
+4	v	6	1
+
+query ITIITTTT
+SELECT * FROM scenario_diff('bag', 'k') ORDER BY ALL;
+----
+1	x	5	NULL	removed	NULL	NULL	NULL
+1	z	5	NULL	added	NULL	NULL	NULL
+2	y	5	NULL	removed	NULL	NULL	NULL
+3	w	9	NULL	added	NULL	NULL	NULL
+4	v	6	1	added	NULL	NULL	NULL
+
+query TIII
+SELECT * FROM scenario_diff_summary('bag');
+----
+k	3	0	2
+
+statement ok
+DETACH bag;
+
+query III
+SELECT * FROM scenario_merge('bag');
+----
+1	5	0
+
+query ITII
+SELECT * FROM k ORDER BY ALL;
+----
+1	x	5	NULL
+1	z	5	NULL
+3	w	9	NULL
+4	v	6	1
+
+#--------------------------------------------------------------------------------------------------
+# Materialized scenarios and branches: the copy follows the added column (filled like the base rows)
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE m (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO m VALUES (1, 10), (2, 20);
+
+statement ok
+CALL scenario_create('mat', mode := 'materialized');
+
+statement ok
+ATTACH 'mat' AS mat (TYPE scenario);
+
+statement ok
+UPDATE mat.m SET v = 11 WHERE id = 1;
+
+statement ok
+CALL scenario_create('mat_child', from_scenario := 'mat');
+
+statement ok
+ALTER TABLE m ADD COLUMN w VARCHAR DEFAULT 'd';
+
+# base data changes still do not reach the materialized scenario
+statement ok
+UPDATE m SET w = 'base' WHERE id = 2;
+
+query IIT
+SELECT * FROM mat.m ORDER BY id;
+----
+1	11	d
+2	20	d
+
+statement ok
+UPDATE mat.m SET w = 'mw' WHERE id = 2;
+
+statement ok
+ATTACH 'mat_child' AS mat_child (TYPE scenario);
+
+query IIT
+SELECT * FROM mat_child.m ORDER BY id;
+----
+1	11	d
+2	20	d
+
+statement ok
+UPDATE mat_child.m SET w = 'cw' WHERE id = 1;
+
+query IIT
+SELECT * FROM mat_child.m ORDER BY id;
+----
+1	11	cw
+2	20	d
+
+query ITTTT
+SELECT * FROM scenario_diff('main', 'mat', 'm') ORDER BY ALL;
+----
+1	modified	v	10	11
+2	modified	w	base	mw
+
+statement ok
+DETACH mat;
+
+statement ok
+DETACH mat_child;
+
+statement ok
+CALL scenario_drop('mat_child');
+
+# the base changed w of row 2 after the copy: a conflict, resolved for the scenario
+query TTTT
+SELECT * FROM scenario_merge_preview('mat') ORDER BY ALL;
+----
+m	1	update	false
+m	2	update	true
+
+query III
+SELECT * FROM scenario_merge('mat', on_conflict := 'ours');
+----
+1	2	1
+
+query IIT
+SELECT * FROM m ORDER BY id;
+----
+1	11	d
+2	20	mw
+
+#--------------------------------------------------------------------------------------------------
+# Branch of a delta scenario: the child inherits the widened delta and pre-images
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO b VALUES (1, 10), (2, 20);
+
+statement ok
+CALL scenario_create('parent');
+
+statement ok
+ATTACH 'parent' AS parent (TYPE scenario);
+
+statement ok
+UPDATE parent.b SET v = 11 WHERE id = 1;
+
+statement ok
+DETACH parent;
+
+statement ok
+ALTER TABLE b ADD COLUMN w INTEGER DEFAULT 0;
+
+statement ok
+CALL scenario_create('child', from_scenario := 'parent');
+
+statement ok
+ATTACH 'child' AS child (TYPE scenario);
+
+statement ok
+UPDATE child.b SET w = 2 WHERE id = 2;
+
+query III
+SELECT * FROM child.b ORDER BY id;
+----
+1	11	0
+2	20	2
+
+statement ok
+DETACH child;
+
+query TTTT
+SELECT * FROM scenario_merge_preview('child') ORDER BY ALL;
+----
+b	1	update	false
+b	2	update	false
+
+#--------------------------------------------------------------------------------------------------
+# A volatile default: the base rows got their own values, rows the scenario wrote read NULL
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE SEQUENCE vseq;
+
+statement ok
+CREATE TABLE vd (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO vd VALUES (1, 10), (2, 20);
+
+statement ok
+CALL scenario_create('vol');
+
+statement ok
+ATTACH 'vol' AS vol (TYPE scenario);
+
+statement ok
+UPDATE vol.vd SET v = 11 WHERE id = 1;
+
+statement ok
+ALTER TABLE vd ADD COLUMN n BIGINT DEFAULT nextval('vseq');
+
+query IIT
+SELECT id, v, n IS NULL FROM vol.vd ORDER BY id;
+----
+1	11	true
+2	20	false
+
+# the internal tables hold no dependency on the sequence
+statement ok
+DETACH vol;
+
+statement ok
+CALL scenario_drop('vol');
+
+#--------------------------------------------------------------------------------------------------
+# Same transaction: the scenario follows an ALTER of the transaction itself; ROLLBACK undoes both
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE tx (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO tx VALUES (1, 10), (2, 20);
+
+statement ok
+CALL scenario_create('txs');
+
+statement ok
+ATTACH 'txs' AS txs (TYPE scenario);
+
+statement ok
+UPDATE txs.tx SET v = 11 WHERE id = 1;
+
+statement ok
+BEGIN;
+
+query II
+SELECT * FROM txs.tx ORDER BY id;
+----
+1	11
+2	20
+
+statement ok
+ALTER TABLE tx ADD COLUMN z INTEGER;
+
+query III
+SELECT * FROM txs.tx ORDER BY id;
+----
+1	11	NULL
+2	20	NULL
+
+statement ok
+UPDATE txs.tx SET z = 1 WHERE id = 2;
+
+query III
+SELECT * FROM txs.tx ORDER BY id;
+----
+1	11	NULL
+2	20	1
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT * FROM txs.tx ORDER BY id;
+----
+1	11
+2	20
+
+query T
+SELECT column_name FROM duckdb_columns() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%_delta_tx' ORDER BY column_index;
+----
+_op
+_ts
+id
+v
+
+#--------------------------------------------------------------------------------------------------
+# Other shape changes: refused while a scenario has unmerged changes to the table
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+ALTER TABLE tx ADD COLUMN x INTEGER;
+
+statement error
+ALTER TABLE tx DROP COLUMN x;
+----
+Cannot drop a column of table 'tx': scenario 'txs' has unmerged changes to it
+
+statement error
+ALTER TABLE tx RENAME COLUMN x TO y;
+----
+Cannot rename a column of table 'tx': scenario 'txs' has unmerged changes to it
+
+statement error
+ALTER TABLE tx ALTER COLUMN x TYPE BIGINT;
+----
+Cannot change a column type of table 'tx': scenario 'txs' has unmerged changes to it
+
+statement error
+ALTER TABLE tx RENAME TO tx2;
+----
+Cannot rename table 'tx': scenario 'txs' has unmerged changes to it
+
+statement error
+DROP TABLE tx;
+----
+Cannot drop table 'tx': scenario 'txs' has unmerged changes to it
+
+# changes that keep the columns are fine
+statement ok
+ALTER TABLE tx ALTER COLUMN x SET DEFAULT 3;
+
+statement ok
+INSERT INTO txs.tx (id, v) VALUES (3, 30);
+
+query III
+SELECT * FROM txs.tx ORDER BY id;
+----
+1	11	NULL
+2	20	NULL
+3	30	3
+
+# a scenario whose changes cancel out (empty delta) does not block: its empty delta and pre-images of the old
+# shape are dropped, and its next write recreates them in the new shape
+statement ok
+DELETE FROM txs.tx WHERE id = 3;
+
+statement ok
+UPDATE txs.tx SET v = 10 WHERE id = 1;
+
+query I
+SELECT count(*) FROM txs.tx WHERE v <> 10 * id;
+----
+0
+
+statement ok
+CREATE TABLE e (id INTEGER PRIMARY KEY, v INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO e VALUES (1, 10, 0);
+
+statement ok
+CALL scenario_create('empty');
+
+statement ok
+ATTACH 'empty' AS empty (TYPE scenario);
+
+statement ok
+INSERT INTO empty.e VALUES (2, 20, 0);
+
+statement ok
+DELETE FROM empty.e WHERE id = 2;
+
+query I
+SELECT count(*) FROM __anofox_scenario.s12_delta_e;
+----
+0
+
+statement ok
+ALTER TABLE e DROP COLUMN x;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = '__anofox_scenario' AND table_name LIKE '%_e';
+----
+0
+
+statement ok
+UPDATE empty.e SET v = 11;
+
+query II
+SELECT * FROM empty.e;
+----
+1	11
+
+statement error
+ALTER TABLE e RENAME COLUMN v TO v2;
+----
+Cannot rename a column of table 'e': scenario 'empty' has unmerged changes to it
+
+#--------------------------------------------------------------------------------------------------
+# Never an INTERNAL error: internal tables that do not match the base (a change made without the
+# extension, simulated here by editing the internal schema) give an actionable error
+#--------------------------------------------------------------------------------------------------
+
+statement ok
+CREATE TABLE o (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO o VALUES (1, 10);
+
+statement ok
+CALL scenario_create('outside');
+
+statement ok
+ATTACH 'outside' AS outside (TYPE scenario);
+
+statement ok
+UPDATE outside.o SET v = 11;
+
+statement ok
+DETACH outside;
+
+statement ok
+ALTER TABLE o ADD COLUMN w INTEGER DEFAULT 4;
+
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
+statement ok
+ALTER TABLE __anofox_scenario.s13_delta_o DROP COLUMN w;
+
+statement ok
+ALTER TABLE __anofox_scenario.s13_pre_o DROP COLUMN w;
+
+statement ok
+RESET anofox_scenario_allow_internal_writes;
+
+statement error
+SELECT * FROM scenario_diff('outside', 'o');
+----
+Scenario 'outside' cannot use table 'o' yet: the base table gained column(s) 'w' that the scenario's stored changes lack
+
+statement error
+SELECT * FROM scenario_merge_preview('outside');
+----
+Scenario 'outside' cannot use table 'o' yet
+
+# ATTACH adds the column (filled with the default)
+statement ok
+ATTACH 'outside' AS outside (TYPE scenario);
+
+query III
+SELECT * FROM outside.o;
+----
+1	11	4
+
+statement ok
+DETACH outside;
+
+# a dropped column the scenario's changes still have
+statement ok
+SET anofox_scenario_allow_internal_writes = true;
+
+statement ok
+ALTER TABLE __anofox_scenario.s13_delta_o ADD COLUMN gone INTEGER;
+
+statement ok
+RESET anofox_scenario_allow_internal_writes;
+
+statement ok
+ATTACH 'outside' AS outside (TYPE scenario);
+
+statement error
+SELECT * FROM outside.o;
+----
+Scenario 'outside' cannot use table 'o': column 'gone' was dropped in the base table after the scenario changed the table
+
+statement error
+UPDATE outside.o SET v = 12;
+----
+Scenario 'outside' cannot use table 'o': column 'gone' was dropped
+
+statement error
+SELECT * FROM scenario_diff('outside', 'o');
+----
+Scenario 'outside' cannot use table 'o': column 'gone' was dropped
+
+statement error
+CALL scenario_merge('outside');
+----
+Scenario 'outside' cannot use table 'o': column 'gone' was dropped
+
+statement error
+CALL scenario_create('outside_child', from_scenario := 'outside');
+----
+Scenario 'outside' cannot use table 'o': column 'gone' was dropped
+
+# the database stays usable, and the scenario can be dropped
+statement ok
+DETACH outside;
+
+statement ok
+CALL scenario_drop('outside');
+
+query I
+SELECT count(*) FROM o;
+----
+1
+
+# CREATE OR REPLACE TABLE is not intercepted: the scenario's next use of the table names the problem
+statement ok
+CREATE TABLE r (id INTEGER PRIMARY KEY, v INTEGER);
+
+statement ok
+INSERT INTO r VALUES (1, 10);
+
+statement ok
+CALL scenario_create('replaced');
+
+statement ok
+ATTACH 'replaced' AS replaced (TYPE scenario);
+
+statement ok
+UPDATE replaced.r SET v = 11;
+
+statement ok
+CREATE OR REPLACE TABLE r (id INTEGER PRIMARY KEY, label VARCHAR);
+
+statement error
+SELECT * FROM replaced.r;
+----
+Scenario 'replaced' cannot use table 'r': column 'v' was dropped or renamed in the base table
+
+statement ok
+DETACH replaced;
+
+statement ok
+CALL scenario_drop('replaced');
+
+query I
+SELECT count(*) FROM r;
+----
+0

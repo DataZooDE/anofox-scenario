@@ -148,6 +148,32 @@ per file; others open it `READ_ONLY`. A scenario over a DuckLake base also needs
 (catalog file, `DATA_PATH`, unexpired snapshot). For someone without the extension, export the
 scenario's view of a table: `COPY (SELECT * FROM opt.demand) TO 'optimistic_demand.parquet'`.
 
+## Base schema changes
+
+A column added to a base table reaches a scenario that already changed the table. Rows the
+scenario changed before show the column's default, like every base row:
+
+```sql
+-- doc-snippets: new session
+CREATE TABLE prices (id INTEGER PRIMARY KEY, price INTEGER);
+INSERT INTO prices VALUES (1, 10), (2, 20);
+CALL scenario_create('repricing');
+ATTACH 'repricing' AS rp (TYPE scenario);
+UPDATE rp.prices SET price = 11 WHERE id = 1;
+
+ALTER TABLE prices ADD COLUMN currency VARCHAR DEFAULT 'EUR';   -- base
+UPDATE rp.prices SET currency = 'USD' WHERE id = 2;             -- scenario writes it
+SELECT * FROM rp.prices ORDER BY id;
+```
+
+Dropping, renaming or retyping a column, renaming or dropping the table waits until no
+scenario has unmerged changes to it:
+
+```sql
+-- fails: has unmerged changes to it
+ALTER TABLE prices DROP COLUMN currency;
+```
+
 ## More errors
 
 | Error contains | Cause | Fix |
