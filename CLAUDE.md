@@ -304,6 +304,8 @@ test/sql/
   attach_write_checks.test        # read-only / frozen / single-writer checks at EXECUTE, not PREPARE (#39)
   scenario_merge_keyless_drift.test # 3-way drift for keyless tables in materialized scenarios (#39)
   scenario_ducklake_merge_hardening.test # legacy deltas, rowid columns, net-plan preview, idempotent lake re-merge (#39)
+  scenario_delta_drift.test       # delta scenarios: pre-images, drift conflicts at merge/preview, branches, legacy (#53)
+  scenario_merge_fk_order.test    # merge applies parents first; in-place updates of referenced rows (#54)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
 ```
@@ -515,6 +517,11 @@ __anofox_scenario.s<id>_delta_<table>(_op VARCHAR, _ts TIMESTAMP, <base columns>
 
 -- Materialized base copies (mode = 'materialized')
 __anofox_scenario.s<id>_mat_<table>     -- schema (minus FOREIGN KEYs) + data copy of the base table
+
+-- Pre-images (#53): keyed tables of non-materialized scenarios over the host; created with
+-- the delta, one row per base row the scenario updated/deleted, as it was at that first
+-- touch (the drift reference of merge-back); copied by branching, emptied by the merge
+__anofox_scenario.s<id>_pre_<table>     -- <base columns>, PRIMARY KEY (<delta key>)
 ```
 
 ## Getting Unstuck

@@ -469,6 +469,10 @@ __anofox_scenario.s<id>_delta_<table>   the changelog described above, created b
 __anofox_scenario.s<id>_mat_<table>     base copies, for mode := 'materialized' (columns, NOT NULL/
                                         CHECK/PK/UNIQUE + data; FOREIGN KEYs stripped: they would
                                         resolve inside this schema, and merge-back enforces them)
+__anofox_scenario.s<id>_pre_<table>     pre-images of the base rows an overlay scenario updated or
+                                        deleted (base columns, PK = the delta's key), created with
+                                        the delta for keyed tables over the host; the drift
+                                        reference of merge-back (#53, see "Merge-back")
 ```
 
 `<table>` is the logical name: bare for `main`, otherwise `<schema>.<table>`. `.` is the separator,
@@ -514,11 +518,24 @@ Conflict detection depends on whether the scenario has a creation snapshot:
 
 - **Overlay** — detects an `insert` whose key now exists in the base, or an `update` whose key
   has vanished from it.
-- **Materialized / DuckLake** — additionally detects three-way *drift*: a base row that changed
-  since the snapshot, on a key the scenario also touched.
-  Keyless tables of both tiers get the copy-count form of drift (below).
+- **Three-way drift** — a base row that changed since the scenario's snapshot of it, on a key
+  the scenario updated or deleted. The snapshot is the mat copy (materialized), the pinned lake
+  snapshot (DuckLake), or for overlay scenarios the row's *pre-image* (#53): the update and
+  delete sinks fetch each base row they touch for the first time (`__scenario_origin = 0`) by
+  rowid and append it to `s<id>_pre_<table>`, next to the delta write and in the same
+  transaction. A key is first touched exactly once — afterwards it is in the delta, so later
+  statements see it with origin 1 — which keeps the first pre-image without a lookup. Branches
+  copy their parent's pre-images with its deltas. Overlay pre-images exist for keyed tables
+  only; deltas written before they existed (no pre table) keep the overlay checks.
+  Keyless tables of the snapshot tiers get the copy-count form of drift (below).
 
-`on_conflict` selects `abort` (default), `ours`, or `theirs`. Host bases apply atomically in the
+`on_conflict` selects `abort` (default), `ours`, or `theirs`. Tables are applied in FOREIGN KEY
+order, referenced tables first, so a new parent row exists before a new child row referencing
+it is appended (#54). An update that keeps the key and every index-backed column (PK, UNIQUE,
+FK) is applied in place — an `UPDATE` of the other columns — because DuckDB refuses deleting a
+row other rows reference; everything else is a delete plus an append. Deleting a referenced
+row together with its children still fails: DuckDB keeps the deleted children in the FK index
+until commit. Host bases apply atomically in the
 caller's transaction. DuckLake bases apply atomically on the lake side in their own transaction,
 because there is no cross-catalog 2PC — hence the autocommit requirement.
 

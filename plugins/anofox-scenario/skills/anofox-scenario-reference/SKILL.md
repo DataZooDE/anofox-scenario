@@ -37,7 +37,7 @@ Every verb is a table function: `CALL f(...)` and `SELECT * FROM f(...)` both wo
 | `scenario_diff(a, b, table)` | same | Any two sides; `'main'` = the base table. `old` = `a`, `new` = `b`. When either side is a scenario over a DuckLake base, `'main'` is the lake table *at that scenario's snapshot*, not the live lake. |
 | `scenario_diff_summary(scenario)` | `table_name, rows_added, rows_modified, rows_removed` | One row per table the scenario has written. |
 | `scenario_merge_preview(scenario)` | `table_name, key, action, conflict` | No side effects. `action`: `insert` / `update` / `delete`; `key` as text. |
-| `scenario_merge(scenario, on_conflict := 'abort'\|'ours'\|'theirs')` | `tables_changed, rows_applied, conflicts_resolved` | Applies the delta to the base; the scenario ends frozen, `merged_at` set, delta empty. Works while attached. A branch's merge includes its parent's changes. Delta scenarios don't detect base edits to rows they updated; the scenario's row wins silently (issue #53). |
+| `scenario_merge(scenario, on_conflict := 'abort'\|'ours'\|'theirs')` | `tables_changed, rows_applied, conflicts_resolved` | Applies the delta to the base; the scenario ends frozen, `merged_at` set, delta empty. Works while attached. A branch's merge includes its parent's changes. A base edit to a row the scenario updated or deleted is a conflict (drift), in every mode; delta scenarios compare with the row as it was at their first touch (keyed tables). Referenced tables are applied first. |
 | `scenario_refresh(name, key_columns := MAP {...})` | `refreshed_tables` | **Deprecated.** Only still needed to declare `key_columns` for a keyless table the scenario has not written yet. |
 | `scenario_migrate()` | `migrated_scenarios, migrated_snapshots` | One-way upgrade of a v0.1 database. |
 
@@ -138,7 +138,8 @@ a name part containing a dot is double-quoted: `'"a.b"'` is the main table `a.b`
 | `is frozen. Unfreeze it before merging` | `scenario_merge` on a frozen scenario | unfreeze, then merge |
 | `was already merged back into the base` | second `scenario_merge`, or `scenario_unfreeze` of a merged scenario | nothing to do; create a new scenario for further changes |
 | `the base changed underneath it` | merge conflict with `on_conflict := 'abort'` | inspect `scenario_merge_preview`, then rerun with `'ours'` or `'theirs'` |
-| `Violates foreign key constraint` (at merge) | a merged row references a parent missing in the base, or a new parent and a new child were inserted in the same scenario (tables are applied one at a time, issue #54) | add the parent row to the base first, then merge again; nothing was applied |
+| `Violates foreign key constraint` (at merge) | a merged row references a parent missing in the base (and not added by the scenario) | add the parent row to the scenario or the base, then merge again; nothing was applied |
+| `is still referenced by a foreign key` (at merge) | the scenario deletes a referenced parent row together with its children (DuckDB refuses that in one transaction), or changes a referenced row's key or another indexed column | merge the child changes first in a scenario of their own, then the parent's |
 | `the key exists in the base table` | INSERT of a key the base already has | `UPDATE`, `INSERT OR REPLACE` / `ON CONFLICT`, or delete it in the scenario first |
 | `the key was already inserted or modified in this scenario` | INSERT of a key the scenario already wrote | same as above |
 | `UNIQUE constraint on scenario table` | duplicate unique value vs. base or scenario rows | as for keys |
