@@ -114,6 +114,12 @@ DELETE FROM __anofox_scenario.s2_delta_events;
 ----
 <REGEX>:.*Cannot modify __anofox_scenario\.s2_delta_events with SQL \(DELETE\).*
 
+# pre-images of overlay updates (#53)
+statement error
+DELETE FROM __anofox_scenario.s2_pre_events;
+----
+<REGEX>:.*Cannot modify __anofox_scenario\.s2_pre_events with SQL \(DELETE\).*
+
 statement error
 TRUNCATE __anofox_scenario.s1_delta_forecast;
 ----
