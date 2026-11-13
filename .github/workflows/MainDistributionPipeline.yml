@@ -116,8 +116,14 @@ jobs:
       - name: Build (release)
         run: GEN=ninja make release
 
-      - name: Install ducklake for the built version
-        run: ./build/release/duckdb -c "INSTALL ducklake; INSTALL parquet;"
+      - name: Install ducklake (and anofox_forecast for the doc snippets) for the built version
+        run: ./build/release/duckdb -c "INSTALL ducklake; INSTALL parquet; INSTALL anofox_forecast FROM community;"
 
       - name: Run test suite incl. DuckLake scenarios
         run: DUCKLAKE_TESTS=1 ./build/release/test/unittest "test/sql/*"
+
+      # Every ```sql block in README.md, docs/ and the Claude Code skills, against this
+      # build (scripts/check_doc_snippets.py). Blocks run sandboxed (no file access outside
+      # a temp dir, locked configuration, no dot-commands); this job has no secrets.
+      - name: Doc snippets (README, docs, skills)
+        run: python3 scripts/check_doc_snippets.py --with-ext ducklake,anofox_forecast

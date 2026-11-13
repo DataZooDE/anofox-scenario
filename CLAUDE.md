@@ -338,8 +338,14 @@ Rules:
   with a first line `-- doc-snippets: new session`, or, where a visible comment would be
   noise (README), a `<!-- doc-snippets: new session -->` line before the fence. Tables
   headed `Error contains` are checked too: each quoted error text must exist in `src/` or
-  `duckdb/src/`. Blocks needing the network, DuckLake or
-  another extension (`-- requires: <ext>`) are skipped and must be checked by hand.
+  `duckdb/src/`, and so are prose quotes like "fails with `...`". Blocks run sandboxed
+  (file access only in a temp dir, locked configuration, no `.` dot-commands).
+- Blocks needing DuckLake or another extension (`INSTALL x`, `ducklake:`, a first line
+  `-- requires: <ext>`) are skipped by `make check-docs` and run by `make check-docs-all`
+  and in CI (DuckLake integration job). Examples whose point is a result (conflict policy,
+  diff direction, rollback) get an entry in `scripts/doc_snippets/expected_output.txt`;
+  `--show-output FILE` prints block outputs to write one.
+- `plugin.json`'s version must match every SKILL.md `version:` and banner (checked).
 - On a release, bump `version` in `plugin.json` and in every SKILL.md frontmatter and banner
   to the new CalVer tag.
 - In-repo testing: `claude --plugin-dir ./plugins/anofox-scenario`.
