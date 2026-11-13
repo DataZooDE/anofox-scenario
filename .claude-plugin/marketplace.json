@@ -1,0 +1,26 @@
+{
+  "name": "anofox-scenario",
+  "owner": {
+    "name": "DataZoo GmbH",
+    "url": "https://github.com/DataZooDE"
+  },
+  "metadata": {
+    "description": "Claude Code skills for anofox_scenario, Git-like branching for DuckDB tables."
+  },
+  "plugins": [
+    {
+      "name": "anofox-scenario",
+      "source": "./plugins/anofox-scenario",
+      "description": "Git-like branching skills for the anofox_scenario DuckDB extension — what-if planning with scenario variants, dry-running changes and merging them back, frozen snapshots and audit trails, plus a semantics and error reference.",
+      "keywords": [
+        "duckdb",
+        "branching",
+        "what-if",
+        "scenarios",
+        "sql",
+        "analytics",
+        "claude-code"
+      ]
+    }
+  ]
+}
