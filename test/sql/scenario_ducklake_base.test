@@ -28,6 +28,12 @@ CALL scenario_create('lakescen', 'over a ducklake', base := 'lake', key_columns 
 statement ok
 ATTACH 'lakescen' AS s (TYPE scenario);
 
+# DDL hint: a DuckLake-based scenario is pinned to its creation snapshot (#51)
+statement error
+CREATE TABLE s.scratch (i INTEGER);
+----
+<REGEX>:.*Scenario 'lakescen' reads 'lake' as of its creation snapshot, so later schema changes do not reach it: change the schema in 'lake', then create a new scenario.*
+
 # reads flow through the ducklake scan
 query ITI
 SELECT id, region, qty FROM s.forecast ORDER BY id;

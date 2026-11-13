@@ -97,6 +97,49 @@ SELECT count(*) FROM forecast;
 ----
 1
 
+# --- the hint depends on where the scenario's schema comes from (#51) ---------
+
+# delta scenario over the host: new base tables show up by themselves
+statement error
+ALTER TABLE s.forecast ADD COLUMN note VARCHAR;
+----
+<REGEX>:.*Change the schema in the base database instead: tables added there appear in scenario 'ddl_test' automatically.*
+
+statement ok
+CALL scenario_create('ddl_mat', mode := 'materialized');
+
+statement ok
+ATTACH 'ddl_mat' AS m (TYPE scenario);
+
+statement error
+CREATE TABLE m.scratch (i INTEGER);
+----
+<REGEX>:.*Scenario 'ddl_mat' reads a copy of the base made when it was created, so later schema changes do not reach it.*
+
+# a branch of a materialized scenario reads the same copy
+statement ok
+CALL scenario_create('ddl_mat_branch', from_scenario := 'ddl_mat');
+
+statement ok
+ATTACH 'ddl_mat_branch' AS mb (TYPE scenario);
+
+statement error
+DROP TABLE mb.forecast;
+----
+<REGEX>:.*Scenario 'ddl_mat_branch' reads a copy of the base made when it was created.*
+
+statement ok
+DETACH mb;
+
+statement ok
+CALL scenario_drop('ddl_mat_branch');
+
+statement ok
+DETACH m;
+
+statement ok
+CALL scenario_drop('ddl_mat');
+
 statement ok
 DETACH s;
 
