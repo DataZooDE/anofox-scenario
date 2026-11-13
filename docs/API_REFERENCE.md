@@ -2,37 +2,41 @@
 
 This document describes the SQL API for the anofox-scenario DuckDB extension.
 
+> **Using an AI assistant?** The [Claude Code plugin](../README.md#-claude-code-skills-ai-pair-programming)
+> packages this reference and the common workflows (what-if planning, dry-run and merge,
+> snapshots and audit) as skills: `/plugin marketplace add DataZooDE/anofox-scenario`.
+
 ## Scenario Catalogs (v2 surface, recommended)
 
 A scenario is exposed as an **attached catalog**: ordinary SQL reads and writes, no special
 functions. (The legacy v0.1 function surface was removed in v0.2 - see `scenario_migrate()`.)
 
 ```sql
+-- given a base table forecast(id INTEGER PRIMARY KEY, region VARCHAR, qty DOUBLE)
 CALL scenario_create('optimistic', 'demand +10%');   -- description optional
-
--- Phase 2 options:
-CALL scenario_create('baseline', mode := 'materialized');       -- frozen full copy: immune to base changes
+CALL scenario_create('baseline', mode := 'materialized');       -- full copy: immune to base changes
 CALL scenario_create('variant', from_scenario := 'optimistic'); -- branch: inherits the parent's changes
 
-SELECT * FROM scenario_list();                    -- name, mode, frozen, parent, created_at, description
-
--- Phase 3: streaming, typed diffs (the delta IS the changelog)
-SELECT * FROM scenario_diff('optimistic', 'forecast');  -- <pk cols>, change_type, column_name, old/new_value
-SELECT * FROM scenario_diff_summary('optimistic');      -- per-table rows_added/modified/removed
+SELECT * FROM scenario_list();                    -- scenario_id, name, mode, frozen, parent, created_at, description
 
 ATTACH 'optimistic' AS opt (TYPE scenario);
 
 SELECT * FROM opt.forecast;                          -- merged view: base + scenario changes
-INSERT INTO opt.forecast VALUES (...);               -- transparent copy-on-write
-UPDATE opt.forecast SET qty = qty * 1.1 WHERE ...;   -- base is never modified
-DELETE FROM opt.forecast WHERE obsolete;
-TRUNCATE opt.forecast;
+INSERT INTO opt.forecast VALUES (5, 'LATAM', 40);    -- transparent copy-on-write
+UPDATE opt.forecast SET qty = qty * 1.1 WHERE region = 'US';   -- base is never modified
+DELETE FROM opt.forecast WHERE qty < 70;
 
+-- streaming, typed diffs (the delta IS the changelog)
+SELECT * FROM scenario_diff('optimistic', 'forecast');  -- <pk cols>, change_type, column_name, old/new_value
+SELECT * FROM scenario_diff_summary('optimistic');      -- per-table rows_added/modified/removed
+
+TRUNCATE opt.forecast;                               -- every row deleted, in the scenario only
 DETACH opt;                                          -- handle gone, scenario data persists
 
 CALL scenario_freeze('optimistic');                  -- reject all writes (reads keep working)
 CALL scenario_unfreeze('optimistic');
-CALL scenario_drop('optimistic');                    -- refuses while attached
+CALL scenario_drop('variant');                       -- branches go first
+CALL scenario_drop('optimistic');                    -- refuses while attached or branched
 ```
 
 **Semantics**
@@ -148,18 +152,18 @@ CALL scenario_drop('optimistic');                    -- refuses while attached
 
 | Function | Kind | Description |
 | --- | --- | --- |
-| `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog], [key_columns := MAP {'table': ['col', ...]}])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes; `base` uses another attached catalog's tables as the base (DuckLake bases are pinned to creation time - true snapshot isolation); `key_columns` declares row identity for tables without a PRIMARY KEY (validated up front - unknown or repeated columns are refused, errors name the table as `schema.table` - and recorded in `__anofox_scenario.scenario_tables`). Delta mode is O(1): no delta tables are created until a table's first write. A branch copies only the parent deltas that exist, plus the parent's declared keys, and may not change an inherited identity. |
+| `CALL scenario_create(name, [description], [mode := 'delta'\|'materialized'], [from_scenario := parent], [base := catalog], [key_columns := MAP {'table': ['col', ...]}])` | verb | Register a scenario. `materialized` copies every base table (full isolation); `from_scenario` branches, inheriting the parent's changes; `base` uses another attached catalog's tables as the base (DuckLake bases are pinned to creation time - true snapshot isolation); `key_columns` declares row identity for tables without a PRIMARY KEY (validated up front - unknown or repeated columns are refused, errors name the table as `schema.table` - and recorded in `__anofox_scenario.scenario_tables`). Delta mode is O(1): no delta tables are created until a table's first write. A branch copies only the parent deltas that exist, plus the parent's declared keys, and may not change an inherited identity; it inherits the parent's base catalog and DuckLake snapshot pin. `from_scenario` and `base` each exclude `mode := 'materialized'`, and each other. Returns `success`. |
 | `CALL scenario_drop(name)` | verb | Remove the scenario, its delta/materialized tables and its declared keys. Refuses while attached or while branches exist. |
 | `CALL scenario_freeze(name)` / `scenario_unfreeze(name)` | verb | Reject/allow writes through any attached handle (reads keep working). A frozen materialized scenario is a snapshot. |
-| `SELECT * FROM scenario_list()` | table | `scenario_id, name, mode, frozen, parent, created_at, description`. |
+| `SELECT * FROM scenario_list()` | table | `scenario_id, name, mode, frozen, parent, created_at, description` (`parent` is the parent scenario's name). |
 | `SELECT * FROM scenario_diff(scenario, table)` | table | Compare to origin (`table` is matched like a scenario table: `main.t` and `t` are the same): `<pk cols>` (native types), `change_type` (`added`/`removed`/`modified`), `column_name`, `old_value`, `new_value`. Streams through the engine. Keyless tables (no PK, no `key_columns`) get a bag diff: every column is the identity, a changed row is `removed` + `added`, and duplicates appear once per copy. |
 | `SELECT * FROM scenario_diff(a, b, table)` | table | Generic diff between two merged relations (`'main'` or any scenario). `old` = side a, `new` = side b. `'main'` is the origin table of the scenario on the other side, in its base catalog: pinned to the scenario's creation snapshot for DuckLake bases, live otherwise. DuckLake-based scenarios are always diffed at their snapshot, so later lake changes never show as scenario changes. |
 | `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog, one row per table the scenario has written (a table never written has no delta and no row). For keyless tables these are the net counts per distinct row (`rows_modified` is 0). |
 | `SELECT * FROM scenario_merge_preview(scenario)` | table | Planned merge-back actions: `table_name, key, action, conflict`. Streaming; no side effects. Overlay conflicts: an `insert` whose key now exists in base, an `update` whose key vanished. Scenarios with a creation snapshot (materialized, DuckLake) additionally flag 3-way *drift* conflicts: the base row changed since the snapshot on a touched key. Keyless tables list the per-value net plan the merge applies: one row per copy deleted or inserted, `key` = the whole row as text, e.g. `(A, 1)`. For keyless tables of snapshot scenarios (materialized, DuckLake) a `delete` conflicts when the base's number of copies of that row differs from the snapshot's. |
-| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). Keyless tables merge as bags: per distinct row (NULL-safe whole-row match) the net delete count `n` removes exactly `n` copies and a net insert count adds that many; on a drifted row of a snapshot scenario (materialized or DuckLake) `theirs` keeps the base's copies and `ours` sets the base to the scenario's count. On a DuckLake base the lake commit is tagged (`commit_extra_info`), so a merge whose host bookkeeping failed can simply be re-run. On success the scenario ends `frozen` with `merged_at` set and an empty delta. Refuses while branches exist. |
+| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). Keyless tables merge as bags: per distinct row (NULL-safe whole-row match) the net delete count `n` removes exactly `n` copies and a net insert count adds that many; on a drifted row of a snapshot scenario (materialized or DuckLake) `theirs` keeps the base's copies and `ours` sets the base to the scenario's count. On a DuckLake base the lake commit is tagged (`commit_extra_info`), so a merge whose host bookkeeping failed can simply be re-run. On success the scenario ends `frozen` with `merged_at` set and an empty delta, and the function returns one row `tables_changed, rows_applied, conflicts_resolved`. Refuses while branches exist, while the scenario is frozen, and once it has been merged. With a host base, a `ROLLBACK` of the surrounding transaction undoes the merge and leaves the scenario mergeable. |
 | `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | verb | **Deprecated (#34).** Tables added to the base after `scenario_create` are writable without it, and it no longer creates delta tables. What remains: `key_columns` declares the row identity of keyless tables the scenario does not track yet (no declared key, never written); rejected once a table is tracked, except to replace a declared key whose column was renamed or dropped in the base before the table's first write. For DuckLake bases the table must be in the scenario's snapshot. Returns `refreshed_tables`, the number of keys declared (`0` without `key_columns`). Refuses frozen and materialized scenarios. |
-| `SELECT * FROM scenario_migrate()` | verb | One-way migration of a legacy v0.1 database (`_scenario_registry`, `_scen_*`, `_snap_*`) into the v2 layout. Archived -> frozen; snapshots -> materialized+frozen; multi-op delta rows folded to net effects; `_scenario_base_rowids` dropped; `_scenario_protocols` preserved. |
-| `ATTACH 'name' AS alias (TYPE scenario)` / `DETACH alias` | SQL | The entire read/write UX. |
+| `SELECT * FROM scenario_migrate()` | verb | Returns `migrated_scenarios, migrated_snapshots` (both `0` on a database without legacy tables). One-way migration of a legacy v0.1 database (`_scenario_registry`, `_scen_*`, `_snap_*`) into the v2 layout. Archived -> frozen; snapshots -> materialized+frozen; multi-op delta rows folded to net effects; `_scenario_base_rowids` dropped; `_scenario_protocols` preserved. |
+| `ATTACH 'name' AS alias (TYPE scenario [, READ_ONLY])` / `DETACH alias` | SQL | The entire read/write UX. `USE alias` makes unqualified table names resolve to the scenario. |
 
 ## Internal Layout
 
@@ -196,7 +200,7 @@ string: the `scenario_diff` table argument, `key_columns :=` keys, and the `tabl
 `scenario_diff_summary` / `scenario_merge_preview`. Names without a dot are written as is.
 
 The delta table is a stable changelog contract: `scenario_diff` reads it, branching copies it,
-and merge-back (v0.5) will replay it.
+and `scenario_merge` replays it.
 
 ## Protocols / Audit Notes
 

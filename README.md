@@ -12,6 +12,7 @@
   <a href="https://github.com/DataZooDE/anofox-scenario/actions/workflows/MainDistributionPipeline.yml"><img src="https://github.com/DataZooDE/anofox-scenario/actions/workflows/MainDistributionPipeline.yml/badge.svg?branch=main" alt="Build Status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSL_1.1-blue.svg" alt="License"></a>
   <img src="https://img.shields.io/badge/DuckDB-v1.5.5%2B%20%7C%202.0-green.svg" alt="DuckDB Compatibility">
+  <a href="#-claude-code-skills-ai-pair-programming"><img src="https://img.shields.io/badge/Claude_Code-AI_skills_plugin-8A2BE2.svg" alt="Claude Code AI skills plugin"></a>
 </p>
 
 ---
@@ -38,6 +39,13 @@ SELECT * FROM scenario_diff('optimistic', 'forecast');  -- exactly what differs
 
 That's the whole idea. Only the rows you actually change are stored, so a scenario over a
 100-million-row table costs you the rows you touched — not a copy.
+
+> **🤖 Built for AI pair-programming.** anofox-scenario ships an installable
+> **[Claude Code plugin](#-claude-code-skills-ai-pair-programming)** whose skills follow the
+> ways people use scenarios — what-if planning, dry-running a change before merging it,
+> freezing an approved plan — so your assistant writes correct branching, diff and merge SQL
+> from a plain-English request. Install with
+> `/plugin marketplace add DataZooDE/anofox-scenario` → `/plugin install anofox-scenario@anofox-scenario`.
 
 ### Is this for you?
 
@@ -280,7 +288,8 @@ scenario_create()                      Register a scenario
 | `SELECT * FROM scenario_diff_summary(scenario)` | Per-table `rows_added / rows_modified / rows_removed` |
 
 Diffs stream through the engine, so filters and aggregates compose normally and PK columns
-keep their native types. Requires a PK or a declared `key_columns` on the table.
+keep their native types. Tables without a PK or a declared `key_columns` are compared as bags
+of rows: every column is the identity and a changed row shows as `removed` + `added`.
 
 ### Merge-Back
 
@@ -294,6 +303,7 @@ keep their native types. Requires a PK or a declared `key_columns` on the table.
 There is no separate snapshot or protocol API. For an immutable point-in-time capture, create a
 materialized scenario and freeze it:
 
+<!-- doc-snippets: new session -->
 ```sql
 CALL scenario_create('q2_approved', mode := 'materialized');
 CALL scenario_freeze('q2_approved');
@@ -304,6 +314,37 @@ For audit notes, use a plain table — see the recipe in
 
 For complete API documentation, including isolation tiers and current limitations, see
 [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+
+---
+
+## 🤖 Claude Code Skills (AI pair-programming)
+
+**Branching is easier when your AI assistant knows the semantics.** anofox-scenario ships an
+installable [Claude Code](https://claude.com/claude-code) plugin. Its skills are organised by
+what you are trying to do rather than by function, and every SQL example in them is executed
+against the extension before a release. Ask for *"model US demand +10% and EU -20% as two
+variants and compare them by region"* or *"dry-run this price import, show me the diff, and
+merge it with base winning conflicts"*, and Claude writes the `scenario_create` / `ATTACH` /
+`scenario_diff` / `scenario_merge` SQL.
+
+Install in any Claude Code session:
+
+```
+/plugin marketplace add DataZooDE/anofox-scenario
+/plugin install anofox-scenario@anofox-scenario
+```
+
+| Skill | Use it to |
+|-------|-----------|
+| `anofox-scenario-what-if` | Build plan variants (S&OP, budgets), branch them, compare KPIs and rows across variants, forecast per scenario with `anofox_forecast` |
+| `anofox-scenario-safe-change` | Dry-run an ETL step, migration or bulk fix, review the diff and merge preview, merge with a conflict policy or discard |
+| `anofox-scenario-snapshot-audit` | Freeze an approved plan, pin to a DuckLake snapshot, see what changed since approval, keep audit notes |
+| `anofox-scenario-reference` | Look up signatures, row identity, constraints, transactions and concurrency, and the cause and fix for each error message |
+
+The skills live in [`plugins/anofox-scenario/`](plugins/anofox-scenario/). For in-repo
+development, load them directly with `claude --plugin-dir ./plugins/anofox-scenario`.
+Combine with the [anofox-forecast plugin](https://github.com/DataZooDE/anofox-forecast#-claude-code-skills-ai-pair-programming)
+for forecasting inside scenarios.
 
 ---
 
