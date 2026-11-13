@@ -141,12 +141,12 @@ void MigrateDeltaTable(ClientContext &context, Catalog &host, DuckTableEntry &le
 	};
 	for (auto &key : insertion_order) {
 		auto &row = folded[key];
-		chunk.SetValue(ScenarioDelta::OP_COL, count, Value(string(1, row.op)));
-		chunk.SetValue(ScenarioDelta::TS_COL, count,
-		               row.ts == timestamp_t(0) ? Value::TIMESTAMP(Timestamp::GetCurrentTimestamp())
-		                                        : Value::TIMESTAMP(row.ts));
+		chunk.data[ScenarioDelta::OP_COL].SetValue(count, Value(string(1, row.op)));
+		chunk.data[ScenarioDelta::TS_COL].SetValue(count, row.ts == timestamp_t(0)
+		                                                      ? Value::TIMESTAMP(Timestamp::GetCurrentTimestamp())
+															  : Value::TIMESTAMP(row.ts));
 		for (idx_t i = 0; i < row.payload.size(); i++) {
-			chunk.SetValue(ScenarioDelta::PAYLOAD_START + i, count, row.payload[i]);
+			chunk.data[ScenarioDelta::PAYLOAD_START + i].SetValue(count, row.payload[i]);
 		}
 		if (++count == STANDARD_VECTOR_SIZE) {
 			flush();
@@ -170,8 +170,8 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 	auto legacy_registry = TryGetMainTable(context, host, DEFAULT_SCHEMA, "_scenario_registry");
 	auto legacy_snapshots = TryGetMainTable(context, host, DEFAULT_SCHEMA, "_scenario_snapshots");
 	if (!legacy_registry && !legacy_snapshots) {
-		output.SetValue(0, 0, Value::BIGINT(0));
-		output.SetValue(1, 0, Value::BIGINT(0));
+		output.data[0].SetValue(0, Value::BIGINT(0));
+		output.data[1].SetValue(0, Value::BIGINT(0));
 		output.SetChildCardinality(1);
 		return;
 	}
@@ -343,8 +343,8 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 	DropTable(context, host, DEFAULT_SCHEMA, "_scenario_snapshots");
 	// _scenario_protocols is intentionally preserved (portable audit trail)
 
-	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(migrated_scenarios)));
-	output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(migrated_snapshots)));
+	output.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(migrated_scenarios)));
+	output.data[1].SetValue(0, Value::BIGINT(NumericCast<int64_t>(migrated_snapshots)));
 	output.SetChildCardinality(1);
 }
 

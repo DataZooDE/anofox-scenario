@@ -501,13 +501,13 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 			for (idx_t out_idx = 0; out_idx < delta_pos_for_output.size(); out_idx++) {
 				auto pos = delta_pos_for_output[out_idx];
 				if (pos == DELTA_OUT_NULL) {
-					append_chunk.SetValue(out_idx, append_count, Value(LogicalType::ROW_TYPE));
+					append_chunk.data[out_idx].SetValue(append_count, Value(LogicalType::ROW_TYPE));
 				} else if (pos == DELTA_OUT_ORIGIN) {
-					append_chunk.SetValue(out_idx, append_count, Value::TINYINT(1));
+					append_chunk.data[out_idx].SetValue(append_count, Value::TINYINT(1));
 				} else if (pos == DELTA_OUT_ROWNO) {
-					append_chunk.SetValue(out_idx, append_count, Value::BIGINT(delta_rowno++));
+					append_chunk.data[out_idx].SetValue(append_count, Value::BIGINT(delta_rowno++));
 				} else {
-					append_chunk.SetValue(out_idx, append_count, chunk.GetValue(pos, row));
+					append_chunk.data[out_idx].SetValue(append_count, chunk.GetValue(pos, row));
 				}
 			}
 			if (++append_count == STANDARD_VECTOR_SIZE) {
@@ -601,7 +601,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 							point_lookup = false;
 							break;
 						}
-						point_keys.SetValue(k, row, cast_value);
+						point_keys.data[k].SetValue(row, cast_value);
 					}
 				}
 				point_keys.SetChildCardinality(point_key_count);
@@ -731,7 +731,7 @@ unique_ptr<GlobalTableFunctionState> ScenarioScanInitGlobal(ClientContext &conte
 				if (bag_pair.second.net > 0) {
 					value_chunk.Reset();
 					for (idx_t col = 0; col < column_count; col++) {
-						value_chunk.SetValue(col, 0, bag_pair.second.row_values[col]);
+						value_chunk.data[col].SetValue(0, bag_pair.second.row_values[col]);
 					}
 					value_chunk.SetChildCardinality(1);
 					for (int64_t n = 0; n < bag_pair.second.net; n++) {

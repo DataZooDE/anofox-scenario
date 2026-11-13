@@ -152,7 +152,7 @@ public:
 			for (idx_t i = 0; i < batch; i++) {
 				auto &row = rows[offset + i];
 				for (idx_t col = 0; col < row.size(); col++) {
-					pre_chunk.SetValue(col, i, row[col]);
+					pre_chunk.data[col].SetValue(i, row[col]);
 				}
 			}
 			pre_chunk.SetChildCardinality(batch);
@@ -336,10 +336,10 @@ public:
 			for (idx_t i = 0; i < deleted_rows.size(); i++) {
 				// every column must hold a value, not just the payload
 				for (idx_t col = 0; col < delta_types.size(); col++) {
-					deleted_chunk.SetValue(col, i, Value(delta_types[col]));
+					deleted_chunk.data[col].SetValue(i, Value(delta_types[col]));
 				}
 				for (idx_t col = 0; col < deleted_rows[i].size(); col++) {
-					deleted_chunk.SetValue(ScenarioDelta::PAYLOAD_START + col, i, deleted_rows[i][col]);
+					deleted_chunk.data[ScenarioDelta::PAYLOAD_START + col].SetValue(i, deleted_rows[i][col]);
 				}
 			}
 			deleted_chunk.SetChildCardinality(deleted_rows.size());
@@ -351,13 +351,13 @@ public:
 			idx_t batch = MinValue<idx_t>(rows.size() - offset, STANDARD_VECTOR_SIZE);
 			for (idx_t i = 0; i < batch; i++) {
 				auto &row = rows[offset + i];
-				delta_chunk.SetValue(ScenarioDelta::OP_COL, i, Value(string(1, ops[offset + i])));
-				delta_chunk.SetValue(ScenarioDelta::TS_COL, i, Value::TIMESTAMP(now));
+				delta_chunk.data[ScenarioDelta::OP_COL].SetValue(i, Value(string(1, ops[offset + i])));
+				delta_chunk.data[ScenarioDelta::TS_COL].SetValue(i, Value::TIMESTAMP(now));
 				for (idx_t col = 0; col < row.size(); col++) {
-					delta_chunk.SetValue(ScenarioDelta::PAYLOAD_START + col, i, row[col]);
+					delta_chunk.data[ScenarioDelta::PAYLOAD_START + col].SetValue(i, row[col]);
 				}
 				if (delta_count_column.IsValid()) {
-					delta_chunk.SetValue(delta_count_column.GetIndex(), i, Value::BIGINT(1));
+					delta_chunk.data[delta_count_column.GetIndex()].SetValue(i, Value::BIGINT(1));
 				}
 			}
 			delta_chunk.SetChildCardinality(batch);
@@ -410,7 +410,7 @@ SourceResultType ScenarioDMLGetData(const ScenarioDMLGlobalState &gstate, bool r
 		return SourceResultType::FINISHED;
 	}
 	source.count_emitted = true;
-	chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.affected_count)));
+	chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(gstate.affected_count)));
 	chunk.SetChildCardinality(1);
 	return SourceResultType::FINISHED;
 }
@@ -905,7 +905,7 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 			out_chunk.Initialize(Allocator::Get(client), entry.GetTypes());
 			for (idx_t i = 0; i < bag_rows.size(); i++) {
 				for (idx_t col = 0; col < column_count; col++) {
-					out_chunk.SetValue(col, i, bag_rows[i][col]);
+					out_chunk.data[col].SetValue(i, bag_rows[i][col]);
 				}
 			}
 			out_chunk.SetChildCardinality(bag_rows.size());
@@ -1055,7 +1055,7 @@ SinkResultType PhysicalScenarioDelete::Sink(ExecutionContext &context, DataChunk
 		out_chunk.Initialize(Allocator::Get(client), entry.GetTypes());
 		for (idx_t i = 0; i < returning_rows.size(); i++) {
 			for (idx_t col = 0; col < column_count; col++) {
-				out_chunk.SetValue(col, i, returning_rows[i][col]);
+				out_chunk.data[col].SetValue(i, returning_rows[i][col]);
 			}
 		}
 		out_chunk.SetChildCardinality(returning_rows.size());
