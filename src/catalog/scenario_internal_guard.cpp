@@ -197,7 +197,7 @@ void ScenarioInternalGuard::Check(ClientContext &context, PreparedStatementData 
 	throw PermissionException(
 	    "Cannot modify %s with SQL (%s): the %s schema holds the scenario registry and the scenario data, which SQL "
 	    "may only read. Change scenarios with the scenario functions (scenario_create, scenario_drop, "
-	    "scenario_freeze, scenario_unfreeze, scenario_refresh, scenario_merge, ...) or write through an attached "
+	    "scenario_freeze, scenario_unfreeze, scenario_merge, ...) or write through an attached "
 	    "scenario. For backup/restore or manual repair: SET %s = true",
 	    finder.target, finder.statement, ScenarioRegistry::SCHEMA_NAME, SETTING_NAME);
 }
