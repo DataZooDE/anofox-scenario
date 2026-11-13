@@ -22,6 +22,7 @@ namespace dc = duckdb_compat;
 #include "duckdb/execution/index/art/art.hpp"
 #include "duckdb/execution/operator/persistent/physical_merge_into.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/execution/index/art/art_key.hpp"
 #include "duckdb/execution/index/art/art_operator.hpp"
 #include "duckdb/execution/index/art/iterator.hpp"
@@ -729,6 +730,42 @@ inline PhysicalOperator &MakeMergeInto(PhysicalPlanGenerator &planner, vector<Lo
                                        optional_idx source_marker, bool parallel, bool return_chunk) {
 	return detail::MakeMergeInto(planner, types, child, actions, row_id_index, source_marker, parallel, return_chunk,
 	                             0);
+}
+
+//===--------------------------------------------------------------------===//
+// ALTER TABLE ... ADD COLUMN on an internal table (#62)
+//===--------------------------------------------------------------------===//
+// 1.5.6: AlterEntryData(catalog, schema, name, if_not_found) and
+// AddColumnInfo(data, column, if_column_not_exists); 2.0: AlterEntryData
+// over a QualifiedName of Identifiers, and AddColumnInfo takes the column's
+// AddColumnConstraints as well (none here).
+namespace detail {
+template <class D = AlterEntryData, class QN = QualifiedName>
+auto MakeAlterEntryData(const string &catalog, const string &schema, const string &name, int)
+    -> decltype(D(QN(dc::Ident(catalog), dc::Ident(schema), dc::Ident(name)), OnEntryNotFound::THROW_EXCEPTION)) {
+	return D(QN(dc::Ident(catalog), dc::Ident(schema), dc::Ident(name)), OnEntryNotFound::THROW_EXCEPTION);
+}
+template <class D = AlterEntryData>
+D MakeAlterEntryData(const string &catalog, const string &schema, const string &name, long) {
+	return D(catalog, schema, name, OnEntryNotFound::THROW_EXCEPTION);
+}
+template <class T = AddColumnInfo>
+auto MakeAddColumnInfo(const AlterEntryData &data, ColumnDefinition column, int)
+    -> decltype(std::declval<T &>().add_column_constraints, unique_ptr<AlterInfo>()) {
+	using CONSTRAINTS = typename std::decay<decltype(std::declval<T &>().add_column_constraints)>::type;
+	return make_uniq<T>(data, std::move(column), false, CONSTRAINTS());
+}
+template <class T = AddColumnInfo>
+unique_ptr<AlterInfo> MakeAddColumnInfo(const AlterEntryData &data, ColumnDefinition column, long) {
+	return make_uniq<T>(data, std::move(column), false);
+}
+} // namespace detail
+
+//! ALTER TABLE catalog.schema.table ADD COLUMN <column>
+inline unique_ptr<AlterInfo> MakeAddColumnInfo(const string &catalog, const string &schema, const string &table,
+                                               ColumnDefinition column) {
+	auto data = detail::MakeAlterEntryData(catalog, schema, table, 0);
+	return detail::MakeAddColumnInfo(data, std::move(column), 0);
 }
 
 } // namespace scenario_compat

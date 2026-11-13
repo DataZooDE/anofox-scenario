@@ -60,6 +60,14 @@ public:
 	//! Publish entry under name unless another thread got there first; returns
 	//! whichever entry is cached
 	CatalogEntry &PublishEntry(const string &name, unique_ptr<CatalogEntry> entry, bool enumeration = false);
+	//! Replace the cached entry for name - a base table altered by this very
+	//! transaction (#62) - unless another thread replaced it first. The old
+	//! entry stays alive until the transaction ends: plans bound before the
+	//! ALTER may still reference it.
+	CatalogEntry &ReplaceEntry(const string &name, CatalogEntry &stale, unique_ptr<CatalogEntry> entry,
+	                           bool enumeration = false);
+	//! Entries replaced by ReplaceEntry, kept alive for the transaction
+	vector<unique_ptr<CatalogEntry>> retired_entries;
 	//! Process-unique id of this transaction; feeds ScenarioCatalog::GetCatalogVersion
 	idx_t serial;
 };

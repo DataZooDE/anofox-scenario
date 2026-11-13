@@ -1,15 +1,16 @@
 ---
 name: anofox-scenario-reference
 description: >
-  Reference for the anofox_scenario DuckDB extension: every function signature and result
-  column, how scenario tables behave (row identity, keyless bag semantics, merged-state
-  constraints, DDL rejection, transactions, concurrency, read-only and frozen checks,
-  __scenario_* virtual columns, table-name quoting, settings), and an error message ->
-  cause -> fix table. Use when a scenario statement fails with an error, when the exact
-  signature or output columns of scenario_create / scenario_drop / scenario_freeze /
-  scenario_unfreeze / scenario_list / scenario_diff / scenario_diff_summary /
-  scenario_merge_preview / scenario_merge / scenario_refresh / scenario_migrate are
-  needed, or when a question is about edge-case semantics rather than a workflow.
+  Supplementary lookup for the anofox_scenario DuckDB extension, loaded alongside a workflow
+  skill or when a scenario statement fails. Error message -> cause -> fix table; every
+  signature and output column (scenario_create, scenario_list, scenario_diff,
+  scenario_diff_summary, scenario_merge_preview, scenario_merge, scenario_freeze,
+  scenario_unfreeze, scenario_drop, scenario_refresh, scenario_migrate); settings (telemetry
+  opt-out, suppression hash limit, internal writes); which base edits a merge does not
+  detect; transactions; ATTACH ... (TYPE scenario) and USE; keyless tables, views, row
+  identity; which tables a scenario changed; using a scenario from Python; sharing one with
+  a colleague. Not a workflow on its own: plan variants -> anofox-scenario-what-if, dry run
+  and merge -> anofox-scenario-safe-change, approved versions -> anofox-scenario-snapshot-audit.
 version: 2026.11.13
 user-invocable: false
 ---
@@ -18,9 +19,44 @@ user-invocable: false
 
 **Extension:** `anofox_scenario` v2026.11.13 | **DuckDB:** v1.5.5+ and v2.0
 
-Workflows live in `anofox-scenario-what-if`, `anofox-scenario-safe-change` and
-`anofox-scenario-snapshot-audit`. This page is the lookup table behind them. The complete
-specification is `docs/API_REFERENCE.md` in the repository.
+Lookup table behind the workflow skills `anofox-scenario-what-if`,
+`anofox-scenario-safe-change` and `anofox-scenario-snapshot-audit`. Longer semantics, Python
+and sharing: [behaviour.md](behaviour.md). Full specification: `docs/API_REFERENCE.md`.
+
+**Ask first.** Fixes marked *(ask first)* merge into the real tables, drop a scenario,
+unfreeze an approved one or pick a conflict winner. Name the target and the consequence and
+get the user's yes, unless they already asked for exactly that. Never choose `'ours'` /
+`'theirs'` just to make an error go away.
+
+## Errors: cause and fix
+
+Rarer errors (`key_columns`, DuckLake pins, creation options, policy typos): [behaviour.md](behaviour.md), "More errors".
+
+| Error contains | Cause | Fix |
+|---|---|---|
+| `Scenario '…' not found` (any scenario function) | a typo, or `USE <scenario alias>` is active and the functions search the scenario catalog (also: empty `scenario_list()`, DDL error from `scenario_create`) | check `scenario_list()`; after `USE alias`, `USE <host db>` (`memory` or the file's stem); prefer `alias.t` |
+| `Scenario '…' not found in database '…'` (ATTACH) | not in the session's default database | create it, or `USE` the database holding it |
+| `DDL operations are not permitted in scenarios` | `CREATE` / `ALTER` / `DROP` on a scenario catalog | change the base schema ("Schema changes" below) |
+| `Cannot … table '…': scenario '…' has unmerged changes to it` | base `DROP COLUMN` / `RENAME COLUMN` / column type change / `RENAME TO` / `DROP TABLE` on a table a scenario changed | merge the scenario (or drop it, *ask first*), then change the base; `ADD COLUMN` works anyway |
+| `Scenario '…' cannot use table '…'` | the base table changed shape without the extension loaded (another process, plain DuckDB) | for a gained column: `DETACH`, then `ATTACH` the scenario in autocommit; for a dropped/renamed/retyped column: restore it, or drop the scenario *(ask first)* |
+| `Cannot modify … with SQL` | SQL write/DDL on `__anofox_scenario` (also `IMPORT DATABASE` / `COPY FROM DATABASE` with scenarios) | use the functions; for restore/repair set `anofox_scenario_allow_internal_writes`, then `RESET` |
+| `Scenario '…' already exists` | name taken | pick another name, or `scenario_drop` the old one *(ask first)* |
+| `Invalid scenario name` / `exceeds the maximum length of 63 characters` | letters, digits, `_` only, starting with a letter or `_`, ≤ 63 chars | e.g. `price_import` instead of `price-import` |
+| `is attached as '…'. DETACH it before dropping` | `scenario_drop` of an attached scenario | `DETACH alias`, then drop *(ask first)* |
+| `other scenarios branch from it` | drop or merge of a scenario with branches | drop the branches first *(ask first)*; a merged branch counts until dropped |
+| `is frozen. Unfreeze it with CALL scenario_unfreeze` | write to a frozen scenario | branch it with `from_scenario`; or unfreeze *(ask first, log why)* |
+| `is frozen. Unfreeze it before merging` | `scenario_merge` of a frozen scenario | unfreeze *(ask first)*, then merge *(ask first)* |
+| `was already merged back into the base` | second merge, or unfreeze of a merged scenario (`merged_at` is set in `scenario_list()`) | nothing to do; a new scenario for further changes |
+| `the base changed underneath it` | merge conflict under `on_conflict := 'abort'` (overlay or drift, keyed or keyless) | show `scenario_merge_preview(s)` `WHERE conflict`; the user picks `'ours'` / `'theirs'` *(ask first)* or redoes the change over the current base |
+| `Violates foreign key constraint` (merge) | a merged row references a parent missing in the base | add the parent to the scenario or base; nothing was applied |
+| `is still referenced by a foreign key` (merge) | the scenario deletes a parent row with its children, or changes a referenced key | merge the child changes first in a scenario of their own |
+| `the key exists in the base table` / `the key was already inserted or modified in this scenario` | `INSERT` of an existing key | `UPDATE`, `INSERT OR REPLACE` / `ON CONFLICT`, or delete it first |
+| `UNIQUE constraint on scenario table` / `NOT NULL constraint failed` / `CHECK constraint failed` | the merged row violates a base constraint | fix the values |
+| `modified the same row twice` | one statement updates a row through several source rows | deduplicate the source (`DISTINCT ON`, aggregate) |
+| `There are no UNIQUE/PRIMARY KEY constraints that refer to this table` | `ON CONFLICT` / `INSERT OR REPLACE` on a keyless table | `MERGE INTO`, or a PK on the base table |
+| `attached in read-only mode` / `transaction is launched in read-only mode` | write through `READ_ONLY` / in `BEGIN TRANSACTION READ ONLY` | re-`ATTACH` without `READ_ONLY` / read-write transaction |
+| `this transaction already modified database` | the transaction already wrote another attached database | commit first; host + its scenarios count as one database |
+| `Cannot change configuration option` | `SET` after `SET lock_configuration = true` | set options (telemetry opt-out) before locking |
 
 ## Functions
 
@@ -28,142 +64,70 @@ Every verb is a table function: `CALL f(...)` and `SELECT * FROM f(...)` both wo
 
 | Call | Returns | Notes |
 |---|---|---|
-| `scenario_create(name, [description], mode := 'delta'\|'materialized', from_scenario := parent, base := catalog, key_columns := MAP {'table': ['col', ...]})` | `success` | Name: letters, digits and `_` only, starting with a letter or `_`, at most 63 characters. `delta` (default) is O(1). `materialized` copies every base table. `from_scenario` branches: a delta scenario over the parent's current state that inherits its changes, declared keys, base catalog and DuckLake snapshot. `base` uses another attached catalog as the base (DuckLake: pinned to creation time). `from_scenario` and `base` each exclude `mode := 'materialized'`, and each other. `key_columns` gives keyless tables a row identity. |
-| `scenario_drop(name)` | `success` | Removes deltas, copies and declared keys. Refuses while attached or while branches exist. |
-| `scenario_freeze(name)` / `scenario_unfreeze(name)` | `success` | Rejects / allows writes through every scenario handle; reads keep working. A merged scenario cannot be unfrozen. SQL on the internal `__anofox_scenario` tables cannot undo it: that schema is read-only for SQL (see Storage below). |
-| `scenario_list()` | `scenario_id, name, mode, frozen, parent, created_at, description` | `parent` is the parent's name. |
-| `ATTACH 'name' AS alias (TYPE scenario [, READ_ONLY])` / `DETACH alias` | | The whole read/write surface. `USE alias` makes unqualified table names resolve to the scenario. |
-| `scenario_diff(scenario, table)` | `<key columns>, change_type, column_name, old_value, new_value` | Scenario vs. its origin. Key columns keep their types; values are VARCHAR. `change_type`: `added` / `removed` / `modified` (one row per changed column). |
-| `scenario_diff(a, b, table)` | same | Any two sides; `'main'` = the base table. `old` = `a`, `new` = `b`. When either side is a scenario over a DuckLake base, `'main'` is the lake table *at that scenario's snapshot*, not the live lake. |
-| `scenario_diff_summary(scenario)` | `table_name, rows_added, rows_modified, rows_removed` | One row per table the scenario has written. |
-| `scenario_merge_preview(scenario)` | `table_name, key, action, conflict` | No side effects. `action`: `insert` / `update` / `delete`; `key` as text. |
-| `scenario_merge(scenario, on_conflict := 'abort'\|'ours'\|'theirs')` | `tables_changed, rows_applied, conflicts_resolved` | Applies the delta to the base; the scenario ends frozen, `merged_at` set, delta empty. Works while attached. A branch's merge includes its parent's changes. A base edit to a row the scenario updated or deleted is a conflict (drift), in every mode; delta scenarios compare with the row as it was at their first touch (keyed tables). Referenced tables are applied first. |
-| `scenario_refresh(name, key_columns := MAP {...})` | `refreshed_tables` | **Deprecated.** Only still needed to declare `key_columns` for a keyless table the scenario has not written yet. |
+| `scenario_create(name, [description], mode := 'delta'\|'materialized', from_scenario := parent, base := catalog, key_columns := MAP {'t': ['col', ...]})` | `success` | Unbranched delta (default): one registry row. `materialized`: copies every base table. `from_scenario`: a delta over the parent's current state that copies the parent's existing deltas and pre-images, declared keys, base catalog and DuckLake pin. `base`: another attached catalog as base (DuckLake: pinned to creation time). `materialized` excludes `from_scenario` and `base`, which also exclude each other. |
+| `scenario_drop(name)` | `success` | Removes deltas, copies, declared keys. Refuses while attached or while branches exist. |
+| `scenario_freeze(name)` / `scenario_unfreeze(name)` | `success` | Rejects / allows writes through every handle; reads keep working. A merged scenario stays frozen. |
+| `scenario_list()` | `scenario_id, name, mode, frozen, parent, created_at, description, merged_at` | `parent` is the parent's name; `merged_at` is NULL until merged. Run it from the host database, not after `USE alias`. |
+| `ATTACH 'name' AS alias (TYPE scenario [, READ_ONLY])` / `DETACH alias` | | The read/write surface: `alias.t`. Per connection; re-attach in every new session. |
+| `scenario_diff(scenario, table)` | `<key columns>, change_type, column_name, old_value, new_value` | Scenario vs. its origin. One row per changed column (`modified`) or per `added` / `removed` key; values as text, no values for `removed`. |
+| `scenario_diff(a, b, table)` | same | `old` = `a`, `new` = `b`; `'main'` = the base table (for a DuckLake scenario: at its pinned snapshot). |
+| `scenario_diff_summary(scenario)` | `table_name, rows_added, rows_modified, rows_removed` | One row per table the scenario wrote: "which tables did it touch". |
+| `scenario_merge_preview(scenario)` | `table_name, key, action, conflict` | No side effects. `key` as text; keyless tables list one row per copy, `key` = the whole row. |
+| `scenario_merge(scenario, on_conflict := 'abort'\|'ours'\|'theirs')` | `tables_changed, rows_applied, conflicts_resolved` | Applies the delta. On success: frozen, `merged_at` set, delta empty. An empty plan (preview lists no rows) is a no-op: `0, 0, 0`, the scenario stays open and unfrozen. A branch's merge includes its parent's changes. Referenced tables first. Drift exceptions below. |
+| `scenario_refresh(name, key_columns := MAP {...})` | `refreshed_tables` | Deprecated; only to declare `key_columns` for a keyless table not written yet. |
 | `scenario_migrate()` | `migrated_scenarios, migrated_snapshots` | One-way upgrade of a v0.1 database. |
 
-Setting: `anofox_scenario_suppression_hash_limit` (default `4194304`): the most updated or
-deleted keys per table kept in an in-memory hash for scans. Above it scans look keys up in the
-delta's index instead (less memory, no parallel scan). `0` always uses the index.
+## Settings
 
-## How scenario tables behave
-
-**Storage.** Everything lives in the host database (the session's default database at
-`scenario_create` / `ATTACH` time) under the `__anofox_scenario` schema: the registry, one delta
-table per (scenario, table) created by that table's first write, and for materialized
-scenarios a copy per table. Copying the `.duckdb` file copies its scenarios. That schema is
-read-only for SQL: `SELECT` works, but `INSERT` / `UPDATE` / `DELETE` / DDL on it fail with
-`Cannot modify … with SQL` (only the scenario functions and attached scenarios change it). For
-`IMPORT DATABASE` of an export that contains scenarios, manual repair, or wiping all scenarios,
-`SET anofox_scenario_allow_internal_writes = true` on that connection, then `RESET` it.
-`EXPORT DATABASE` needs no setting.
-
-**Reads.** A scenario table is the base table with the scenario's inserts, updates and
-deletes applied (delta mode reads the live base; materialized reads its copy; DuckLake reads
-the pinned snapshot). Tables added to the base later are readable and writable in delta
-scenarios without any extra step.
-
-**Row identity** is fixed by a table's first write in the scenario: the declared
-`key_columns`, else the base PRIMARY KEY, else none (keyless).
-
-```sql
-CREATE TABLE events (event_id INTEGER, kind VARCHAR, amount INTEGER);   -- no PRIMARY KEY
-INSERT INTO events VALUES (1, 'sale', 10), (2, 'sale', 10), (3, 'refund', -5);
-CALL scenario_create('keyed', key_columns := MAP {'events': ['event_id']});
-```
-
-**Keyless tables** (no PK, no `key_columns`) behave like a bag of rows, as in plain DuckDB:
-`UPDATE` / `DELETE` / `MERGE` act on every matching copy, `scenario_diff` uses all columns as
-the identity (a changed row is `removed` + `added`, duplicates appear once per copy), and the
-merge applies net copy counts per distinct row.
-
-**Constraints.** The base's `NOT NULL`, `CHECK`, `PRIMARY KEY` and `UNIQUE` constraints are
-checked against the scenario's merged state, with different messages for collisions with base
-rows and with the scenario's own rows. A unique value whose base row the scenario deleted or
-changed is free again. `FOREIGN KEY`s are not checked inside a scenario; `scenario_merge`
-checks them against the base and rolls back as a whole on a violation.
-
-**DDL** (`CREATE` / `ALTER` / `DROP` on a scenario catalog) is always rejected. Change the base.
-
-**Repeated matches in one statement.** If an `UPDATE ... FROM`, `MERGE` or similar matches the
-same target row several times, repeated *deletes* count once (as in DuckDB), but a second
-*update* of the same row fails with `modified the same row twice` and the statement leaves
-no trace. Plain DuckDB silently picks one match. Deduplicate the source first.
-
-**Transactions.** Scenario writes run in the caller's transaction; `ROLLBACK` undoes them,
-including a table's first write. Host writes and writes to any number of scenarios on the same
-host may share one transaction and commit atomically:
-
-```sql
-CREATE TABLE orders (id INTEGER PRIMARY KEY, status VARCHAR);
-INSERT INTO orders VALUES (1, 'open');
-CALL scenario_create('ops');
-ATTACH 'ops' AS ops (TYPE scenario);
-
-BEGIN;
-INSERT INTO orders VALUES (2, 'open');           -- host
-UPDATE ops.orders SET status = 'closed';         -- scenario, sees row 2
-COMMIT;
-SELECT * FROM ops.orders ORDER BY id;
-```
-
-Writing to a *different* attached database in the same transaction is refused (DuckDB's
-one-writer-per-transaction rule). Writes in a `READ ONLY` transaction, through a `READ_ONLY`
-attachment or to a frozen scenario fail when the statement executes, even if it would change
-zero rows; a statement prepared in such a state runs once the executing transaction allows it.
-
-**Concurrency.** A transaction reads its own snapshot of a scenario. Two transactions changing
-the same keys get DuckDB's normal write-write conflict. Two transactions making the *first*
-write to the same scenario table at once: the second gets a retryable `TransactionException`;
-retry after the first commits.
-
-**Virtual columns.** Scenario tables expose `__scenario_origin` (0 = base row, 1 = scenario
-row), `__scenario_key_<k>` and, on keyless tables, `__scenario_rowno`. They can be selected and
-filtered on but are not stable identifiers (`__scenario_rowno` is renumbered by every scan).
-
-```sql
-SELECT __scenario_origin, * FROM ops.orders ORDER BY id;
-```
-
-**Table names as strings** (`scenario_diff`'s table argument, `key_columns` keys,
-`table_name` output columns): `t` and `main.t` are the same; other schemas are `schema.table`;
-a name part containing a dot is double-quoted: `'"a.b"'` is the main table `a.b`.
-
-## Errors: cause and fix
-
-| Error contains | Cause | Fix |
+| Setting | Default | Meaning |
 |---|---|---|
-| `DDL operations are not permitted in scenarios` | `CREATE` / `ALTER` / `DROP` against a scenario catalog | change the base schema; new base tables appear in delta scenarios automatically |
-| `Cannot modify … with SQL` | plain SQL writes or DDL on the internal `__anofox_scenario` schema (also `IMPORT DATABASE` of an export with scenarios, `COPY FROM DATABASE` of a database with scenarios) | use the scenario functions; for restore or repair `SET anofox_scenario_allow_internal_writes = true`, then `RESET` it |
-| `Scenario '…' not found in database '…'` (ATTACH) | no scenario with that name in the session's default database | `CALL scenario_create('…')` first, or `USE` the database that holds it |
-| `Scenario '…' already exists` | name taken | pick another name or `scenario_drop` the old one |
-| `Invalid scenario name` | only letters, digits and `_`, starting with a letter or `_` (`price-import` fails) | rename, e.g. `price_import` |
-| `exceeds the maximum length of 63 characters` | scenario name too long | shorten it |
-| `is attached as '…'. DETACH it before dropping` | `scenario_drop` on an attached scenario | `DETACH alias` first |
-| `other scenarios branch from it` | drop or merge of a scenario with branches | drop the branches first; a merged branch still counts until it is dropped |
-| `is frozen. Unfreeze it with CALL scenario_unfreeze` | write to a frozen scenario | `scenario_unfreeze` (record why), or branch with `from_scenario` |
-| `is frozen. Unfreeze it before merging` | `scenario_merge` on a frozen scenario | unfreeze, then merge |
-| `was already merged back into the base` | second `scenario_merge`, or `scenario_unfreeze` of a merged scenario | nothing to do; create a new scenario for further changes |
-| `the base changed underneath it` | merge conflict with `on_conflict := 'abort'` | inspect `scenario_merge_preview`, then rerun with `'ours'` or `'theirs'` |
-| `Violates foreign key constraint` (at merge) | a merged row references a parent missing in the base (and not added by the scenario) | add the parent row to the scenario or the base, then merge again; nothing was applied |
-| `is still referenced by a foreign key` (at merge) | the scenario deletes a referenced parent row together with its children (DuckDB refuses that in one transaction), or changes a referenced row's key or another indexed column | merge the child changes first in a scenario of their own, then the parent's |
-| `the key exists in the base table` | INSERT of a key the base already has | `UPDATE`, `INSERT OR REPLACE` / `ON CONFLICT`, or delete it in the scenario first |
-| `the key was already inserted or modified in this scenario` | INSERT of a key the scenario already wrote | same as above |
-| `UNIQUE constraint on scenario table` | duplicate unique value vs. base or scenario rows | as for keys |
-| `NOT NULL constraint failed` / `CHECK constraint failed` | merged row violates the base's constraint | fix the value |
-| `modified the same row twice` | one statement updates the same target row through several source rows | deduplicate the source (`DISTINCT ON`, aggregate) |
-| `There are no UNIQUE/PRIMARY KEY constraints that refer to this table` | `ON CONFLICT` / `INSERT OR REPLACE` on a table without a unique target | add a `UNIQUE` / PK to the base table, or use `MERGE INTO` |
-| `attached in read-only mode` | write through a `READ_ONLY` attachment | re-`ATTACH` without `READ_ONLY` |
-| `transaction is launched in read-only mode` | write inside `BEGIN TRANSACTION READ ONLY` | use a read-write transaction |
-| `this transaction already modified database` | the transaction already wrote another attached database | commit that first; one transaction writes one database (host + its scenarios count as one) |
-| `concurrently made the first write to table` | two transactions created the same delta at once | `ROLLBACK` and retry |
-| `key_columns declared for table '…', but it already has a PRIMARY KEY` | the base PK is the identity already | drop that entry from `key_columns` |
-| `key_columns declared for unknown table` / `column '…' does not exist` / `is listed twice` | typo in `key_columns` | fix the map (table names as above) |
-| `declared key column '…' no longer exists in the base table` | key column renamed or dropped in the base before the table's first write | re-declare with `scenario_refresh(name, key_columns := ...)` |
-| `the table is not in the scenario's base snapshot` | DuckLake table created after the scenario's snapshot | create a new scenario over the lake's current state |
-| `changed after the scenario's base snapshot` | DuckLake table's columns changed after the snapshot | same |
-| `Base catalog '…' is not attached` | `base :=` names a catalog that is not attached | `ATTACH` it first |
-| `Table '…' not found in scenario '…'` | `scenario_diff` table argument not in the base | check the name / schema quoting |
-| `Invalid scenario mode` | `mode :=` other than `'delta'` / `'materialized'` | use one of those |
-| `Branching (from_scenario) and mode := 'materialized' cannot be combined` | a branch is always a delta over its parent | branch without `mode`, or materialize from the base |
-| `cannot be combined with materialized mode or branching` | `base :=` with `mode := 'materialized'` or `from_scenario` | for a DuckLake base the snapshot pin already isolates; drop `mode` |
-| `Cannot branch from scenario '…': not found` | `from_scenario` names a missing scenario | check `scenario_list()` |
+| `anofox_scenario_telemetry_enabled` | `true` | Anonymous usage telemetry (`extension_loaded`: version, platform). Opt out with `SET anofox_scenario_telemetry_enabled = false` after `LOAD`, **before** `SET lock_configuration = true`. The load event itself fires during `LOAD`: to stop it too, set env `DATAZOO_DISABLE_TELEMETRY=1`. Off in CI. |
+| `anofox_scenario_suppression_hash_limit` | `4194304` | Updated/deleted keys per table hashed in memory for scans (~16 bytes each). Above it, scans probe the delta's index: less memory, no parallel scan. `0` = always the index. |
+| `anofox_scenario_allow_internal_writes` | `false` | Lets SQL write `__anofox_scenario` (restore, repair). Set it only for that, then `RESET` it. |
+
+## Base edits a merge does not detect
+
+A merge treats a base edit to a row the scenario updated or deleted as a conflict (*drift*),
+compared with the materialized copy, the pinned lake snapshot, or (delta scenarios) the row as
+it was when the scenario first touched it. Exceptions:
+
+- **Keyless tables of delta scenarios** (no PK, no `key_columns`): a delete whose copies are
+  no longer all in the base *is* a conflict (`abort` refuses; `theirs` deletes nothing for that
+  value; `ours` deletes the copies that remain). Not flagged: a delete that still finds enough
+  copies. Keyless inserts always apply, so with `ours` / `theirs` a changed row can end up in
+  both versions.
+- **Deltas written by v2026.11.13 or earlier** (before pre-images): a base edit is overwritten.
+- **Rows a branch inherited from a materialized parent**: a base edit is overwritten.
+
+Remedy: declare `key_columns`, merge right after the dry run, or redo the change in a fresh
+scenario over the current base.
+
+## Transactions (the one place for BEGIN / COMMIT advice)
+
+- Scenario writes, `scenario_create` / `_freeze` / `_unfreeze` / `_drop` and host-base
+  `scenario_merge` run in the caller's transaction: `ROLLBACK` undoes them. Host writes and
+  any number of scenarios on the same host commit atomically together.
+- Wrap a host-base merge in `BEGIN ... COMMIT` to check the base before anyone sees it;
+  `ROLLBACK` leaves the scenario mergeable.
+- A DuckLake merge needs autocommit (no `BEGIN`): the lake commits on its own and cannot be
+  rolled back.
+- Writing a *different* attached database in the same transaction is refused.
+
+Example: [behaviour.md](behaviour.md), "Transactions".
+
+## Schema changes
+
+DDL inside a scenario is rejected; change the base instead. New base tables appear in delta
+scenarios automatically (materialized ones keep their table set).
+
+- **`ALTER TABLE t ADD COLUMN`** on the base reaches every scenario, attached or not, also
+  when it has changed `t`, and in materialized scenarios and branches. Rows the scenario
+  changed before show the value the base rows got: the column's `DEFAULT`, NULL without one
+  (also NULL for a volatile default such as `nextval(...)`). Scenarios can then write the
+  column, and `scenario_diff` / `scenario_merge` include it.
+- **`DROP COLUMN`, `RENAME COLUMN`, a column type change, `RENAME TO`, `DROP TABLE`** on a base
+  table are refused while any scenario has unmerged changes to it (`… has unmerged changes to
+  it`): merge the scenario first. A scenario without changes to the table does not block it.
+  Materialized copies keep their old columns.
+
+Example: [behaviour.md](behaviour.md), "Base schema changes".

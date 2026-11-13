@@ -1,12 +1,31 @@
 # <file><TAB><first SQL line of the block><TAB><expected lines, separated by \n>
 # Each expected line must be a substring of a line of the block's own output (-list mode,
 # `a|b|c`), in this order. Pin examples whose point is a result, not just that they run.
+plugins/anofox-scenario/skills/anofox-scenario-reference/behaviour.md	CREATE TABLE orders (id INTEGER PRIMARY KEY, status VARCHAR);	1|closed\n2|closed
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	SELECT table_name, action, conflict, count(*) AS n	products|delete|false|1\nproducts|insert|false|1\nproducts|update|false|1
 plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	SELECT id, change_type, column_name, old_value, new_value	2|modified|price|24.50|26.00\n4|removed\n5|added
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	SELECT * FROM products ORDER BY id;	5|Thingamajig|7.50\nprice_import_2026_03|true|true
 plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	CALL scenario_create('retire_gizmo');	count_star()\n3\ncount_star()\n4
 plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	CREATE TABLE stock (sku VARCHAR PRIMARY KEY, qty INTEGER);	B|update|false\nC|insert|true
 plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	SELECT * FROM scenario_merge('restock', on_conflict := 'theirs');	1|1|1\nA|10\nB|25\nC|7
 plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	CREATE TABLE item (id INTEGER PRIMARY KEY, name VARCHAR, price INTEGER);	1|update|true\n0|0|1\n1|new name|10
-plugins/anofox-scenario/skills/anofox-scenario-safe-change/SKILL.md	CREATE TABLE plan (id INTEGER PRIMARY KEY, v INTEGER);	1|2|0\n1|10\n2|20
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	CREATE TABLE plan (id INTEGER PRIMARY KEY, v INTEGER);	1|2|0\n1|10\n2|20\n1|update|true
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	CREATE SCHEMA IF NOT EXISTS merge_log;	1|3|0\nprice_fix|true
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	CALL scenario_create('undo_price_fix', 'reverse price_fix');	2|update|false\n4|insert|false\n5|delete|false
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	SELECT * FROM scenario_merge('undo_price_fix');	1|3|0\n2|Gadget|24.50\n4|Doohickey|12.00
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	CREATE TABLE tally (account VARCHAR, amount INTEGER);	(x, 1)|delete|true\n(x, 2)|insert|false
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	SELECT * FROM scenario_merge('fix_amount', on_conflict := 'theirs');	1|1|1\nx|2\ny|1
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	INSTALL ducklake;	1|1|0\n1|closed\n2|open
+plugins/anofox-scenario/skills/anofox-scenario-safe-change/recipes.md	ALTER TABLE orders ADD COLUMN tax DECIMAL(10,2);         -- real table, after the user's yes	orders|update|false|2
+plugins/anofox-scenario/skills/anofox-scenario-what-if/SKILL.md	CREATE VIEW demand_by_region AS SELECT region, sum(qty) AS total_qty FROM demand GROUP BY region;	pessimistic|EU|132.00\noptimistic|US|346.50
+plugins/anofox-scenario/skills/anofox-scenario-what-if/SKILL.md	SELECT * FROM scenario_diff('pessimistic', 'demand') ORDER BY ALL;	A|EU|2026-01-01|modified|qty|80.00|64.00\nB|EU|2026-01-01|removed
 plugins/anofox-scenario/skills/anofox-scenario-what-if/SKILL.md	SELECT * FROM scenario_diff('optimistic', 'pessimistic', 'demand') ORDER BY ALL;	A|US|2026-01-01|modified|qty|110.00|100.00\nB|EU|2026-01-01|removed
+plugins/anofox-scenario/skills/anofox-scenario-what-if/SKILL.md	CALL scenario_create('optimistic_promo', from_scenario := 'optimistic');	A|US|2026-02-01|modified|qty|121.00|141.00
+plugins/anofox-scenario/skills/anofox-scenario-what-if/forecast.md	INSTALL anofox_forecast FROM community;	sku|forecast_step|ds|yhat|yhat_lower|yhat_upper|model_name\nsku|ds|base|stockout|delta
 plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	SELECT * FROM scenario_diff('budget_2026_approved', 'main', 'budget') ORDER BY cost_center;	CC-200|modified|amount|72000.00|80000.00\nCC-300|removed\nCC-400|added
-plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	INSTALL ducklake;	count_star()\n2
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	SELECT key, action, conflict FROM scenario_merge_preview('budget_2026_rev1');	CC-200|update|true
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	BEGIN;	frozen\ntrue\nCC-300|infra
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/SKILL.md	CALL scenario_create('optimistic_approved', 'optimistic, approved 2026-03-14', mode := 'materialized');	differences\n0\nA|EU|80\nA|US|110\nB|US|60
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/recipes.md	INSTALL ducklake;	count_star()\n2
+plugins/anofox-scenario/skills/anofox-scenario-snapshot-audit/recipes.md	SELECT coalesce(a.cost_center, l.cost_center) AS cost_center,	CC-300|NULL|9000.00
+plugins/anofox-scenario/skills/anofox-scenario-reference/behaviour.md	CREATE TABLE prices (id INTEGER PRIMARY KEY, price INTEGER);	1|11|EUR\n2|20|USD

@@ -1,13 +1,14 @@
 ---
 name: anofox-scenario-snapshot-audit
 description: >
-  Frozen snapshots and audit trails with the anofox_scenario DuckDB extension: freeze an
-  approved plan, keep a point-in-time copy that later base changes cannot alter, show what
-  changed since approval, and keep a log of why. Use when the user wants to freeze or lock
-  a plan / budget / forecast version, keep an auditable record, compare today's data with
-  an approved state, pin a scenario to a DuckLake snapshot, document decisions, or migrate
-  a legacy v0.1 scenario database. Main tools: scenario_create(mode := 'materialized') or
-  (base := <ducklake>), scenario_freeze / scenario_unfreeze, and scenario_migrate.
+  Approved, signed-off versions and audit trails with the anofox_scenario DuckDB extension:
+  freeze an approved plan, budget or forecast so later base changes cannot alter it, capture
+  an approved what-if variant, show what changed since sign-off, log who corrected or revised
+  it and why, pin a version to a DuckLake snapshot, migrate a legacy v0.1 scenario database.
+  Use when the user says approved, signed off, sign-off, baseline, frozen, locked, "as of" a
+  date, "the version from March", audit trail or compliance record. Not for exploring new
+  variants (anofox-scenario-what-if) or applying changes to the real tables
+  (anofox-scenario-safe-change).
 version: 2026.11.13
 user-invocable: false
 ---
@@ -16,45 +17,56 @@ user-invocable: false
 
 **Extension:** `anofox_scenario` v2026.11.13 | **DuckDB:** v1.5.5+ and v2.0
 
-There is no separate snapshot API: a snapshot is a scenario that does not move with the base
-(materialized, or pinned to a DuckLake snapshot) and is frozen so nobody writes to it. For
-error messages see `anofox-scenario-reference`.
+A snapshot is a scenario that does not move with the base (materialized, or pinned to a
+DuckLake snapshot) and is frozen so nobody writes to it. Errors and settings:
+`anofox-scenario-reference`. DuckLake, Markdown export, legacy migration:
+[recipes.md](recipes.md).
+
+## Ask first
+
+Unfreezing an approved scenario, dropping it, or merging a revision into the real tables
+changes the record. Name the scenario and the consequence, get the user's yes, and log it
+(see "Audit notes"). Prefer branching an approved version over unfreezing it.
+
+## What are you approving?
+
+Decide before creating anything:
+
+| Approving | Do |
+|---|---|
+| the current contents of the base tables | `mode := 'materialized'` + `scenario_freeze` (§1) |
+| an existing what-if variant (a delta scenario) | capture it into a materialized scenario (§7); freezing the variant itself is not enough, its untouched rows still follow the base |
+| a variant still to be planned | start from a materialized baseline, branch it, freeze the chosen branch |
+| tables in a DuckLake catalog | `base := 'lake'` + freeze: pinned, no copy ([recipes.md](recipes.md)) |
 
 ## Critical gotchas
 
 - **A default (delta) scenario is not a snapshot.** It reads the live base for every row it
-  did not change, so a frozen delta scenario still moves when the base changes. Use
-  `mode := 'materialized'` (copies every base table at creation) or a DuckLake `base :=`
-  (reads pinned to the creation time, no copy).
-- **Freezing is a switch, not a seal.** `scenario_freeze` rejects every write through a
-  scenario catalog; reads keep working. `scenario_unfreeze` reverses it (except for a merged
-  scenario, which stays frozen). Treat unfreezing an approved plan as an audited action and
-  record it (see "Audit notes").
-- **Frozen is guarded, not sealed.** SQL cannot edit the internal `__anofox_scenario` tables
-  (registry, deltas, materialized copies) in a session that has the extension loaded: such
-  writes fail with `Cannot modify … with SQL`, so `UPDATE __anofox_scenario.registry SET
-  frozen = false` does not work. But a process that opens the file without the extension, or
-  a session that sets `anofox_scenario_allow_internal_writes = true`, can change them, and
-  nothing would show it. Add `SET lock_configuration = true` after loading the extension to
-  keep the setting off. For real tamper evidence keep an external copy: `EXPORT DATABASE`
-  plus a checksum stored elsewhere, or DuckLake snapshots with a retention policy.
-- **Materialized creation copies all base tables** of the host database, and tables added to
-  the base later are not part of the snapshot. `mode := 'materialized'` cannot be combined
-  with `base :=` (a DuckLake base is pinned already) or `from_scenario` (a branch is always a
-  delta over its parent).
-- **Materialized copies don't carry FOREIGN KEY constraints** (data and other constraints are
-  copied); a merge back into the base still enforces them.
+  did not change, frozen or not.
+- **Freezing is a switch, not a seal.** `scenario_unfreeze` reverses it (not for a merged
+  scenario). Do an approved correction atomically (see "Audit notes").
+- **Frozen is guarded, not sealed.** SQL cannot edit `__anofox_scenario` in a session with the
+  extension loaded, but a process without the extension, or with
+  `anofox_scenario_allow_internal_writes`, can. `SET lock_configuration = true` after loading
+  keeps the setting off (set the telemetry opt-out before it). For tamper evidence keep an
+  external copy: `EXPORT DATABASE` plus a checksum stored elsewhere.
+- **Materialized creation copies all base tables** of the host database; tables added later
+  are not part of it. Copies carry no FOREIGN KEY constraints; a merge still enforces them.
+- **A revision is computed from the approved copy**, not today's base. Merging it flags every
+  row it touched that the base changed since approval; `'ours'` reverts those base edits.
 
 ## The playbook
 
-### 1. Approve a plan: materialize and freeze
+### 1. Approve the current data: materialize and freeze
 
 ```sql
 CREATE TABLE budget (cost_center VARCHAR PRIMARY KEY, amount DECIMAL(12,2), owner VARCHAR);
 INSERT INTO budget VALUES ('CC-100', 50000, 'ops'), ('CC-200', 72000, 'sales'), ('CC-300', 31000, 'it');
 
+BEGIN;
 CALL scenario_create('budget_2026_approved', 'approved by the board 2026-03-14', mode := 'materialized');
 CALL scenario_freeze('budget_2026_approved');
+COMMIT;
 ```
 
 ### 2. Read the approved state at any time
@@ -64,15 +76,13 @@ ATTACH 'budget_2026_approved' AS approved (TYPE scenario);
 SELECT * FROM approved.budget ORDER BY cost_center;
 ```
 
-Writes are rejected while it is frozen:
-
 ```sql
+-- fails: is frozen. Unfreeze it with CALL scenario_unfreeze
 UPDATE approved.budget SET amount = 0;
 ```
 
-So is plain SQL on the internal tables behind it, such as flipping the flag:
-
 ```sql
+-- fails: Cannot modify __anofox_scenario.registry with SQL
 UPDATE __anofox_scenario.registry SET frozen = false WHERE name = 'budget_2026_approved';
 ```
 
@@ -86,21 +96,17 @@ DELETE FROM budget WHERE cost_center = 'CC-300';
 
 ### 4. What changed since approval
 
-Compare the snapshot with the live table (`old` = approved, `new` = today):
+Snapshot vs. live table (`old` = approved, `new` = today):
 
 ```sql
 SELECT * FROM scenario_diff('budget_2026_approved', 'main', 'budget') ORDER BY cost_center;
 ```
 
-For a DuckLake-based approval, `'main'` here is the lake table *at the scenario's snapshot*,
-so this diff stays empty however the lake changes; compare with the live lake by a plain
-join instead (see "DuckLake").
+The 2-argument form `scenario_diff('budget_2026_approved', 'budget')` answers another
+question: what the scenario itself changed (nothing, for an untouched approval). For a
+DuckLake approval `'main'` is the pinned snapshot: compare with a join ([recipes.md](recipes.md)).
 
-The 2-argument form `scenario_diff('budget_2026_approved', 'budget')` answers a different
-question: what the scenario itself changed relative to its creation snapshot (nothing, for a
-frozen approval).
-
-KPI view, approved vs actual:
+KPI view, approved vs. actual:
 
 ```sql
 SELECT coalesce(a.cost_center, b.cost_center) AS cost_center,
@@ -112,7 +118,8 @@ ORDER BY cost_center;
 ### 5. Inventory
 
 ```sql
-SELECT name, mode, frozen, parent, created_at, description FROM scenario_list() ORDER BY created_at;
+SELECT name, mode, frozen, parent, created_at, merged_at, description
+FROM scenario_list() ORDER BY created_at;
 ```
 
 ### 6. A revision on top of the approved plan
@@ -126,50 +133,17 @@ UPDATE rev1.budget SET amount = amount * 1.05 WHERE owner = 'sales';
 SELECT * FROM scenario_diff('budget_2026_approved', 'budget_2026_rev1', 'budget');
 ```
 
-## DuckLake: snapshots without copying
-
-Over a DuckLake catalog a scenario is pinned to the lake snapshot at creation
-(`AT (TIMESTAMP => created_at)`), so creation is O(1) and later lake commits are invisible to it.
-Branches keep their parent's snapshot.
+Merging `rev1` into the live table writes values computed from the approved copy: CC-200 was
+changed in the base since approval, so it is a conflict. To apply a revision to today's data,
+redo it in a fresh delta scenario (`anofox-scenario-safe-change`).
 
 ```sql
-INSTALL ducklake;
-ATTACH 'ducklake:lake.ducklake' AS lake (DATA_PATH 'lake_files/');
-CREATE TABLE lake.budget (cost_center VARCHAR, amount DECIMAL(12,2));
-INSERT INTO lake.budget VALUES ('CC-100', 50000), ('CC-200', 72000);
-
-CALL scenario_create('lake_budget_approved', base := 'lake',
-                     key_columns := MAP {'budget': ['cost_center']});
-CALL scenario_freeze('lake_budget_approved');
-
-INSERT INTO lake.budget VALUES ('CC-300', 9000);    -- later lake commit
-ATTACH 'lake_budget_approved' AS lba (TYPE scenario);
-SELECT count(*) FROM lba.budget;                    -- 2: pinned to the snapshot
+SELECT key, action, conflict FROM scenario_merge_preview('budget_2026_rev1');
 ```
-
-Tables the lake creates after the snapshot are not part of the scenario.
-
-What changed in the live lake since approval (a `scenario_diff` against `'main'` would compare
-with the pinned snapshot and show nothing):
-
-```sql
--- requires: ducklake
-SELECT coalesce(a.cost_center, l.cost_center) AS cost_center,
-       a.amount AS approved, l.amount AS current
-FROM lba.budget a FULL JOIN lake.budget l USING (cost_center)
-WHERE a.amount IS DISTINCT FROM l.amount
-ORDER BY cost_center;
-```
-
-A DuckLake-based snapshot is only readable while the lake keeps it: the DuckLake catalog
-file, its `DATA_PATH` files and the snapshot itself (not expired or compacted away) must be
-retained alongside the `.duckdb` file.
 
 ## Audit notes
 
-Notes are plain SQL over plain tables; there is no dedicated API. Keep an append-only log
-of decisions next to the data: every approval, unfreeze and revision is a new row, nothing is
-updated or replaced.
+Plain SQL over a plain, append-only table: every approval, correction and revision is a row.
 
 ```sql
 CREATE SEQUENCE IF NOT EXISTS audit_events_seq;
@@ -181,42 +155,52 @@ CREATE TABLE IF NOT EXISTS audit_events (
 INSERT INTO audit_events (scenario, event, actor, note) VALUES
     ('budget_2026_approved', 'approved', 'board', 'board meeting 2026-03-14, minutes ref B-26-03'),
     ('budget_2026_rev1', 'created', 'cfo', 'sales headcount moved forward to Q2');
-
-SELECT scenario, event, actor, note FROM audit_events ORDER BY event_id;
 ```
 
-Log an unfreeze in the same transaction as the unfreeze itself, so one never happens
-without the other:
+An approved correction (after the user's yes): unfreeze, correct, refreeze and log in one
+transaction, so the plan is never left writable and never changes without its log entry:
 
 ```sql
 BEGIN;
 CALL scenario_unfreeze('budget_2026_approved');
-INSERT INTO audit_events (scenario, event, actor, note)
-    VALUES ('budget_2026_approved', 'unfrozen', 'controller', 'correct CC-300 owner');
-COMMIT;
+UPDATE approved.budget SET owner = 'infra' WHERE cost_center = 'CC-300';
 CALL scenario_freeze('budget_2026_approved');
-INSERT INTO audit_events (scenario, event, actor) VALUES ('budget_2026_approved', 'frozen', 'controller');
+INSERT INTO audit_events (scenario, event, actor, note) VALUES
+    ('budget_2026_approved', 'corrected', 'controller', 'CC-300 owner it -> infra; unfrozen and refrozen');
+COMMIT;
+
+SELECT frozen FROM scenario_list() WHERE name = 'budget_2026_approved';
+SELECT cost_center, owner FROM approved.budget WHERE cost_center = 'CC-300';
 ```
 
-Export as Markdown:
+Scenarios, copies and notes all live in the one `.duckdb` file.
+
+## 7. Capture an approved what-if variant
+
+Copy the variant's state into a new materialized scenario and freeze it in one transaction.
+Only the tables the variant changed need copying; the fresh copy already holds the rest.
 
 ```sql
-COPY (SELECT '## ' || scenario || ' / ' || event || ' (' || logged_at || ', ' || coalesce(actor, '?') || ')'
-             || chr(10) || coalesce(note, '')
-      FROM audit_events ORDER BY event_id)
-TO 'audit_events.md' (FORMAT csv, QUOTE '', HEADER false);
+-- doc-snippets: new session
+CREATE TABLE demand (sku VARCHAR, region VARCHAR, qty INTEGER, PRIMARY KEY (sku, region));
+INSERT INTO demand VALUES ('A', 'US', 100), ('A', 'EU', 80), ('B', 'US', 50);
+CALL scenario_create('optimistic', 'US +10');
+ATTACH 'optimistic' AS opt (TYPE scenario);
+UPDATE opt.demand SET qty = qty + 10 WHERE region = 'US';
+
+SELECT table_name FROM scenario_diff_summary('optimistic');   -- the tables to copy
 ```
 
-For a host-database scenario, the scenarios, their deltas and copies, and these notes all
-live in the one `.duckdb` file. DuckLake-based scenarios additionally need the lake (see
-above). Databases migrated from v0.1 keep their notes in `_scenario_protocols`.
-
-## Legacy databases (v0.1)
-
-Databases written by v0.1 (`_scenario_registry`, `_scen_*`, `_snap_*` tables) are migrated once,
-in place: archived scenarios become frozen, v0.1 snapshots become materialized + frozen
-scenarios, and `_scenario_protocols` rows are kept.
-
 ```sql
-SELECT * FROM scenario_migrate();
+CALL scenario_create('optimistic_approved', 'optimistic, approved 2026-03-14', mode := 'materialized');
+ATTACH 'optimistic_approved' AS oa (TYPE scenario);
+BEGIN;
+DELETE FROM oa.demand;
+INSERT INTO oa.demand SELECT * FROM opt.demand;
+CALL scenario_freeze('optimistic_approved');
+COMMIT;
+
+SELECT count(*) AS differences FROM scenario_diff('optimistic', 'optimistic_approved', 'demand');
+UPDATE demand SET qty = 0;                            -- the base moves on
+SELECT * FROM oa.demand ORDER BY ALL;                 -- still the approved variant
 ```

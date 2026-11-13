@@ -95,6 +95,7 @@ set(EXTENSION_SOURCES
     src/catalog/scenario_table_entry.cpp
     src/catalog/scenario_scan.cpp
     src/catalog/scenario_delta.cpp
+    src/catalog/scenario_schema_change.cpp
     src/catalog/scenario_insert.cpp
     src/catalog/scenario_update_delete.cpp
     src/catalog/scenario_unique.cpp

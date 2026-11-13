@@ -74,6 +74,13 @@ public:
 	//! deltas remain.
 	static bool TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
 	                                          bool read_only_attach);
+	//! Add the columns the base gained to a scenario's internal tables at
+	//! ATTACH (an ALTER TABLE ... ADD COLUMN that ran without the extension
+	//! loaded; with it loaded, the ALTER itself does this, #62), under the
+	//! same conditions as the legacy keyless upgrade. Returns false when
+	//! narrow tables remain.
+	static bool TryWidenAtAttach(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                             bool read_only_attach);
 
 	static string DeltaTableName(int64_t scenario_id, const string &table_name);
 	//! Materialized base copy: __anofox_scenario.s<id>_mat_<table> (Phase 2)
@@ -135,6 +142,53 @@ public:
 	//! source untouched.
 	static void CopyTableData(ClientContext &context, DuckTableEntry &from_table, DuckTableEntry &to_table,
 	                          idx_t target_column_offset = 0);
+
+	//===------------------------------------------------------------------===//
+	// Base schema changes (#62)
+	//===------------------------------------------------------------------===//
+	//! How the payload columns of an internal table (delta: after _op/_ts and
+	//! before a bag delta's multiplicity; pre-image and mat copy: all columns)
+	//! relate to the columns of the table they mirror
+	enum class Shape : uint8_t {
+		//! same names and types, position by position
+		SAME,
+		//! a prefix of the reference: the base gained trailing columns
+		//! (ALTER TABLE ... ADD COLUMN) the internal table still lacks
+		NARROW,
+		//! a column was dropped, renamed or changed type
+		MISMATCH
+	};
+	static Shape CompareShape(const TableCatalogEntry &internal, bool is_delta, const ColumnList &reference,
+	                          string &detail);
+	//! Throw the user-facing error for an internal table that does not match
+	//! the table it mirrors (no-op for SAME)
+	static void ThrowIfShapeDiffers(const string &scenario_name, const string &logical_name,
+	                                const TableCatalogEntry &internal, bool is_delta, const ColumnList &reference);
+	//! Bring the internal tables of one scenario table (its delta and
+	//! pre-images; its mat copy for a materialized scenario) up to the
+	//! columns of the table they mirror: the host base table, or the mat copy
+	//! of the nearest materialized ancestor (which itself follows the base).
+	//! Added columns are added to the internal tables too (may_widen), filled
+	//! with the value the base rows got: the column's DEFAULT when it is not
+	//! volatile, else NULL. A narrow table that may not be widened, or a
+	//! mismatch, throws when throw_errors is set. Scenarios over another
+	//! catalog (DuckLake) are left alone.
+	static void SyncTableShape(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                           const string &logical_name, bool may_widen, bool throw_errors = true);
+	//! SyncTableShape for every table the scenario has internal tables for
+	static void SyncScenarioShapes(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+	                               bool may_widen, bool throw_errors = true);
+	//! True when some internal table of the scenario lacks columns its base
+	//! gained (an ALTER that ran without the extension loaded)
+	static bool ScenarioNeedsWidening(ClientContext &context, Catalog &host_catalog, int64_t scenario_id);
+	//! Scenarios (ids, ascending) that have an internal table (delta,
+	//! pre-images or mat copy) for a logical table name of the host
+	static vector<int64_t> ScenariosWithTable(ClientContext &context, Catalog &host_catalog,
+	                                          const string &logical_name);
+	//! Whether a table has at least one row visible to the transaction
+	static bool HasRows(ClientContext &context, DuckTableEntry &table);
+	//! Drop a table of the internal schema (caller's transaction)
+	static void DropInternalTable(ClientContext &context, Catalog &host_catalog, const string &table_name);
 
 	//! Logical column ids of the base table's PRIMARY KEY (empty when none)
 	static vector<idx_t> GetPKColumns(const TableCatalogEntry &base_entry);

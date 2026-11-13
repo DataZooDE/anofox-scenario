@@ -198,13 +198,13 @@ idx_t ScenarioDelta::UpgradeLegacyKeylessDeltas(ClientContext &context, Catalog 
 	return legacy_names.size();
 }
 
-bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
-                                                  bool read_only_attach) {
-	if (!HasLegacyKeylessDeltas(context, host_catalog, scenario_id)) {
-		return true;
-	}
-	// Every skip below is safe: readers handle the legacy layout as
-	// _count = 1, and the next ATTACH that is allowed to write upgrades.
+//! Whether ATTACH may rewrite a scenario's internal tables now (legacy
+//! keyless upgrade, columns the base gained without the extension loaded):
+//! a writable host, an attach that is not READ_ONLY, an autocommit statement
+//! (or a transaction that already writes the host), and no older transaction
+//! on the host that might hold uncommitted writes to them. Registers the
+//! host write when it returns true.
+static bool RewriteAtAttachAllowed(ClientContext &context, Catalog &host_catalog, bool read_only_attach) {
 	if (read_only_attach) {
 		return false; // READ_ONLY promises not to write the host
 	}
@@ -215,14 +215,15 @@ bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalo
 	}
 	auto modified = meta.ModifiedDatabase();
 	if (modified ? modified.get() != &host_db : !context.transaction.IsAutoCommit()) {
-		// inside an explicit transaction the upgrade would make the host the
+		// inside an explicit transaction the rewrite would make the host the
 		// transaction's single writer behind the user's back (and block a
 		// later write to another database); only ride along when the
 		// transaction already writes the host
 		return false;
 	}
 	// another, older transaction on the host may hold uncommitted writes to
-	// the legacy delta: dropping it now would fail that transaction's commit
+	// the internal tables: rewriting them now would fail that transaction's
+	// commit
 	auto &transaction_manager = host_db.GetTransactionManager();
 	if (transaction_manager.IsDuckTransactionManager()) {
 		auto &duck_manager = DuckTransactionManager::Get(host_db);
@@ -233,7 +234,20 @@ bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalo
 	}
 	meta.ModifyDatabase(host_db, DatabaseModificationType::DROP_CATALOG_ENTRY |
 	                                 DatabaseModificationType::CREATE_CATALOG_ENTRY |
-	                                 DatabaseModificationType::INSERT_DATA);
+	                                 DatabaseModificationType::ALTER_TABLE | DatabaseModificationType::INSERT_DATA);
+	return true;
+}
+
+bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                                  bool read_only_attach) {
+	if (!HasLegacyKeylessDeltas(context, host_catalog, scenario_id)) {
+		return true;
+	}
+	// Every skip below is safe: readers handle the legacy layout as
+	// _count = 1, and the next ATTACH that is allowed to write upgrades.
+	if (!RewriteAtAttachAllowed(context, host_catalog, read_only_attach)) {
+		return false;
+	}
 	try {
 		UpgradeLegacyKeylessDeltas(context, host_catalog, scenario_id);
 	} catch (std::exception &ex) {
@@ -243,6 +257,27 @@ bool ScenarioDelta::TryUpgradeLegacyKeylessDeltas(ClientContext &context, Catalo
 		// a catalog conflict with a concurrent transaction: keep the legacy
 		// layout rather than fail the ATTACH (each table's swap is
 		// self-contained, so tables upgraded before the conflict stay valid)
+		return false;
+	}
+	return true;
+}
+
+bool ScenarioDelta::TryWidenAtAttach(ClientContext &context, Catalog &host_catalog, int64_t scenario_id,
+                                     bool read_only_attach) {
+	if (!ScenarioNeedsWidening(context, host_catalog, scenario_id)) {
+		return true;
+	}
+	// Skipping is safe: readers and writers of a table whose internal tables
+	// lack a base column raise an error that points back here
+	if (!RewriteAtAttachAllowed(context, host_catalog, read_only_attach)) {
+		return false;
+	}
+	try {
+		SyncScenarioShapes(context, host_catalog, scenario_id, true, false);
+	} catch (std::exception &ex) {
+		if (!scenario_compat::IsException(ex, ExceptionType::TRANSACTION)) {
+			throw;
+		}
 		return false;
 	}
 	return true;

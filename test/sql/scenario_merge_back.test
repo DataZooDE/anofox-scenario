@@ -158,10 +158,16 @@ CALL scenario_create('matx', mode := 'materialized');
 
 # materialized merge-back is supported since v0.4.1 (see
 # scenario_merge_materialized.test); an untouched scenario is a no-op merge
+# that leaves it open (scenario_merge_empty.test)
 query III
 SELECT * FROM scenario_merge('matx');
 ----
 0	0	0
+
+query T
+SELECT (merged_at IS NULL)::VARCHAR FROM scenario_list() WHERE name = 'matx';
+----
+true
 
 statement error
 SELECT * FROM scenario_merge('nope');

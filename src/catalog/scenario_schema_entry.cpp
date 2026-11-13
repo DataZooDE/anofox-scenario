@@ -75,9 +75,11 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 	bool enumeration = !for_binding;
 
 	auto cached = transaction.FindEntry(qualified, enumeration);
-	if (cached) {
+	if (cached && &cached->Cast<ScenarioTableEntry>().base_entry == &base_table) {
 		return *cached;
 	}
+	// (a cached entry over another base entry: this transaction altered the
+	// base table since it cached it, e.g. ADD COLUMN (#62) - rebuild it)
 
 	// Mirror the base table's columns and constraints. For materialized
 	// bases the physical name (s<id>_mat_<t>) is replaced by the logical one.
@@ -99,6 +101,9 @@ CatalogEntry &ScenarioSchemaEntry::GetOrCreateTableEntryAs(ClientContext &contex
 		// The first write re-resolves the identity and raises the error
 		// (ScenarioCatalog::GetOrCreateWriteDelta), as does scenario_diff
 		entry->key_columns.clear();
+	}
+	if (cached) {
+		return transaction.ReplaceEntry(qualified, *cached, std::move(entry), enumeration);
 	}
 	return transaction.PublishEntry(qualified, std::move(entry), enumeration);
 }

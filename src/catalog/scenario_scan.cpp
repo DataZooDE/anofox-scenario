@@ -1030,6 +1030,12 @@ TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, Scenario
 	auto &host_catalog = scenario_catalog.GetHostCatalog(context);
 	auto delta_table =
 	    ScenarioDelta::TryGetDeltaTable(context, host_catalog, scenario_catalog.scenario_id, ScenarioDelta::LogicalName(entry));
+	if (delta_table) {
+		// the delta mirrors the table column for column; a base schema change
+		// that did not reach it (#62) gets a clear error, not a misread
+		ScenarioDelta::ThrowIfShapeDiffers(scenario_catalog.scenario_name, ScenarioDelta::LogicalName(entry),
+		                                   *delta_table, true, entry.GetColumns());
+	}
 	auto result = make_uniq<ScenarioScanBindData>(entry, entry.base_entry, delta_table, entry.IdentityColumns());
 	result->keyless = entry.key_columns.empty();
 	result->base_is_duck = entry.base_entry.IsDuckTable();

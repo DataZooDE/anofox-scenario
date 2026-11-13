@@ -260,6 +260,7 @@ src/
     scenario_delta.cpp                 #   delta/mat table management + copy helpers
     scenario_registry.cpp              #   registry v2 (caller-transaction catalog ops)
     scenario_internal_guard.cpp        #   rejects SQL writes/DDL on __anofox_scenario (#55)
+    scenario_schema_change.cpp         #   base ALTER/DROP TABLE vs. internal tables: ADD COLUMN widening, refusals (#62)
     scenario_transaction.cpp           #   transaction shim (ACID rides the host)
     include under src/include/catalog/
   lifecycle/
@@ -305,9 +306,12 @@ test/sql/
   attach_write_checks.test        # read-only / frozen / single-writer checks at EXECUTE, not PREPARE (#39)
   attach_internal_guard.test      # host SQL may read __anofox_scenario but not write it / change its schema; escape-hatch setting, IMPORT (#55)
   scenario_merge_keyless_drift.test # 3-way drift for keyless tables in materialized scenarios (#39)
-  scenario_ducklake_merge_hardening.test # legacy deltas, rowid columns, net-plan preview, idempotent lake re-merge (#39)
+  scenario_ducklake_merge_hardening.test # legacy deltas, rowid columns, net-plan preview, idempotent lake re-merge (#39), empty lake merges
+  scenario_delta_keyless_drift.test # keyless delete whose base copies are gone = conflict in delta scenarios (preview, abort/ours/theirs)
+  scenario_merge_empty.test       # merging an empty plan is a no-op: 0|0|0, scenario stays open (not frozen, merged_at NULL)
   scenario_delta_drift.test       # delta scenarios: pre-images, drift conflicts at merge/preview, branches, legacy (#53)
   scenario_merge_fk_order.test    # merge applies parents first; in-place updates of referenced rows (#54)
+  scenario_base_schema_change.test # base ALTER/DROP TABLE of tables scenarios changed: ADD COLUMN reaches every scenario, other shape changes refused (#62)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
   test_internal_guard.cpp         # internal-schema guard on client-API prepared statements; connections open before LOAD (#55)
@@ -318,7 +322,8 @@ test/cpp/                         # Catch tests linked into unittest (see test/R
 ```
 .claude-plugin/marketplace.json                 # marketplace manifest (repo = marketplace)
 plugins/anofox-scenario/.claude-plugin/plugin.json  # plugin manifest; version = CalVer release
-plugins/anofox-scenario/skills/<skill>/SKILL.md # one skill per usage pattern
+plugins/anofox-scenario/skills/<skill>/SKILL.md # one skill per usage pattern (aim: <= ~10 KB)
+plugins/anofox-scenario/skills/<skill>/*.md      # companion files (long or optional recipes), linked from SKILL.md
 scripts/check_doc_snippets.py                   # `make check-docs`: runs every ```sql block
 scripts/doc_snippets/                           #   fixtures, expected errors, synopses, allowed names
 ```
