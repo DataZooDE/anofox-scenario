@@ -23,6 +23,11 @@ and edge cases see `anofox-scenario-reference`.
 
 ## Critical gotchas
 
+- **Ask before anything irreversible.** Show the user the diff summary, the merge preview and
+  its conflict count, then ask before running `scenario_merge`, before choosing `'ours'` or
+  `'theirs'`, and before `scenario_drop`. A committed merge has no undo; on a host database
+  run it inside `BEGIN ... COMMIT` so the result can be checked first. A DuckLake merge commits
+  on its own and cannot be rolled back.
 - **Preview first.** `scenario_merge_preview(s)` lists every action the merge would take and
   flags conflicts, with no side effects. `scenario_merge` with the default
   `on_conflict := 'abort'` fails on the first conflict and changes nothing.
@@ -30,17 +35,25 @@ and edge cases see `anofox-scenario-reference`.
   set and its delta is empty. A second merge fails (`already merged back into the base`).
   Drop it afterwards, or create a new scenario for the next change.
 - **Merge refuses while branches exist** and while the scenario is frozen
-  (`Unfreeze it before merging`). Drop branches first.
-- **Foreign keys are checked at merge time, not inside the scenario.** A scenario may insert a
-  child whose parent exists only in the scenario; the merge applies parents and children
-  together and rolls back as a whole on a violation.
+  (`Unfreeze it before merging`). Drop the branches first; a branch that was itself merged
+  still counts until it is dropped. A merged scenario cannot be unfrozen.
+- **Merging a branch applies its parent's changes too** (a branch starts from its parent's
+  state). See "Merging a branch".
+- **Foreign keys are checked at merge time, not inside the scenario**, and the whole merge
+  rolls back on a violation. Tables are applied one after another with immediate checks, so
+  a scenario that inserts a new parent *and* a new child row referencing it currently fails
+  to merge (issue #54). Add the new parent rows to the base (or merge them in a scenario of
+  their own) first.
 - **Host-database merges run in your transaction.** Wrap `scenario_merge` in
   `BEGIN ... COMMIT` to check the result before it becomes visible, or `ROLLBACK` to undo it.
   DuckLake bases are different: the lake side commits on its own and needs autocommit (no
   surrounding `BEGIN`).
-- **Default scenarios read the live base.** If the base changes between the dry run and the
-  merge, untouched rows show the new base values; rows the scenario changed are checked for
-  conflicts at merge time (see "Conflicts").
+- **Default (delta) scenarios do not detect base edits to rows they changed.** If someone
+  edits a row in the base after the scenario updated it, the merge writes the scenario's whole
+  row back and the base edit is lost, even with `'abort'`; the preview shows no conflict
+  (issue #53). Merge right after the dry run, or create the scenario with
+  `mode := 'materialized'` when the base may change in between: materialized and DuckLake
+  scenarios flag such rows as conflicts. Rows the scenario did not touch keep any base change.
 
 ## The playbook
 
@@ -100,7 +113,6 @@ Columns: `table_name`, `key` (the key as text), `action` (`insert` / `update` / 
 `conflict` (BOOLEAN). Then apply:
 
 ```sql
-DETACH dry;
 SELECT * FROM scenario_merge('price_import_2026_03');
 ```
 
@@ -111,9 +123,11 @@ The base now holds the change:
 SELECT * FROM products ORDER BY id;
 ```
 
-The merged scenario is frozen with an empty delta; remove it when done:
+The merged scenario is frozen with an empty delta; remove it when done (`DETACH` is needed
+before a drop, not before a merge):
 
 ```sql
+DETACH dry;
 CALL scenario_drop('price_import_2026_03');
 ```
 
@@ -123,7 +137,6 @@ CALL scenario_drop('price_import_2026_03');
 CALL scenario_create('retire_gizmo');
 ATTACH 'retire_gizmo' AS rg (TYPE scenario);
 DELETE FROM rg.products WHERE id = 3;
-DETACH rg;
 
 BEGIN;
 SELECT * FROM scenario_merge('retire_gizmo');
@@ -151,7 +164,7 @@ changes. Which ones are detected depends on the mode:
 
 | Scenario | Conflict when |
 |---|---|
-| delta (default) | an `insert` whose key now exists in the base; an `update` whose key no longer exists |
+| delta (default) | an `insert` whose key now exists in the base; an `update` whose key no longer exists. **Not detected:** a base edit to a row the scenario updated; the scenario's row overwrites it (issue #53) |
 | materialized / DuckLake (have a creation snapshot) | additionally *drift*: the base row of a key the scenario touched changed since the snapshot |
 
 `on_conflict` decides what happens:
@@ -159,7 +172,7 @@ changes. Which ones are detected depends on the mode:
 | `on_conflict` | Effect |
 |---|---|
 | `'abort'` (default) | the merge fails and changes nothing |
-| `'ours'` | the scenario's version wins |
+| `'ours'` | the scenario's version wins: a conflicting insert replaces the base row, and an update of a row the base deleted inserts it again |
 | `'theirs'` | the base's version wins for conflicting keys; the rest is applied |
 
 ```sql
@@ -185,6 +198,51 @@ choose who wins:
 ```sql
 SELECT * FROM scenario_merge('restock', on_conflict := 'theirs');
 SELECT * FROM stock ORDER BY sku;   -- B = 25 from the scenario, C = 7 kept from the base
+```
+
+The undetected case in a delta scenario, for comparison (the base's `name` edit is lost):
+
+```sql
+-- doc-snippets: new session
+CREATE TABLE item (id INTEGER PRIMARY KEY, name VARCHAR, price INTEGER);
+INSERT INTO item VALUES (1, 'old name', 10);
+CALL scenario_create('reprice');
+ATTACH 'reprice' AS rp (TYPE scenario);
+UPDATE rp.item SET price = 11;
+UPDATE item SET name = 'new name';                    -- base edit after the dry run
+SELECT key, action, conflict FROM scenario_merge_preview('reprice');   -- conflict = false
+SELECT * FROM scenario_merge('reprice');
+SELECT * FROM item;                                   -- (1, 'old name', 11)
+```
+
+With `mode := 'materialized'` the same preview reports `conflict = true`.
+
+## Merging a branch
+
+To apply one variant out of several (see `anofox-scenario-what-if`), merge the scenario
+that holds the full intended state. A branch made with `from_scenario` contains its parent's
+changes, so merging the branch applies both. Afterwards drop the branch, then its
+ancestors: their changes are already in the base, and merging them again would report their
+inserts as conflicts.
+
+```sql
+-- doc-snippets: new session
+CREATE TABLE plan (id INTEGER PRIMARY KEY, v INTEGER);
+INSERT INTO plan VALUES (1, 1), (2, 2);
+CALL scenario_create('base_case');
+ATTACH 'base_case' AS bc (TYPE scenario);
+UPDATE bc.plan SET v = 10 WHERE id = 1;
+CALL scenario_create('chosen', from_scenario := 'base_case');
+ATTACH 'chosen' AS ch (TYPE scenario);
+UPDATE ch.plan SET v = 20 WHERE id = 2;
+
+SELECT * FROM scenario_merge('chosen');    -- rows_applied = 2: the parent's change and its own
+SELECT * FROM plan ORDER BY id;            -- (1, 10), (2, 20)
+
+DETACH ch;
+CALL scenario_drop('chosen');              -- the parent stays blocked until its branches are dropped
+DETACH bc;
+CALL scenario_drop('base_case');
 ```
 
 ## Keyless tables

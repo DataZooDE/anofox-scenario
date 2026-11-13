@@ -170,7 +170,9 @@ UPDATE promo.demand SET qty = qty + 20 WHERE sku = 'A' AND month = DATE '2026-02
 SELECT * FROM scenario_diff('optimistic', 'optimistic_promo', 'demand');
 ```
 
-A scenario with branches cannot be dropped or merged until its branches are dropped.
+A scenario with branches cannot be dropped or merged until its branches are dropped. To
+apply the chosen variant to the real data, merge it (a branch carries its parent's changes)
+and then drop it and its ancestors: see "Merging a branch" in `anofox-scenario-safe-change`.
 
 ### 7. Inventory and cleanup
 

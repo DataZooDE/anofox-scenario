@@ -28,16 +28,16 @@ Every verb is a table function: `CALL f(...)` and `SELECT * FROM f(...)` both wo
 
 | Call | Returns | Notes |
 |---|---|---|
-| `scenario_create(name, [description], mode := 'delta'\|'materialized', from_scenario := parent, base := catalog, key_columns := MAP {'table': ['col', ...]})` | `success` | Name: starts with a letter or `_`, at most 63 characters. `delta` (default) is O(1). `materialized` copies every base table. `from_scenario` branches: a delta scenario over the parent's current state that inherits its changes, declared keys, base catalog and DuckLake snapshot. `base` uses another attached catalog as the base (DuckLake: pinned to creation time). `from_scenario` and `base` each exclude `mode := 'materialized'`, and each other. `key_columns` gives keyless tables a row identity. |
+| `scenario_create(name, [description], mode := 'delta'\|'materialized', from_scenario := parent, base := catalog, key_columns := MAP {'table': ['col', ...]})` | `success` | Name: letters, digits and `_` only, starting with a letter or `_`, at most 63 characters. `delta` (default) is O(1). `materialized` copies every base table. `from_scenario` branches: a delta scenario over the parent's current state that inherits its changes, declared keys, base catalog and DuckLake snapshot. `base` uses another attached catalog as the base (DuckLake: pinned to creation time). `from_scenario` and `base` each exclude `mode := 'materialized'`, and each other. `key_columns` gives keyless tables a row identity. |
 | `scenario_drop(name)` | `success` | Removes deltas, copies and declared keys. Refuses while attached or while branches exist. |
-| `scenario_freeze(name)` / `scenario_unfreeze(name)` | `success` | Rejects / allows writes through every handle; reads keep working. |
+| `scenario_freeze(name)` / `scenario_unfreeze(name)` | `success` | Rejects / allows writes through every scenario handle; reads keep working. A merged scenario cannot be unfrozen. Freeze does not stop direct host SQL on the internal `__anofox_scenario` tables (issue #55). |
 | `scenario_list()` | `scenario_id, name, mode, frozen, parent, created_at, description` | `parent` is the parent's name. |
 | `ATTACH 'name' AS alias (TYPE scenario [, READ_ONLY])` / `DETACH alias` | | The whole read/write surface. `USE alias` makes unqualified table names resolve to the scenario. |
 | `scenario_diff(scenario, table)` | `<key columns>, change_type, column_name, old_value, new_value` | Scenario vs. its origin. Key columns keep their types; values are VARCHAR. `change_type`: `added` / `removed` / `modified` (one row per changed column). |
-| `scenario_diff(a, b, table)` | same | Any two sides; `'main'` = the base table. `old` = `a`, `new` = `b`. |
+| `scenario_diff(a, b, table)` | same | Any two sides; `'main'` = the base table. `old` = `a`, `new` = `b`. When either side is a scenario over a DuckLake base, `'main'` is the lake table *at that scenario's snapshot*, not the live lake. |
 | `scenario_diff_summary(scenario)` | `table_name, rows_added, rows_modified, rows_removed` | One row per table the scenario has written. |
 | `scenario_merge_preview(scenario)` | `table_name, key, action, conflict` | No side effects. `action`: `insert` / `update` / `delete`; `key` as text. |
-| `scenario_merge(scenario, on_conflict := 'abort'\|'ours'\|'theirs')` | `tables_changed, rows_applied, conflicts_resolved` | Applies the delta to the base; the scenario ends frozen, `merged_at` set, delta empty. |
+| `scenario_merge(scenario, on_conflict := 'abort'\|'ours'\|'theirs')` | `tables_changed, rows_applied, conflicts_resolved` | Applies the delta to the base; the scenario ends frozen, `merged_at` set, delta empty. Works while attached. A branch's merge includes its parent's changes. Delta scenarios don't detect base edits to rows they updated; the scenario's row wins silently (issue #53). |
 | `scenario_refresh(name, key_columns := MAP {...})` | `refreshed_tables` | **Deprecated.** Only still needed to declare `key_columns` for a keyless table the scenario has not written yet. |
 | `scenario_migrate()` | `migrated_scenarios, migrated_snapshots` | One-way upgrade of a v0.1 database. |
 
@@ -130,14 +130,15 @@ a name part containing a dot is double-quoted: `'"a.b"'` is the main table `a.b`
 | `DDL operations are not permitted in scenarios` | `CREATE` / `ALTER` / `DROP` against a scenario catalog | change the base schema; new base tables appear in delta scenarios automatically |
 | `Scenario '…' not found in database '…'` (ATTACH) | no scenario with that name in the session's default database | `CALL scenario_create('…')` first, or `USE` the database that holds it |
 | `Scenario '…' already exists` | name taken | pick another name or `scenario_drop` the old one |
-| `Invalid scenario name` | name must start with a letter or `_` | rename |
+| `Invalid scenario name` | only letters, digits and `_`, starting with a letter or `_` (`price-import` fails) | rename, e.g. `price_import` |
+| `exceeds the maximum length of 63 characters` | scenario name too long | shorten it |
 | `is attached as '…'. DETACH it before dropping` | `scenario_drop` on an attached scenario | `DETACH alias` first |
-| `other scenarios branch from it` | drop or merge of a scenario with branches | drop (or merge) the branches first |
+| `other scenarios branch from it` | drop or merge of a scenario with branches | drop the branches first; a merged branch still counts until it is dropped |
 | `is frozen. Unfreeze it with CALL scenario_unfreeze` | write to a frozen scenario | `scenario_unfreeze` (record why), or branch with `from_scenario` |
 | `is frozen. Unfreeze it before merging` | `scenario_merge` on a frozen scenario | unfreeze, then merge |
-| `was already merged back into the base` | second `scenario_merge` | nothing to do; create a new scenario for further changes |
+| `was already merged back into the base` | second `scenario_merge`, or `scenario_unfreeze` of a merged scenario | nothing to do; create a new scenario for further changes |
 | `the base changed underneath it` | merge conflict with `on_conflict := 'abort'` | inspect `scenario_merge_preview`, then rerun with `'ours'` or `'theirs'` |
-| `Violates foreign key constraint` (at merge) | a merged row references a parent missing in the base | add the parent to the scenario (or base) and merge again; nothing was applied |
+| `Violates foreign key constraint` (at merge) | a merged row references a parent missing in the base, or a new parent and a new child were inserted in the same scenario (tables are applied one at a time, issue #54) | add the parent row to the base first, then merge again; nothing was applied |
 | `the key exists in the base table` | INSERT of a key the base already has | `UPDATE`, `INSERT OR REPLACE` / `ON CONFLICT`, or delete it in the scenario first |
 | `the key was already inserted or modified in this scenario` | INSERT of a key the scenario already wrote | same as above |
 | `UNIQUE constraint on scenario table` | duplicate unique value vs. base or scenario rows | as for keys |

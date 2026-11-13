@@ -1,14 +1,14 @@
 ---
 name: anofox-scenario-snapshot-audit
 description: >
-  Immutable snapshots and audit trails with the anofox_scenario DuckDB extension: freeze an
+  Frozen snapshots and audit trails with the anofox_scenario DuckDB extension: freeze an
   approved plan, keep a point-in-time copy that later base changes cannot alter, show what
   changed since approval, and keep notes on why. Use when the user wants to freeze or
   lock a plan / budget / forecast version, keep an auditable record, compare today's data
   with an approved state, pin a scenario to a DuckLake snapshot, document decisions, or
   migrate a legacy v0.1 scenario database. Covers scenario_create(mode := 'materialized'),
   scenario_create(base := <ducklake>), scenario_freeze / scenario_unfreeze, scenario_diff
-  against 'main', scenario_list, the _scenario_protocols notes recipe and scenario_migrate.
+  against 'main', scenario_list, an append-only audit-notes recipe and scenario_migrate.
 version: 2026.10.21
 user-invocable: false
 ---
@@ -27,9 +27,14 @@ error messages see `anofox-scenario-reference`.
   did not change, so a frozen delta scenario still moves when the base changes. Use
   `mode := 'materialized'` (copies every base table at creation) or a DuckLake `base :=`
   (reads pinned to the creation time, no copy).
-- **Freezing is a switch, not a seal.** `scenario_freeze` rejects every write through any
-  handle; reads keep working. `scenario_unfreeze` reverses it. Treat unfreezing an approved
-  plan as an audited action, and record it (see "Audit notes").
+- **Freezing is a switch, not a seal.** `scenario_freeze` rejects every write through a
+  scenario catalog; reads keep working. `scenario_unfreeze` reverses it (except for a merged
+  scenario, which stays frozen). Treat unfreezing an approved plan as an audited action and
+  record it (see "Audit notes").
+- **Frozen is not tamper-proof.** Anyone with write access to the host database can change
+  the internal `__anofox_scenario` tables directly, and nothing would show it (issue #55).
+  For tamper evidence keep an external copy: `EXPORT DATABASE` plus a checksum stored
+  elsewhere, or DuckLake snapshots with a retention policy.
 - **Materialized creation copies all base tables** of the host database, and tables added to
   the base later are not part of the snapshot. `mode := 'materialized'` cannot be combined
   with `base :=` (a DuckLake base is pinned already) or `from_scenario` (a branch is always a
@@ -77,6 +82,10 @@ Compare the snapshot with the live table (`old` = approved, `new` = today):
 ```sql
 SELECT * FROM scenario_diff('budget_2026_approved', 'main', 'budget') ORDER BY cost_center;
 ```
+
+For a DuckLake-based approval, `'main'` here is the lake table *at the scenario's snapshot*,
+so this diff stays empty however the lake changes; compare with the live lake by a plain
+join instead (see "DuckLake").
 
 The 2-argument form `scenario_diff('budget_2026_approved', 'budget')` answers a different
 question: what the scenario itself changed relative to its creation snapshot (nothing, for a
@@ -131,34 +140,67 @@ SELECT count(*) FROM lba.budget;                    -- 2: pinned to the snapshot
 
 Tables the lake creates after the snapshot are not part of the scenario.
 
-## Audit notes
-
-Notes are plain SQL over a plain table; there is no dedicated API. Keep the decision, the
-approver and every unfreeze next to the data:
+What changed in the live lake since approval (a `scenario_diff` against `'main'` would compare
+with the pinned snapshot and show nothing):
 
 ```sql
-CREATE TABLE IF NOT EXISTS _scenario_protocols (
-    entity_type VARCHAR NOT NULL, entity_name VARCHAR NOT NULL, section VARCHAR NOT NULL,
-    content VARCHAR, updated_at TIMESTAMP DEFAULT current_timestamp,
-    PRIMARY KEY (entity_type, entity_name, section));
+-- requires: ducklake
+SELECT coalesce(a.cost_center, l.cost_center) AS cost_center,
+       a.amount AS approved, l.amount AS current
+FROM lba.budget a FULL JOIN lake.budget l USING (cost_center)
+WHERE a.amount IS DISTINCT FROM l.amount
+ORDER BY cost_center;
+```
 
-INSERT OR REPLACE INTO _scenario_protocols (entity_type, entity_name, section, content) VALUES
-    ('scenario', 'budget_2026_approved', 'approval', 'board meeting 2026-03-14, minutes ref B-26-03'),
-    ('scenario', 'budget_2026_rev1', 'why', 'sales headcount moved forward to Q2');
+A DuckLake-based snapshot is only readable while the lake keeps it: the DuckLake catalog
+file, its `DATA_PATH` files and the snapshot itself (not expired or compacted away) must be
+retained alongside the `.duckdb` file.
 
-SELECT entity_name, section, content FROM _scenario_protocols ORDER BY entity_name, section;
+## Audit notes
+
+Notes are plain SQL over plain tables; there is no dedicated API. Keep an append-only log
+of decisions next to the data: every approval, unfreeze and revision is a new row, nothing is
+updated or replaced.
+
+```sql
+CREATE SEQUENCE IF NOT EXISTS audit_events_seq;
+CREATE TABLE IF NOT EXISTS audit_events (
+    event_id BIGINT DEFAULT nextval('audit_events_seq') PRIMARY KEY,
+    scenario VARCHAR NOT NULL, event VARCHAR NOT NULL, actor VARCHAR,
+    logged_at TIMESTAMP DEFAULT current_timestamp, note VARCHAR);
+
+INSERT INTO audit_events (scenario, event, actor, note) VALUES
+    ('budget_2026_approved', 'approved', 'board', 'board meeting 2026-03-14, minutes ref B-26-03'),
+    ('budget_2026_rev1', 'created', 'cfo', 'sales headcount moved forward to Q2');
+
+SELECT scenario, event, actor, note FROM audit_events ORDER BY event_id;
+```
+
+Log an unfreeze in the same transaction as the unfreeze itself, so one never happens
+without the other:
+
+```sql
+BEGIN;
+CALL scenario_unfreeze('budget_2026_approved');
+INSERT INTO audit_events (scenario, event, actor, note)
+    VALUES ('budget_2026_approved', 'unfrozen', 'controller', 'correct CC-300 owner');
+COMMIT;
+CALL scenario_freeze('budget_2026_approved');
+INSERT INTO audit_events (scenario, event, actor) VALUES ('budget_2026_approved', 'frozen', 'controller');
 ```
 
 Export as Markdown:
 
 ```sql
-COPY (SELECT '## ' || entity_name || ' / ' || section || chr(10) || content
-      FROM _scenario_protocols ORDER BY entity_name, section)
-TO 'protocols.md' (FORMAT csv, QUOTE '', HEADER false);
+COPY (SELECT '## ' || scenario || ' / ' || event || ' (' || logged_at || ', ' || coalesce(actor, '?') || ')'
+             || chr(10) || coalesce(note, '')
+      FROM audit_events ORDER BY event_id)
+TO 'audit_events.md' (FORMAT csv, QUOTE '', HEADER false);
 ```
 
-Because scenarios, deltas, snapshots and notes all live in the host database, one
-`.duckdb` file is the complete record.
+For a host-database scenario, the scenarios, their deltas and copies, and these notes all
+live in the one `.duckdb` file. DuckLake-based scenarios additionally need the lake (see
+above). Databases migrated from v0.1 keep their notes in `_scenario_protocols`.
 
 ## Legacy databases (v0.1)
 

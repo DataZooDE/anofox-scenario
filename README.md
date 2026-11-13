@@ -56,7 +56,7 @@ single file containing both a baseline and the alternatives. Typical uses:
 - **S&OP and demand planning** — model demand shifts, supply disruptions, or price changes
 - **Budget planning** — keep optimistic, pessimistic, and baseline variants side by side
 - **Data validation** — try an ETL or migration change in a branch before applying it for real
-- **Audit trails** — freeze an approved plan as an immutable record you can diff against later
+- **Audit trails** — freeze an approved plan as a point-in-time record you can diff against later
 
 **Not a fit if** you need multiple people writing to the same scenario concurrently, you're
 working at data-lake scale across a cluster, or you need to change the *schema* inside a
@@ -152,8 +152,8 @@ CALL scenario_create('price_increase_eu', from_scenario := 'price_increase');
 -- Full copy instead of a delta: immune to later base changes
 CALL scenario_create('q2_approved', mode := 'materialized');
 
--- Reject further writes; reads keep working. A frozen materialized
--- scenario is effectively an immutable snapshot.
+-- Reject further writes through the scenario; reads keep working. A frozen
+-- materialized scenario is a point-in-time snapshot.
 CALL scenario_freeze('q2_approved');
 ```
 
@@ -180,6 +180,10 @@ SELECT * FROM scenario_merge('price_increase', on_conflict := 'abort');
 
 On success the scenario ends up frozen with an empty delta. Use `on_conflict := 'ours'` to let
 the scenario win or `'theirs'` to let the base win, instead of aborting.
+
+> **Note:** a default (delta) scenario does not detect a base edit to a row it also updated:
+> the scenario's row overwrites it ([#53](https://github.com/DataZooDE/anofox-scenario/issues/53)).
+> Merge soon after the dry run, or use `mode := 'materialized'`, which reports such rows as conflicts.
 
 ```sql
 DETACH pi;  -- handle gone, scenario data persists
@@ -249,7 +253,7 @@ scenario_create()                      Register a scenario
         │
         ├── scenario_diff()            Diff against baseline or another scenario
         │
-        ├── scenario_freeze()          Make it read-only (immutable when materialized)
+        ├── scenario_freeze()          Reject writes (a point-in-time snapshot when materialized)
         │
         ├── scenario_merge()           Apply changes back to the base
         │
@@ -300,7 +304,7 @@ of rows: every column is the identity and a changed row shows as `removed` + `ad
 
 ### Snapshots and Audit Notes
 
-There is no separate snapshot or protocol API. For an immutable point-in-time capture, create a
+There is no separate snapshot or protocol API. For a point-in-time capture, create a
 materialized scenario and freeze it:
 
 <!-- doc-snippets: new session -->

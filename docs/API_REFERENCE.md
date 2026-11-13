@@ -144,6 +144,8 @@ CALL scenario_drop('optimistic');                    -- refuses while attached o
 
 | Limitation | Notes |
 | --- | --- |
+| Delta-mode merge does not detect a base edit to a row the scenario updated: the scenario's row overwrites it, even with `on_conflict := 'abort'`, and the preview shows no conflict (#53) | merge right after the dry run, or use `mode := 'materialized'` / a DuckLake base, which flag such drift |
+| `scenario_merge` applies tables one at a time with immediate FK checks: a scenario inserting a new parent and a new child referencing it fails to merge (#54) | add the parent rows to the base first |
 | Views with *qualified* table references keep reading their explicit target (unqualified references rebind to scenario tables) | documented semantics |
 | DuckLake merge-back: lake apply commits in its own transaction (autocommit required, no cross-catalog 2PC) | the lake commit is tagged; if the host bookkeeping fails afterwards, re-running `scenario_merge` finishes it without re-applying. Refused if the scenario was written to in between |
 | Keyless scenarios written before v0.4.1: keyless `UPDATE`/`DELETE` needs the delta upgraded first, which happens on a plain `ATTACH` (autocommit or a transaction already writing the host, not `READ_ONLY`, no other transaction active on the host). Otherwise ATTACH succeeds, reads are correct, and the DML error asks to re-`ATTACH` | reads and `INSERT` are unaffected |
@@ -160,7 +162,7 @@ CALL scenario_drop('optimistic');                    -- refuses while attached o
 | `SELECT * FROM scenario_diff(a, b, table)` | table | Generic diff between two merged relations (`'main'` or any scenario). `old` = side a, `new` = side b. `'main'` is the origin table of the scenario on the other side, in its base catalog: pinned to the scenario's creation snapshot for DuckLake bases, live otherwise. DuckLake-based scenarios are always diffed at their snapshot, so later lake changes never show as scenario changes. |
 | `SELECT * FROM scenario_diff_summary(scenario)` | table | Per-table `rows_added / rows_modified / rows_removed` from the delta changelog, one row per table the scenario has written (a table never written has no delta and no row). For keyless tables these are the net counts per distinct row (`rows_modified` is 0). |
 | `SELECT * FROM scenario_merge_preview(scenario)` | table | Planned merge-back actions: `table_name, key, action, conflict`. Streaming; no side effects. Overlay conflicts: an `insert` whose key now exists in base, an `update` whose key vanished. Scenarios with a creation snapshot (materialized, DuckLake) additionally flag 3-way *drift* conflicts: the base row changed since the snapshot on a touched key. Keyless tables list the per-value net plan the merge applies: one row per copy deleted or inserted, `key` = the whole row as text, e.g. `(A, 1)`. For keyless tables of snapshot scenarios (materialized, DuckLake) a `delete` conflicts when the base's number of copies of that row differs from the snapshot's. |
-| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). Keyless tables merge as bags: per distinct row (NULL-safe whole-row match) the net delete count `n` removes exactly `n` copies and a net insert count adds that many; on a drifted row of a snapshot scenario (materialized or DuckLake) `theirs` keeps the base's copies and `ours` sets the base to the scenario's count. On a DuckLake base the lake commit is tagged (`commit_extra_info`), so a merge whose host bookkeeping failed can simply be re-run. On success the scenario ends `frozen` with `merged_at` set and an empty delta, and the function returns one row `tables_changed, rows_applied, conflicts_resolved`. Refuses while branches exist, while the scenario is frozen, and once it has been merged. With a host base, a `ROLLBACK` of the surrounding transaction undoes the merge and leaves the scenario mergeable. |
+| `SELECT * FROM scenario_merge(scenario, [on_conflict := 'abort'\|'ours'\|'theirs'])` | verb | Apply the scenario's delta to the base. `abort` (default) throws on any conflict; `ours` = scenario wins; `theirs` = base wins. Host bases apply atomically in the caller's transaction; DuckLake bases apply atomically on the lake side in their own transaction (autocommit required). Keyless tables merge as bags: per distinct row (NULL-safe whole-row match) the net delete count `n` removes exactly `n` copies and a net insert count adds that many; on a drifted row of a snapshot scenario (materialized or DuckLake) `theirs` keeps the base's copies and `ours` sets the base to the scenario's count. On a DuckLake base the lake commit is tagged (`commit_extra_info`), so a merge whose host bookkeeping failed can simply be re-run. On success the scenario ends `frozen` with `merged_at` set and an empty delta, and the function returns one row `tables_changed, rows_applied, conflicts_resolved`. Refuses while branches exist (a merged branch counts until it is dropped), while the scenario is frozen, and once it has been merged. Merging a branch applies its parent's changes too. Delta scenarios do not detect base edits to rows they updated (#53); foreign keys are checked table by table (#54). With a host base, a `ROLLBACK` of the surrounding transaction undoes the merge and leaves the scenario mergeable. |
 | `SELECT * FROM scenario_refresh(name, [key_columns := MAP {...}])` | verb | **Deprecated (#34).** Tables added to the base after `scenario_create` are writable without it, and it no longer creates delta tables. What remains: `key_columns` declares the row identity of keyless tables the scenario does not track yet (no declared key, never written); rejected once a table is tracked, except to replace a declared key whose column was renamed or dropped in the base before the table's first write. For DuckLake bases the table must be in the scenario's snapshot. Returns `refreshed_tables`, the number of keys declared (`0` without `key_columns`). Refuses frozen and materialized scenarios. |
 | `SELECT * FROM scenario_migrate()` | verb | Returns `migrated_scenarios, migrated_snapshots` (both `0` on a database without legacy tables). One-way migration of a legacy v0.1 database (`_scenario_registry`, `_scen_*`, `_snap_*`) into the v2 layout. Archived -> frozen; snapshots -> materialized+frozen; multi-op delta rows folded to net effects; `_scenario_base_rowids` dropped; `_scenario_protocols` preserved. |
 | `ATTACH 'name' AS alias (TYPE scenario [, READ_ONLY])` / `DETACH alias` | SQL | The entire read/write UX. `USE alias` makes unqualified table names resolve to the scenario. |
@@ -204,20 +206,27 @@ and `scenario_merge` replays it.
 
 ## Protocols / Audit Notes
 
-Protocol notes are plain SQL over a plain table - no dedicated API. Recommended recipe:
+Protocol notes are plain SQL over plain tables - no dedicated API. Recommended recipe: an
+append-only event log (every approval, unfreeze or revision is a new row; nothing is replaced):
 
 ```sql
-CREATE TABLE IF NOT EXISTS _scenario_protocols (
-    entity_type VARCHAR NOT NULL, entity_name VARCHAR NOT NULL, section VARCHAR NOT NULL,
-    content VARCHAR, updated_at TIMESTAMP DEFAULT current_timestamp,
-    PRIMARY KEY (entity_type, entity_name, section));
+CREATE SEQUENCE IF NOT EXISTS audit_events_seq;
+CREATE TABLE IF NOT EXISTS audit_events (
+    event_id BIGINT DEFAULT nextval('audit_events_seq') PRIMARY KEY,
+    scenario VARCHAR NOT NULL, event VARCHAR NOT NULL, actor VARCHAR,
+    logged_at TIMESTAMP DEFAULT current_timestamp, note VARCHAR);
 
-INSERT OR REPLACE INTO _scenario_protocols VALUES
-    ('scenario', 'optimistic', 'why', 'testing demand +10% for the Q3 review', current_timestamp);
+INSERT INTO audit_events (scenario, event, actor, note) VALUES
+    ('optimistic', 'created', 'planning', 'testing demand +10% for the Q3 review');
 
 -- export to markdown
-COPY (SELECT '## ' || entity_name || chr(10) || content FROM _scenario_protocols ORDER BY entity_name)
-TO 'protocols.md' (FORMAT csv, QUOTE '', HEADER false);
+COPY (SELECT '## ' || scenario || ' / ' || event || chr(10) || coalesce(note, '')
+      FROM audit_events ORDER BY event_id)
+TO 'audit_events.md' (FORMAT csv, QUOTE '', HEADER false);
 ```
+
+Freezing guards writes through scenario catalogs; it is not tamper protection against direct
+host SQL on the internal `__anofox_scenario` tables (#55). For tamper evidence keep an
+external copy (`EXPORT DATABASE` plus a checksum) or use DuckLake snapshots with retention.
 
 (Databases migrated from v0.1 keep their existing `_scenario_protocols` rows unchanged.)
