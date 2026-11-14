@@ -937,9 +937,9 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 		                            dc::Str(bind_data.name));
 	}
 	auto emit_counts = [&](idx_t tables_changed, idx_t rows_applied, idx_t conflicts_resolved) {
-		output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
-		output.SetValue(1, 0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
-		output.SetValue(2, 0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
+		output.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(tables_changed)));
+		output.data[1].SetValue(0, Value::BIGINT(NumericCast<int64_t>(rows_applied)));
+		output.data[2].SetValue(0, Value::BIGINT(NumericCast<int64_t>(conflicts_resolved)));
 		output.SetChildCardinality(1);
 	};
 	// nothing to merge (the preview's plan is empty): a no-op that leaves the
@@ -1291,7 +1291,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 						row_ids.SetValue(i, Value::BIGINT(update.first));
 						auto &payload = rows[update.second].payload;
 						for (idx_t c = 0; c < in_place_columns.size(); c++) {
-							update_chunk.SetValue(c, i, payload[in_place_columns[c].index]);
+							update_chunk.data[c].SetValue(i, payload[in_place_columns[c].index]);
 						}
 					}
 					update_chunk.SetChildCardinality(batch);
@@ -1319,7 +1319,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				for (auto row_idx : append_rows) {
 					auto &row = rows[row_idx];
 					for (idx_t col = 0; col < row.payload.size(); col++) {
-						append_chunk.SetValue(col, count, row.payload[col]);
+						append_chunk.data[col].SetValue(count, row.payload[col]);
 					}
 					if (++count == STANDARD_VECTOR_SIZE) {
 						flush();
@@ -1481,7 +1481,7 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 				for (idx_t n = 0; n < net_pair.second.add; n++) {
 					auto &payload = *net_pair.second.payload;
 					for (idx_t col = 0; col < payload.size(); col++) {
-						append_chunk.SetValue(col, count, payload[col]);
+						append_chunk.data[col].SetValue(count, payload[col]);
 					}
 					inserted++;
 					if (++count == STANDARD_VECTOR_SIZE) {

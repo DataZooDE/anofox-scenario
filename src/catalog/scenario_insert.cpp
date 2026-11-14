@@ -364,7 +364,7 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 	delta_chunk.Reset();
 	auto now = Timestamp::GetCurrentTimestamp();
 	for (idx_t i = 0; i < chunk.size(); i++) {
-		delta_chunk.SetValue(ScenarioDelta::OP_COL, i, Value(string(1, row_ops[i])));
+		delta_chunk.data[ScenarioDelta::OP_COL].SetValue(i, Value(string(1, row_ops[i])));
 	}
 	dc::ReferenceValue(delta_chunk.data[ScenarioDelta::TS_COL], Value::TIMESTAMP(now), chunk.size());
 	for (idx_t col = 0; col < chunk.ColumnCount(); col++) {
@@ -391,11 +391,11 @@ SinkResultType PhysicalScenarioInsert::Sink(ExecutionContext &context, DataChunk
 		deleted_chunk.Initialize(Allocator::Get(client), delta_types);
 		for (idx_t i = 0; i < tombstone_source_rows.size(); i++) {
 			for (idx_t col = 0; col < delta_types.size(); col++) {
-				deleted_chunk.SetValue(col, i, Value(delta_types[col]));
+				deleted_chunk.data[col].SetValue(i, Value(delta_types[col]));
 			}
 			for (auto pk_col : gstate.pk_columns) {
-				deleted_chunk.SetValue(ScenarioDelta::PAYLOAD_START + pk_col, i,
-				                       chunk.GetValue(pk_col, tombstone_source_rows[i]));
+				deleted_chunk.data[ScenarioDelta::PAYLOAD_START + pk_col].SetValue(
+				    i, chunk.GetValue(pk_col, tombstone_source_rows[i]));
 			}
 		}
 		deleted_chunk.SetChildCardinality(tombstone_source_rows.size());
@@ -432,7 +432,7 @@ SourceResultType PhysicalScenarioInsert::GetDataInternal(ExecutionContext &conte
 		return SourceResultType::FINISHED;
 	}
 	source.count_emitted = true;
-	chunk.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
+	chunk.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(gstate.insert_count)));
 	chunk.SetChildCardinality(1);
 	return SourceResultType::FINISHED;
 }

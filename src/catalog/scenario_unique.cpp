@@ -112,7 +112,7 @@ void ScenarioBaseUniqueProbe::CollectReplaced(ClientContext &context, DuckTableE
 			key_chunk.Reset();
 			vector<Value> key_values;
 			for (idx_t k = 0; k < key_columns.size(); k++) {
-				key_chunk.SetValue(k, 0, pending[key_columns[k]]);
+				key_chunk.data[k].SetValue(0, pending[key_columns[k]]);
 				key_values.push_back(pending[key_columns[k]]);
 			}
 			key_chunk.SetChildCardinality(1);
@@ -137,10 +137,10 @@ void ScenarioBaseUniqueProbe::CollectReplaced(ClientContext &context, DuckTableE
 				idx_t count = 0;
 				for (; it != replaced_keys.end() && count < STANDARD_VECTOR_SIZE; ++it, count++) {
 					for (idx_t col = 0; col < column_count; col++) {
-						key_rows.SetValue(col, count, Value(table_types[col]));
+						key_rows.data[col].SetValue(count, Value(table_types[col]));
 					}
 					for (idx_t k = 0; k < key_columns.size(); k++) {
-						key_rows.SetValue(key_columns[k], count, it->second[k]);
+						key_rows.data[key_columns[k]].SetValue(count, it->second[k]);
 					}
 				}
 				key_rows.SetChildCardinality(count);
@@ -242,7 +242,7 @@ void ScenarioBaseUniqueProbe::ProbeSecondary(ClientContext &context, DuckTableEn
 			Vector mask_row_ids(LogicalType::ROW_TYPE, batch);
 			for (idx_t i = 0; i < batch; i++) {
 				for (idx_t col = 0; col < column_count; col++) {
-					mask_rows.SetValue(col, i, replaced_rows[offset + i][col]);
+					mask_rows.data[col].SetValue(i, replaced_rows[offset + i][col]);
 				}
 				mask_row_ids.SetValue(i, Value::BIGINT(replaced_row_ids[offset + i]));
 			}
@@ -362,7 +362,7 @@ void ScenarioBaseUniqueProbe::ProbeKeyless(ClientContext &context, DuckTableEntr
 				}
 				single.Reset();
 				for (idx_t col = 0; col < column_count; col++) {
-					single.SetValue(col, 0, rows.GetValue(col, i));
+					single.data[col].SetValue(0, rows.GetValue(col, i));
 				}
 				single.SetChildCardinality(1);
 				try {

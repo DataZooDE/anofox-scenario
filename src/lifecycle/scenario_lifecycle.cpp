@@ -182,7 +182,7 @@ void LifecycleExecute(ClientContext &context, TableFunctionInput &data, DataChun
 	}
 	auto &bind_data = data.bind_data->Cast<LifecycleBindData>();
 	VERB(context, bind_data);
-	output.SetValue(0, 0, Value::BOOLEAN(true));
+	output.data[0].SetValue(0, Value::BOOLEAN(true));
 	output.SetChildCardinality(1);
 	state.done = true;
 }
@@ -590,7 +590,7 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 			refreshed++;
 		}
 	}
-	output.SetValue(0, 0, Value::BIGINT(NumericCast<int64_t>(refreshed)));
+	output.data[0].SetValue(0, Value::BIGINT(NumericCast<int64_t>(refreshed)));
 	output.SetChildCardinality(1);
 }
 
@@ -629,21 +629,21 @@ void ScenarioListExecute(ClientContext &context, TableFunctionInput &data, DataC
 	idx_t count = 0;
 	while (state.offset < state.entries.size() && count < STANDARD_VECTOR_SIZE) {
 		auto &entry = state.entries[state.offset++];
-		output.SetValue(0, count, Value::BIGINT(entry.scenario_id));
-		output.SetValue(1, count, Value(entry.name));
-		output.SetValue(2, count, Value(entry.mode));
-		output.SetValue(3, count, Value::BOOLEAN(entry.frozen));
+		output.data[0].SetValue(count, Value::BIGINT(entry.scenario_id));
+		output.data[1].SetValue(count, Value(entry.name));
+		output.data[2].SetValue(count, Value(entry.mode));
+		output.data[3].SetValue(count, Value::BOOLEAN(entry.frozen));
 		if (entry.parent_id >= 0) {
 			auto parent = state.names_by_id.find(entry.parent_id);
-			output.SetValue(4, count,
-			                parent != state.names_by_id.end() ? Value(parent->second) : Value(LogicalType::VARCHAR));
+			output.data[4].SetValue(count, parent != state.names_by_id.end() ? Value(parent->second)
+			                                                                 : Value(LogicalType::VARCHAR));
 		} else {
-			output.SetValue(4, count, Value(LogicalType::VARCHAR));
+			output.data[4].SetValue(count, Value(LogicalType::VARCHAR));
 		}
-		output.SetValue(5, count, Value::TIMESTAMP(entry.created_at));
-		output.SetValue(6, count, entry.has_description ? Value(entry.description) : Value(LogicalType::VARCHAR));
-		output.SetValue(7, count,
-		                entry.has_merged_at ? Value::TIMESTAMP(entry.merged_at) : Value(LogicalType::TIMESTAMP));
+		output.data[5].SetValue(count, Value::TIMESTAMP(entry.created_at));
+		output.data[6].SetValue(count, entry.has_description ? Value(entry.description) : Value(LogicalType::VARCHAR));
+		output.data[7].SetValue(count, entry.has_merged_at ? Value::TIMESTAMP(entry.merged_at)
+		                                                   : Value(LogicalType::TIMESTAMP));
 		count++;
 	}
 	output.SetChildCardinality(count);

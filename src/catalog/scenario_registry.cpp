@@ -334,9 +334,9 @@ void ScenarioRegistry::InsertDeclaredKey(ClientContext &context, Catalog &host_c
 	for (auto &column : key_columns) {
 		keys.emplace_back(column);
 	}
-	chunk.SetValue(TAB_COL_SCENARIO_ID, 0, Value::BIGINT(scenario_id));
-	chunk.SetValue(TAB_COL_TABLE_NAME, 0, Value(table_name));
-	chunk.SetValue(TAB_COL_KEY_COLUMNS, 0, Value::LIST(LogicalType::VARCHAR, std::move(keys)));
+	chunk.data[TAB_COL_SCENARIO_ID].SetValue(0, Value::BIGINT(scenario_id));
+	chunk.data[TAB_COL_TABLE_NAME].SetValue(0, Value(table_name));
+	chunk.data[TAB_COL_KEY_COLUMNS].SetValue(0, Value::LIST(LogicalType::VARCHAR, std::move(keys)));
 	chunk.SetChildCardinality(1);
 	auto binder = Binder::CreateBinder(context);
 	auto bound_constraints = binder->BindConstraints(table);
@@ -391,9 +391,9 @@ void ScenarioRegistry::ReplaceDeclaredKey(ClientContext &context, Catalog &host_
 		for (auto &column : keys) {
 			key_values.emplace_back(column);
 		}
-		chunk.SetValue(TAB_COL_SCENARIO_ID, 0, Value::BIGINT(scenario_id));
-		chunk.SetValue(TAB_COL_TABLE_NAME, 0, Value(table_name));
-		chunk.SetValue(TAB_COL_KEY_COLUMNS, 0, Value::LIST(LogicalType::VARCHAR, std::move(key_values)));
+		chunk.data[TAB_COL_SCENARIO_ID].SetValue(0, Value::BIGINT(scenario_id));
+		chunk.data[TAB_COL_TABLE_NAME].SetValue(0, Value(table_name));
+		chunk.data[TAB_COL_KEY_COLUMNS].SetValue(0, Value::LIST(LogicalType::VARCHAR, std::move(key_values)));
 		chunk.SetChildCardinality(1);
 	};
 	DataChunk old_row, new_row;
@@ -543,21 +543,21 @@ void ScenarioRegistry::Insert(ClientContext &context, Catalog &host_catalog, con
 	auto &data_table = table.GetStorage();
 	DataChunk chunk;
 	chunk.Initialize(Allocator::Get(context), data_table.GetTypes());
-	chunk.SetValue(REG_COL_SCENARIO_ID, 0, Value::BIGINT(entry.scenario_id));
-	chunk.SetValue(REG_COL_NAME, 0, Value(entry.name));
-	chunk.SetValue(REG_COL_MODE, 0, Value(entry.mode));
-	chunk.SetValue(REG_COL_FROZEN, 0, Value::BOOLEAN(entry.frozen));
-	chunk.SetValue(REG_COL_PARENT_ID, 0,
-	               entry.parent_id < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(entry.parent_id));
-	chunk.SetValue(REG_COL_BASE_SNAPSHOT_ID, 0,
-	               entry.base_snapshot_id < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(entry.base_snapshot_id));
-	chunk.SetValue(REG_COL_CREATED_AT, 0, Value::TIMESTAMP(entry.created_at));
-	chunk.SetValue(REG_COL_MERGED_AT, 0,
-	               entry.has_merged_at ? Value::TIMESTAMP(entry.merged_at) : Value(LogicalType::TIMESTAMP));
-	chunk.SetValue(REG_COL_DESCRIPTION, 0,
-	               entry.has_description ? Value(entry.description) : Value(LogicalType::VARCHAR));
-	chunk.SetValue(REG_COL_BASE_CATALOG, 0,
-	               entry.base_catalog.empty() ? Value(LogicalType::VARCHAR) : Value(entry.base_catalog));
+	chunk.data[REG_COL_SCENARIO_ID].SetValue(0, Value::BIGINT(entry.scenario_id));
+	chunk.data[REG_COL_NAME].SetValue(0, Value(entry.name));
+	chunk.data[REG_COL_MODE].SetValue(0, Value(entry.mode));
+	chunk.data[REG_COL_FROZEN].SetValue(0, Value::BOOLEAN(entry.frozen));
+	chunk.data[REG_COL_PARENT_ID].SetValue(0, entry.parent_id < 0 ? Value(LogicalType::BIGINT)
+	                                                              : Value::BIGINT(entry.parent_id));
+	chunk.data[REG_COL_BASE_SNAPSHOT_ID].SetValue(
+	    0, entry.base_snapshot_id < 0 ? Value(LogicalType::BIGINT) : Value::BIGINT(entry.base_snapshot_id));
+	chunk.data[REG_COL_CREATED_AT].SetValue(0, Value::TIMESTAMP(entry.created_at));
+	chunk.data[REG_COL_MERGED_AT].SetValue(0, entry.has_merged_at ? Value::TIMESTAMP(entry.merged_at)
+	                                                              : Value(LogicalType::TIMESTAMP));
+	chunk.data[REG_COL_DESCRIPTION].SetValue(0, entry.has_description ? Value(entry.description)
+	                                                                  : Value(LogicalType::VARCHAR));
+	chunk.data[REG_COL_BASE_CATALOG].SetValue(0, entry.base_catalog.empty() ? Value(LogicalType::VARCHAR)
+	                                                                        : Value(entry.base_catalog));
 	chunk.SetChildCardinality(1);
 
 	auto binder = Binder::CreateBinder(context);
@@ -600,7 +600,7 @@ void ScenarioRegistry::SetFrozen(ClientContext &context, Catalog &host_catalog, 
 	row_ids.SetValue(0, Value::BIGINT(row_id));
 	DataChunk update_chunk;
 	update_chunk.Initialize(Allocator::Get(context), {LogicalType::BOOLEAN});
-	update_chunk.SetValue(0, 0, Value::BOOLEAN(frozen));
+	update_chunk.data[0].SetValue(0, Value::BOOLEAN(frozen));
 	update_chunk.SetChildCardinality(1);
 	vector<PhysicalIndex> column_ids {PhysicalIndex(REG_COL_FROZEN)};
 	dc::SetVectorSize(row_ids, 1);
@@ -624,8 +624,8 @@ void ScenarioRegistry::MarkMerged(ClientContext &context, Catalog &host_catalog,
 	row_ids.SetValue(0, Value::BIGINT(row_id));
 	DataChunk update_chunk;
 	update_chunk.Initialize(Allocator::Get(context), {LogicalType::BOOLEAN, LogicalType::TIMESTAMP});
-	update_chunk.SetValue(0, 0, Value::BOOLEAN(true));
-	update_chunk.SetValue(1, 0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+	update_chunk.data[0].SetValue(0, Value::BOOLEAN(true));
+	update_chunk.data[1].SetValue(0, Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
 	update_chunk.SetChildCardinality(1);
 	vector<PhysicalIndex> column_ids {PhysicalIndex(REG_COL_FROZEN), PhysicalIndex(REG_COL_MERGED_AT)};
 	dc::SetVectorSize(row_ids, 1);
