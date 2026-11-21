@@ -636,7 +636,10 @@ Every reader of a `snapshot` scenario applies the same pin: the scan (a `BoundAt
 foreign scan), merge-back and its preview (the 3-way drift reference), and `scenario_diff`. The diff
 reads the base `AT (TIMESTAMP => created_at)` for `old_value` and for the merged relation, and its
 `'main'` side is the scenario's origin in its base catalog, pinned for DuckLake and live for
-unversioned bases.
+unversioned bases. `created_at` is a UTC instant stored as `TIMESTAMP`; every pin passes it as a
+`TIMESTAMPTZ` (`Value::TIMESTAMPTZ`, `ScenarioDelta::PinLiteral`: `TIMESTAMPTZ '...+00'`), since
+DuckLake reads a naive `TIMESTAMP` in the session's `TimeZone` and the pin would move by the UTC
+offset (`scenario_ducklake_timezone.test`).
 
 ---
 
@@ -748,7 +751,7 @@ reports `merged_at`). An empty plan is the exception (above).
 
 ## DuckDB versions
 
-One source tree builds against DuckDB v1.5.6 and the DuckDB 2.0 pre-release that
+One source tree builds against DuckDB v2.0.1 (the submodule pin) and v1.5.6, the two lines
 community-extensions builds (see `docs/UPDATING.md`). Call sites carry no version checks: API
 differences sit behind helpers that detect the API by its shape (overload resolution / SFINAE),
 in two places:

@@ -1049,7 +1049,10 @@ TableFunction ScenarioScanFunction::GetFunction(ClientContext &context, Scenario
 		unique_ptr<BoundAtClause> at_clause;
 		auto &base_catalog = scenario_catalog.GetBaseCatalog(context);
 		if (base_catalog.GetCatalogType() == "ducklake") {
-			at_clause = make_uniq<BoundAtClause>("timestamp", Value::TIMESTAMP(scenario_catalog.created_at));
+			// created_at is a UTC instant: pass it as TIMESTAMPTZ, a naive
+			// TIMESTAMP is read in the session's TimeZone
+			at_clause = make_uniq<BoundAtClause>(
+			    "timestamp", Value::TIMESTAMPTZ(timestamp_tz_t(scenario_catalog.created_at)));
 		}
 		EntryLookupInfo foreign_lookup(CatalogType::TABLE_ENTRY, dc::EntryName(dc::Str(entry.base_entry.name)),
 		                               at_clause.get(), QueryErrorContext());

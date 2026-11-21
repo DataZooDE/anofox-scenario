@@ -674,7 +674,9 @@ vector<idx_t> ScenarioDelta::GetKeyColumns(ClientContext &context, Catalog &host
 optional_ptr<TableCatalogEntry> ScenarioDelta::GetPinnedBaseEntry(ClientContext &context, Catalog &base_catalog,
                                                                  const string &schema_name, const string &table_name,
                                                                  timestamp_t at) {
-	BoundAtClause at_clause("timestamp", Value::TIMESTAMP(at));
+	// `at` is a UTC instant (created_at): TIMESTAMPTZ, not a naive TIMESTAMP that
+	// DuckLake would read in the session's TimeZone
+	BoundAtClause at_clause("timestamp", Value::TIMESTAMPTZ(timestamp_tz_t(at)));
 	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, dc::EntryName(table_name), &at_clause, QueryErrorContext());
 	optional_ptr<CatalogEntry> pinned;
 	try {

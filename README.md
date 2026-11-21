@@ -66,8 +66,8 @@ branch — DDL in scenarios is rejected by design.
 
 ## Installation
 
-Requires DuckDB v1.5.5 or later. The same source also builds against DuckDB 2.0 (the pre-release
-duckdb/community-extensions builds against); see [docs/UPDATING.md](docs/UPDATING.md).
+Requires DuckDB v1.5.5 or later; builds are published for DuckDB v2.0.1 and v1.5.6 from the same
+source (see [docs/UPDATING.md](docs/UPDATING.md)).
 
 ```sql
 INSTALL anofox_scenario FROM community;

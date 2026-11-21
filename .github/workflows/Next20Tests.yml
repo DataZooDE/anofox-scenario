@@ -1,10 +1,8 @@
 #
-# Runs the SQL suite on the DuckDB 2.0 line on macOS. The distribution jobs
-# cannot: they link a prebuilt DuckDB whose version string differs from the
-# extension's, so every `require anofox_scenario` test is skipped there. Here
-# DuckDB is built from source at the commit community-extensions uses (see
-# docs/UPDATING.md), so the extension loads and the tests run - the setup in
-# which community-extensions' osx_arm64 build caught macOS-only failures.
+# Runs the full suite (test/*, incl. test/cpp) on the DuckDB 2.0 line on macOS,
+# with DuckDB built from source at the submodule's v2.0.1 commit - the setup in
+# which community-extensions' osx_arm64 build caught macOS-only failures. It
+# fails if the extension did not load (every `require` skipped).
 #
 name: DuckDB 2.0 tests (macOS)
 on:
@@ -18,7 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  DUCKDB_COMMIT: d54cbbe3df17e8e5ce68312f483b4155836112aa
+  DUCKDB_COMMIT: 8d78114e90a53823803660bf821f6073ac87da8c  # v2.0.1
   CI_TOOLS_REF: v2.0-cyanoptera
 
 jobs:

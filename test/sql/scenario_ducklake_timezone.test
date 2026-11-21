@@ -1,0 +1,97 @@
+# name: test/sql/scenario_ducklake_timezone.test
+# description: a DuckLake base is pinned to the scenario's creation instant whatever the session TimeZone
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+require parquet
+
+require icu
+
+# needs the ducklake extension installed for the running duckdb version;
+# run with DUCKLAKE_TESTS=1 (release build)
+require-env DUCKLAKE_TESTS
+
+# created_at is a UTC instant stored as TIMESTAMP. Passed to DuckLake's
+# AT (TIMESTAMP => ...) as a naive TIMESTAMP it was read in the session's
+# TimeZone: east of UTC the pin landed hours before the scenario existed
+# ("No snapshot found at timestamp ..." right after creation, or an older
+# snapshot on an older lake), west of UTC hours after it.
+statement ok
+SET TimeZone = 'Asia/Tokyo';
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH 'ducklake:__TEST_DIR__/tz_meta.ducklake' AS lake (DATA_PATH '__TEST_DIR__/tz_data');
+
+statement ok
+CREATE TABLE lake.budget (cost_center VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO lake.budget VALUES ('CC-100', 50000), ('CC-200', 72000);
+
+statement ok
+CALL scenario_create('tz_east', base := 'lake', key_columns := MAP {'budget': ['cost_center']});
+
+statement ok
+ATTACH 'tz_east' AS te (TYPE scenario);
+
+# merge-on-read scan, pinned to the creation instant
+query TI
+SELECT * FROM te.budget ORDER BY cost_center;
+----
+CC-100	50000
+CC-200	72000
+
+# a lake commit after creation stays invisible (America/Los_Angeles: a pin read
+# as local time would land hours after creation and see it)
+statement ok
+INSERT INTO lake.budget VALUES ('CC-300', 9000);
+
+statement ok
+SET TimeZone = 'America/Los_Angeles';
+
+query I
+SELECT count(*) FROM te.budget;
+----
+2
+
+# writes resolve the pinned table entry
+statement ok
+UPDATE te.budget SET amount = 51000 WHERE cost_center = 'CC-100';
+
+# diffs compare with the pinned snapshot: only the update, never CC-300
+query TTTT
+SELECT cost_center, change_type, old_value, new_value FROM scenario_diff('tz_east', 'budget');
+----
+CC-100	modified	50000	51000
+
+statement ok
+SET TimeZone = 'Asia/Tokyo';
+
+query TTTT
+SELECT cost_center, change_type, old_value, new_value FROM scenario_diff('main', 'tz_east', 'budget');
+----
+CC-100	modified	50000	51000
+
+statement ok
+DETACH te;
+
+# merge checks drift against the pinned snapshot and applies the update
+statement ok
+SELECT * FROM scenario_merge('tz_east');
+
+query TI
+SELECT * FROM lake.budget ORDER BY cost_center;
+----
+CC-100	51000
+CC-200	72000
+CC-300	9000
+
+statement ok
+CALL scenario_drop('tz_east');
+
+statement ok
+DETACH lake;

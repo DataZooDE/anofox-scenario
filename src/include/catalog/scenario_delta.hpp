@@ -203,6 +203,12 @@ public:
 	static optional_ptr<TableCatalogEntry> GetPinnedBaseEntry(ClientContext &context, Catalog &base_catalog,
 	                                                          const string &schema_name, const string &table_name,
 	                                                          timestamp_t at);
+	//! SQL literal for an AT (TIMESTAMP => ...) pin at the UTC instant `at`
+	//! (created_at): a TIMESTAMPTZ with an explicit +00 offset. A naive
+	//! TIMESTAMP literal would be read in the session's TimeZone.
+	static string PinLiteral(timestamp_t at) {
+		return "TIMESTAMPTZ '" + Timestamp::ToString(at) + "+00'";
+	}
 
 	//! Serialize the key columns of a row into a canonical comparable string
 	//! (length-prefixed, NULL-tagged). Used for suppression sets and the
