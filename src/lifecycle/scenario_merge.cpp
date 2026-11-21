@@ -288,7 +288,7 @@ unique_ptr<TableRef> MergePreviewBindReplace(ClientContext &context, TableFuncti
 			    internal_prefix + QM(ScenarioDelta::MatTableName(entry->scenario_id, logical_name)) + " m";
 		} else if (!entry->base_catalog.empty()) {
 			snapshot_ref =
-			    base_name + " AS m AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry->created_at) + "')";
+			    base_name + " AS m AT (TIMESTAMP => " + ScenarioDelta::PinLiteral(entry->created_at) + ")";
 		} else if (!pk_columns.empty() &&
 		           ScenarioDelta::TryGetPreTable(context, host, entry->scenario_id, logical_name)) {
 			// delta scenario: the pre-images of the base rows it touched (#53)
@@ -665,7 +665,7 @@ bool MergeIntoForeignBase(ClientContext &context, Catalog &host, const ScenarioR
 		auto delta_ref = internal_prefix + QM(delta_pair.first);
 		auto base_ref = QM(base_catalog->GetName()) + "." + QM(schema_name) + "." + QM(table_name);
 		auto snapshot_ref =
-		    base_ref + " AS m AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry.created_at) + "')";
+		    base_ref + " AS m AT (TIMESTAMP => " + ScenarioDelta::PinLiteral(entry.created_at) + ")";
 		auto pk_columns = ScenarioDelta::GetKeyColumns(context, host, entry.scenario_id, logical_name, *base_entry);
 
 		// payload column list, delta side

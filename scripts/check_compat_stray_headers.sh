@@ -41,8 +41,10 @@ stray=$(mktemp -d)
 tu=$(mktemp -d)
 trap 'rm -rf "$stray" "$tu"' EXIT
 
-# (a) Headers of DuckDB 2.0 that the bundled v1.5.6 lacks and that duckdb-compat
-#     or this extension once probed for, or that a compat header includes on 2.0.
+# (a) Headers of DuckDB 2.0 that a v1.5 tree lacks and that duckdb-compat or this
+#     extension once probed for, or that a compat header includes on 2.0. With the
+#     bundled DuckDB on 2.0 (the submodule pin) they all exist and none is planted;
+#     the check still compiles the headers the way a 2.0 build does.
 known="duckdb/common/types/size.hpp duckdb/planner/table_filter_set.hpp duckdb/common/identifier.hpp
 	duckdb/execution/operator/schema/physical_create_trigger.hpp"
 # (b) Every header the sources or the duckdb-compat submodule probe for.
@@ -61,13 +63,19 @@ for header in $(printf '%s\n' $known $probed | sort -u); do
 done
 
 if [ "$planted" -eq 0 ]; then
-	echo "warning: no stray headers planted; the check below tests nothing" >&2
+	echo "note: no stray headers planted (the bundled DuckDB has every listed and probed header); checking the plain compile only" >&2
 fi
 
 # The TU lives outside $stray: a quoted include searches the includer's directory first.
 for header in $headers; do
 	printf '#include "%s"\n' "$header" >>"$tu/tu.cpp"
 done
-"$cxx" -std=c++17 -fsyntax-only -I"$duckdb_include" -I"$compat_include" -I"$root/src/include" \
+# Same detection as CMakeLists.txt: DUCKDB_COMPAT_CREATE_TRIGGER exactly when the bundled
+# tree has 2.0's CREATE TRIGGER operator (create_trigger.hpp static_asserts on a mismatch).
+defs=()
+if [ -e "$duckdb_include/duckdb/execution/operator/schema/physical_create_trigger.hpp" ]; then
+	defs+=(-DDUCKDB_COMPAT_CREATE_TRIGGER)
+fi
+"$cxx" -std=c++17 -fsyntax-only "${defs[@]}" -I"$duckdb_include" -I"$compat_include" -I"$root/src/include" \
 	-isystem "$stray" "$tu/tu.cpp"
 echo "$headers compile with $planted stray header(s) on the include path"

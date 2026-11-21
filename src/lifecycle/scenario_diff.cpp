@@ -136,7 +136,7 @@ DiffTarget ResolveDiffTarget(ClientContext &context, const string &scenario_name
 	if (base_catalog) {
 		target.origin_name = Q(dc::Str(base_catalog->GetName())) + "." + Q(schema_name) + "." + Q(plain_name);
 		if (base_catalog->GetCatalogType() == "ducklake") {
-			origin_at = " AT (TIMESTAMP => TIMESTAMP '" + Timestamp::ToString(entry->created_at) + "')";
+			origin_at = " AT (TIMESTAMP => " + ScenarioDelta::PinLiteral(entry->created_at) + ")";
 		}
 	}
 

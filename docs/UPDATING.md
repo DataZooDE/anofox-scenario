@@ -5,11 +5,12 @@ releases. One source tree serves two DuckDB lines at the same time:
 
 | Line | DuckDB | extension-ci-tools | Where |
 |------|--------|--------------------|-------|
-| v1.5 (variegata) | `v1.5.6`, the `./duckdb` submodule pin | `v1.5-variegata` | local builds, `duckdb-v1_5_5-*` CI jobs, releases |
-| 2.0 (cyanoptera) | `v2.0.0` built from commit `d54cbbe3df17e8e5ce68312f483b4155836112aa` (no tag yet) | `v2.0-cyanoptera` | `duckdb-next-build` CI job, community-extensions `repo.ref` |
+| 2.0 (cyanoptera) | `v2.0.1` (`8d78114e90a53823803660bf821f6073ac87da8c`), the `./duckdb` submodule pin | `v2.0-cyanoptera` (also the `./extension-ci-tools` pin) | local builds, `duckdb-v2_0_1-*` CI jobs, `Next20Tests.yml` (macOS from source), DuckLake integration job, community-extensions `repo.ref` |
+| v1.5 (variegata) | `v1.5.6` | `v1.5-variegata` | `duckdb-v1_5_5-*` CI jobs, community-extensions `repo.variegata` |
 
-duckdb/community-extensions builds `repo.ref` against the 2.0 commit above (`duckdb_commit` in its
-`build.yml`) and `repo.variegata` against v1.5.6, so both have to build from the same commit.
+duckdb/community-extensions builds `repo.ref` against its `DUCKDB_LATEST_STABLE` (2.0 line) and
+`repo.variegata` against v1.5.6, so both have to build from the same commit. Both lines are
+smoke-tested and deployed by `MainDistributionPipeline.yml`, each under its own DuckDB version path.
 
 ## The compat-shim approach
 
@@ -45,13 +46,13 @@ Rules of thumb for the 2.0 port (details in `docs/spec/architecture.md`, *DuckDB
 
 ## Bumping a line
 
-1. **v1.5 patch release**: bump `./duckdb` to the tag and `./extension-ci-tools` to the matching
-   branch, and `duckdb_version` in the `duckdb-v1_5_5-*` jobs of
-   `.github/workflows/MainDistributionPipeline.yml`.
-2. **2.0 commit** (when community-extensions moves `DUCKDB_LATEST_STABLE`): set
-   `duckdb_version` of the `duckdb-next-build` job to the new SHA. The 2.0 line is built in a
-   scratch worktree whose `duckdb` is at that SHA and `extension-ci-tools` at the matching branch;
-   the submodule pin stays on v1.5.
+1. **2.0 patch release** (e.g. v2.0.1 -> v2.0.2): bump `./duckdb` to the tag and
+   `./extension-ci-tools` to the head of `v2.0-cyanoptera`, `duckdb_version` (and the job names) of
+   the `duckdb-v2_0_1-*` jobs in `.github/workflows/MainDistributionPipeline.yml`, and
+   `DUCKDB_COMMIT` in `.github/workflows/Next20Tests.yml`.
+2. **v1.5 patch release**: set `duckdb_version` in the `duckdb-v1_5_5-*` jobs. The v1.5 line is
+   built locally in a scratch worktree whose `duckdb` is at that tag and `extension-ci-tools` at
+   `v1.5-variegata`; the submodule pins stay on 2.0.
 3. Survey every compile error against the exact commit (`ninja -k 0`), map each one to an
    existing helper or add a new one (generic: duckdb-compat PR with probe cases for every line;
    scenario internals: `scenario_compat.hpp`).
@@ -61,8 +62,7 @@ Rules of thumb for the 2.0 port (details in `docs/spec/architecture.md`, *DuckDB
    the built file, `test/cpp` falls back to `LOAD '<build>/extension/anofox_scenario/...'`, and
    the shell needs `-unsigned` plus an explicit `LOAD '<path>'`.
 5. DuckLake tests (`DUCKLAKE_TESTS=1`) need published ducklake binaries for the build's DuckDB
-   version; there are none for a 2.0 pre-release, so DuckLake bases stay unverified on 2.0 until
-   there are.
+   version (core publishes them for tagged releases such as v2.0.1, not for pre-release commits).
 
 Where a DuckDB release legitimately changes a result, keep the test and make it accept both
 lines rather than dropping it. Current cases:
