@@ -39,7 +39,8 @@ on:
       deploy_script:
         required: false
         type: string
-        default: "./duckdb/scripts/extension-upload-single.sh"
+        # Pinned aws-cli uploader (see the script header): DuckDB 2.0.1's own copy needs rclone + AWS_ENDPOINT_URL
+        default: "./scripts/extension-upload-single.sh"
       matrix_parse_script:
         required: false
         type: string
