@@ -14,7 +14,8 @@ on:
         type: string
       # extension-ci-tools ref the build job used (its ci_tools_version). The deploy
       # matrix is parsed from that ref's distribution_matrix.json, so it lists exactly
-      # the archs the build produced. Empty: the ./extension-ci-tools submodule pin.
+      # the archs the build produced (the 2.0 line has no osx_amd64, the 1.5 line has).
+      # Empty: duckdb_version (a tools branch/tag of that name).
       ci_tools_version:
         required: false
         type: string
@@ -49,6 +50,8 @@ jobs:
     name: Generate matrix
     timeout-minutes: 15
     runs-on: ubuntu-latest
+    # PR runs deploy nothing: skip the matrix (and the deploy job) entirely
+    if: ${{ inputs.deploy_latest || inputs.deploy_versioned }}
     outputs:
       deploy_matrix: ${{ steps.parse-matrices.outputs.deploy_matrix }}
     steps:
@@ -62,11 +65,15 @@ jobs:
           cd duckdb
           git checkout ${{ inputs.duckdb_version }}
 
-      - name: Checkout extension-ci-tools to the build's version
-        if: ${{ inputs.ci_tools_version != '' }}
+      - name: Checkout extension-ci-tools to version
+        # The SAME tools ref the build job used (ci_tools_version, falling back to
+        # duckdb_version), so the parsed matrix lines up with what the build produced.
+        # Branch first, tag fallback.
         run: |
           cd extension-ci-tools
-          git fetch --depth 1 origin "${{ inputs.ci_tools_version }}"
+          REF="${{ inputs.ci_tools_version != '' && inputs.ci_tools_version || inputs.duckdb_version }}"
+          git fetch --depth 1 origin "$REF" || \
+            git fetch --depth 1 origin tag "$REF"
           git checkout FETCH_HEAD
 
       - id: parse-matrices
@@ -81,7 +88,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     needs: generate_matrix
-    if: ${{ needs.generate_matrix.outputs.deploy_matrix != '{}' && needs.generate_matrix.outputs.deploy_matrix != '' }}
+    if: ${{ needs.generate_matrix.outputs.deploy_matrix != '{}' && needs.generate_matrix.outputs.deploy_matrix != '' && (inputs.deploy_latest || inputs.deploy_versioned) }}
     strategy:
       matrix: ${{fromJson(needs.generate_matrix.outputs.deploy_matrix)}}
 
