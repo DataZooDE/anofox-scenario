@@ -9,13 +9,13 @@ description: >
   date, "the version from March", audit trail or compliance record. Not for exploring new
   variants (anofox-scenario-what-if) or applying changes to the real tables
   (anofox-scenario-safe-change).
-version: 2026.11.23
+version: 2026.11.24
 user-invocable: false
 ---
 
 # Anofox Scenario — Snapshot & Audit Playbook
 
-**Extension:** `anofox_scenario` v2026.11.23 | **DuckDB:** v1.5.5+ and v2.0.1
+**Extension:** `anofox_scenario` v2026.11.24 | **DuckDB:** v1.5.5+ and v2.0.1
 
 A snapshot is a scenario that does not move with the base (materialized, or pinned to a
 DuckLake snapshot) and is frozen so nobody writes to it. Errors and settings:

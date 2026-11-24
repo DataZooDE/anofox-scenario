@@ -11,13 +11,13 @@ description: >
   tables) cannot run inside a scenario because DDL is rejected; this skill says what to do
   instead. Not for comparing plan variants (anofox-scenario-what-if) or keeping approved,
   signed-off versions (anofox-scenario-snapshot-audit).
-version: 2026.11.23
+version: 2026.11.24
 user-invocable: false
 ---
 
 # Anofox Scenario — Safe Change Playbook (dry run, review, merge, undo)
 
-**Extension:** `anofox_scenario` v2026.11.23 | **DuckDB:** v1.5.5+ and v2.0.1
+**Extension:** `anofox_scenario` v2026.11.24 | **DuckDB:** v1.5.5+ and v2.0.1
 
 Run the change in a scenario, check it, read the diff, preview the merge, then apply it in
 one step, or drop the scenario and nothing happened. Errors, transactions and edge cases:
