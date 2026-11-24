@@ -11,13 +11,13 @@ description: >
   identity; which tables a scenario changed; using a scenario from Python; sharing one with
   a colleague. Not a workflow on its own: plan variants -> anofox-scenario-what-if, dry run
   and merge -> anofox-scenario-safe-change, approved versions -> anofox-scenario-snapshot-audit.
-version: 2026.11.23
+version: 2026.11.24
 user-invocable: false
 ---
 
 # Anofox Scenario — Reference & Troubleshooting
 
-**Extension:** `anofox_scenario` v2026.11.23 | **DuckDB:** v1.5.5+ and v2.0.1
+**Extension:** `anofox_scenario` v2026.11.24 | **DuckDB:** v1.5.5+ and v2.0.1
 
 Lookup table behind the workflow skills `anofox-scenario-what-if`,
 `anofox-scenario-safe-change` and `anofox-scenario-snapshot-audit`. Longer semantics, Python
