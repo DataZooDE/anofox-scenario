@@ -19,6 +19,7 @@
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/database_manager.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/parser/parsed_data/create_table_function_info.hpp"
@@ -163,6 +164,11 @@ void ScenarioMigrateExecute(ClientContext &context, TableFunctionInput &data, Da
 	}
 	state.done = true;
 	auto &host = Catalog::GetCatalog(context, DatabaseManager::GetDefaultDatabase(context));
+	// refused even with nothing to migrate, like every changing verb (#66)
+	if (host.GetAttached().IsReadOnly()) {
+		throw InvalidInputException("Cannot migrate scenarios: the host database '%s' is attached in read-only mode",
+		                            dc::Str(host.GetAttached().GetName()));
+	}
 
 	idx_t migrated_scenarios = 0;
 	idx_t migrated_snapshots = 0;

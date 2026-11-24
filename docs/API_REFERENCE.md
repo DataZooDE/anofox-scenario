@@ -119,6 +119,17 @@ CALL scenario_drop('optimistic');                    -- refuses while attached o
   frozen scenario fail at the start of execution, even when they would touch zero rows. Like
   core, these checks run at `EXECUTE`, not `PREPARE`: a write prepared in a read-only
   transaction (or while the scenario is frozen) runs once the executing transaction allows it.
+- **Read-only host:** when the host database is read-only - attached `READ_ONLY`, or the whole
+  instance opened read-only (`access_mode = READ_ONLY`) - every function that would change the
+  registry or a table (`scenario_create`, `scenario_drop`, `scenario_freeze`,
+  `scenario_unfreeze`, `scenario_merge`, `scenario_refresh`, `scenario_migrate`) fails up front
+  with the error a write through an attached scenario gets (`Cannot write to scenario '<name>':
+  its host database '<host>' is attached in read-only mode`; `scenario_migrate`: `Cannot migrate
+  scenarios: the host database '<host>' is attached in read-only mode`), even when it would
+  change nothing (#66). Reads keep working: `scenario_list`, `scenario_diff`, `scenario_diff_summary`,
+  `scenario_merge_preview` and `ATTACH ... (TYPE scenario)`. Attaching a scenario opens no
+  file: it looks the name up in the host's registry and reads the host (or the already attached
+  base catalog the scenario names), so `enable_external_access = false` stays effective.
 - **Reads under concurrency:** a transaction keeps reading its own snapshot of a scenario even
   after another connection commits changes to the same keys. A write from that older snapshot to
   a key someone else changed since fails with DuckDB's normal write-write conflict.

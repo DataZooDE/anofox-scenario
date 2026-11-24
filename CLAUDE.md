@@ -312,6 +312,7 @@ test/sql/
   scenario_delta_drift.test       # delta scenarios: pre-images, drift conflicts at merge/preview, branches, legacy (#53)
   scenario_merge_fk_order.test    # merge applies parents first; in-place updates of referenced rows (#54)
   scenario_base_schema_change.test # base ALTER/DROP TABLE of tables scenarios changed: ADD COLUMN reaches every scenario, other shape changes refused (#62)
+  scenario_readonly_host.test     # read-only host (READ_ONLY attach or read-only instance): changing scenario_* functions refused, reads work (#66)
 test/cpp/                         # Catch tests linked into unittest (see test/README.md)
   test_prepared_insert.cpp        # client-API prepared INSERT across transactions (#22)
   test_internal_guard.cpp         # internal-schema guard on client-API prepared statements; connections open before LOAD (#55)

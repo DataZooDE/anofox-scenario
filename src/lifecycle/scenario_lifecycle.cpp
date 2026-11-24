@@ -181,6 +181,8 @@ void LifecycleExecute(ClientContext &context, TableFunctionInput &data, DataChun
 		return;
 	}
 	auto &bind_data = data.bind_data->Cast<LifecycleBindData>();
+	// every verb (create/drop/freeze/unfreeze) changes the registry
+	ScenarioRegistry::ThrowIfHostReadOnly(GetHostCatalog(context), bind_data.name);
 	VERB(context, bind_data);
 	output.data[0].SetValue(0, Value::BOOLEAN(true));
 	output.SetChildCardinality(1);
@@ -513,6 +515,7 @@ void ScenarioRefreshExecute(ClientContext &context, TableFunctionInput &data, Da
 	state.done = true;
 	auto &bind_data = data.bind_data->Cast<LifecycleBindData>();
 	auto &host_catalog = GetHostCatalog(context);
+	ScenarioRegistry::ThrowIfHostReadOnly(host_catalog, bind_data.name);
 	auto entry = ScenarioRegistry::Lookup(context, host_catalog, bind_data.name);
 	if (!entry) {
 		throw InvalidInputException("Scenario '%s' not found", dc::Str(bind_data.name));

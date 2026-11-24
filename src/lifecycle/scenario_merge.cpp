@@ -916,6 +916,9 @@ void MergeExecute(ClientContext &context, TableFunctionInput &data, DataChunk &o
 	state.done = true;
 	auto &bind_data = data.bind_data->Cast<MergeBindData>();
 	auto &host = MergeHostCatalog(context);
+	// before anything else: a DuckLake base would otherwise be committed to
+	// before the host bookkeeping fails (#66)
+	ScenarioRegistry::ThrowIfHostReadOnly(host, bind_data.name);
 
 	auto entry = ScenarioRegistry::Lookup(context, host, bind_data.name);
 	if (!entry) {
