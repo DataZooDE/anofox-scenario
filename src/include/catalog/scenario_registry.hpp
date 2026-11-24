@@ -53,6 +53,13 @@ public:
 	//! Created lazily, like the registry, in the caller's transaction (#34)
 	static constexpr const char *TABLES_TABLE_NAME = "scenario_tables";
 
+	//! Scenario state lives in the host database: refuse a scenario function
+	//! that would change it while the host is read-only - attached READ_ONLY,
+	//! or the whole instance opened with access_mode = READ_ONLY (its default
+	//! database is then attached read-only too). The catalog API the verbs
+	//! write through does not check this itself (#66). Same message as a
+	//! write through an attached scenario.
+	static void ThrowIfHostReadOnly(Catalog &host_catalog, const string &scenario_name);
 	//! Create schema + sequence + registry table if they do not exist yet.
 	//! Runs in the caller's transaction.
 	static void EnsureExists(ClientContext &context, Catalog &host_catalog);

@@ -1,0 +1,248 @@
+# name: test/sql/scenario_readonly_host.test
+# description: scenario functions refuse to change a read-only host database - attached READ_ONLY or the whole instance opened read-only - while reads keep working (#66)
+# group: [anofox_scenario]
+
+require anofox_scenario
+
+# --- setup: a host database with a base table and scenarios in every state -------
+
+statement ok
+ATTACH '__TEST_DIR__/ro_host.db' AS base;
+
+statement ok
+USE base;
+
+statement ok
+CREATE TABLE plan (id INTEGER PRIMARY KEY, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO plan VALUES (1, 'EU', 100), (2, 'US', 200);
+
+# keyless: what scenario_refresh(key_columns := ...) would declare
+statement ok
+CREATE TABLE events (session_id INTEGER, url VARCHAR);
+
+statement ok
+CALL scenario_create('demand_up', 'raise demand');
+
+statement ok
+CALL scenario_create('approved');
+
+statement ok
+CALL scenario_freeze('approved');
+
+statement ok
+ATTACH 'demand_up' AS s (TYPE scenario);
+
+statement ok
+INSERT INTO s.plan VALUES (10, 'APAC', 500);
+
+statement ok
+UPDATE s.plan SET qty = 222 WHERE id = 2;
+
+statement ok
+DETACH s;
+
+statement ok
+USE memory;
+
+statement ok
+DETACH base;
+
+# --- host attached READ_ONLY ---------------------------------------------------
+
+statement ok
+ATTACH '__TEST_DIR__/ro_host.db' AS base (READ_ONLY);
+
+statement ok
+USE base;
+
+# the issue's setting: a locked-down, read-only serving instance
+statement ok
+SET enable_external_access = false;
+
+statement ok
+SET lock_configuration = true;
+
+statement error
+CALL scenario_create('evil');
+----
+Cannot write to scenario 'evil': its host database 'base' is attached in read-only mode
+
+statement error
+SELECT * FROM scenario_create('evil', 'with a description', mode := 'materialized');
+----
+Cannot write to scenario 'evil': its host database 'base' is attached in read-only mode
+
+statement error
+CALL scenario_create('branch', from_scenario := 'demand_up');
+----
+Cannot write to scenario 'branch': its host database 'base' is attached in read-only mode
+
+statement error
+CALL scenario_drop('demand_up');
+----
+Cannot write to scenario 'demand_up': its host database 'base' is attached in read-only mode
+
+statement error
+CALL scenario_freeze('demand_up');
+----
+Cannot write to scenario 'demand_up': its host database 'base' is attached in read-only mode
+
+statement error
+CALL scenario_unfreeze('approved');
+----
+Cannot write to scenario 'approved': its host database 'base' is attached in read-only mode
+
+statement error
+SELECT * FROM scenario_merge('demand_up', on_conflict := 'ours');
+----
+Cannot write to scenario 'demand_up': its host database 'base' is attached in read-only mode
+
+statement error
+CALL scenario_merge('demand_up');
+----
+Cannot write to scenario 'demand_up': its host database 'base' is attached in read-only mode
+
+statement error
+SELECT * FROM scenario_refresh('demand_up');
+----
+Cannot write to scenario 'demand_up': its host database 'base' is attached in read-only mode
+
+statement error
+SELECT * FROM scenario_refresh('demand_up', key_columns := MAP {'events': ['session_id']});
+----
+Cannot write to scenario 'demand_up': its host database 'base' is attached in read-only mode
+
+statement error
+CALL scenario_migrate();
+----
+Cannot migrate scenarios: the host database 'base' is attached in read-only mode
+
+# nothing changed within the session: base rows and registry as they were
+query ITI
+SELECT id, region, qty FROM base.main.plan ORDER BY id;
+----
+1	EU	100
+2	US	200
+
+query TTT
+SELECT name, frozen, merged_at IS NULL FROM scenario_list() ORDER BY name;
+----
+approved	true	true
+demand_up	false	true
+
+# reads keep working
+query ITTTT
+SELECT id, change_type, column_name, old_value, new_value
+FROM scenario_diff('demand_up', 'plan') ORDER BY change_type, id, column_name;
+----
+10	added	NULL	NULL	NULL
+2	modified	qty	200	222
+
+query TIII
+SELECT table_name, rows_added, rows_modified, rows_removed
+FROM scenario_diff_summary('demand_up') WHERE rows_added + rows_modified + rows_removed > 0;
+----
+plan	1	1	0
+
+query TTT
+SELECT table_name, key, action FROM scenario_merge_preview('demand_up') ORDER BY action, key;
+----
+plan	10	insert
+plan	2	update
+
+statement ok
+ATTACH 'demand_up' AS s (TYPE scenario);
+
+query ITI
+SELECT id, region, qty FROM s.plan ORDER BY id;
+----
+1	EU	100
+2	US	222
+10	APAC	500
+
+# and writes through the attached scenario are refused, as before
+statement error
+INSERT INTO s.plan VALUES (11, 'LATAM', 1);
+----
+Cannot write to scenario 'demand_up': its host database 'base' is attached in read-only mode
+
+# --- whole instance read-only (access_mode = READ_ONLY on open) ------------------------
+
+load __TEST_DIR__/ro_host.db readonly
+
+statement error
+CALL scenario_create('evil');
+----
+Cannot write to scenario 'evil': its host database 'ro_host' is attached in read-only mode
+
+statement error
+CALL scenario_drop('demand_up');
+----
+Cannot write to scenario 'demand_up': its host database 'ro_host' is attached in read-only mode
+
+statement error
+CALL scenario_freeze('demand_up');
+----
+Cannot write to scenario 'demand_up': its host database 'ro_host' is attached in read-only mode
+
+statement error
+CALL scenario_unfreeze('approved');
+----
+Cannot write to scenario 'approved': its host database 'ro_host' is attached in read-only mode
+
+statement error
+SELECT * FROM scenario_merge('demand_up', on_conflict := 'ours');
+----
+Cannot write to scenario 'demand_up': its host database 'ro_host' is attached in read-only mode
+
+statement error
+SELECT * FROM scenario_refresh('demand_up', key_columns := MAP {'events': ['session_id']});
+----
+Cannot write to scenario 'demand_up': its host database 'ro_host' is attached in read-only mode
+
+statement error
+CALL scenario_migrate();
+----
+Cannot migrate scenarios: the host database 'ro_host' is attached in read-only mode
+
+query ITI
+SELECT id, region, qty FROM plan ORDER BY id;
+----
+1	EU	100
+2	US	200
+
+query TTT
+SELECT name, frozen, merged_at IS NULL FROM scenario_list() ORDER BY name;
+----
+approved	true	true
+demand_up	false	true
+
+query TIII
+SELECT table_name, rows_added, rows_modified, rows_removed
+FROM scenario_diff_summary('demand_up') WHERE rows_added + rows_modified + rows_removed > 0;
+----
+plan	1	1	0
+
+query TTT
+SELECT table_name, key, action FROM scenario_merge_preview('demand_up') ORDER BY action, key;
+----
+plan	10	insert
+plan	2	update
+
+statement ok
+ATTACH 'demand_up' AS s (TYPE scenario);
+
+query ITI
+SELECT id, region, qty FROM s.plan ORDER BY id;
+----
+1	EU	100
+2	US	222
+10	APAC	500
+
+# a read-only instance attaches the scenario read-only too
+statement error
+UPDATE s.plan SET qty = 0 WHERE id = 1;
+----
+Cannot execute statement of type "UPDATE" on database "s" which is attached in read-only mode!

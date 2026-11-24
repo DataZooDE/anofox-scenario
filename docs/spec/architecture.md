@@ -320,6 +320,14 @@ initialized - before any row flows, so zero-row writes fail too, but at `EXECUTE
 at physical planning, which `PREPARE` performs: a write prepared in a read-only transaction
 stays executable later, as in core. `MarkHostWrite` repeats the read-only checks as a backstop.
 
+The scenario functions write the host through the catalog API, which, unlike the binder, does
+not refuse a read-only database (`MetaTransaction::ModifyDatabase` only checks the
+transaction). So every mutating verb (`scenario_create/drop/freeze/unfreeze/merge/refresh/
+migrate`) calls `ScenarioRegistry::ThrowIfHostReadOnly` first, before any lookup or work - a
+merge into a DuckLake base would otherwise commit on the lake before the host bookkeeping fails
+(#66). `AttachedDatabase::IsReadOnly` covers both a `READ_ONLY` attach and an instance opened
+with `access_mode = READ_ONLY` (its default database is attached read-only).
+
 Introspection reads the flag as well (`duckdb_tables().temporary`, and from it
 `information_schema.tables.table_type` / `commit_action` and `SHOW [ALL] TABLES`). So each
 transaction caches *two* entries per table in `ScenarioTransaction`: the binder's, from

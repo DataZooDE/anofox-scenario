@@ -54,7 +54,7 @@ Rarer errors (`key_columns`, DuckLake pins, creation options, policy typos): [be
 | `UNIQUE constraint on scenario table` / `NOT NULL constraint failed` / `CHECK constraint failed` | the merged row violates a base constraint | fix the values |
 | `modified the same row twice` | one statement updates a row through several source rows | deduplicate the source (`DISTINCT ON`, aggregate) |
 | `There are no UNIQUE/PRIMARY KEY constraints that refer to this table` | `ON CONFLICT` / `INSERT OR REPLACE` on a keyless table | `MERGE INTO`, or a PK on the base table |
-| `attached in read-only mode` / `transaction is launched in read-only mode` | write through `READ_ONLY` / in `BEGIN TRANSACTION READ ONLY` | re-`ATTACH` without `READ_ONLY` / read-write transaction |
+| `attached in read-only mode` / `transaction is launched in read-only mode` | write through `READ_ONLY` / in `BEGIN TRANSACTION READ ONLY`; a changing `scenario_*` function on a read-only host database | re-`ATTACH` without `READ_ONLY` / read-write transaction / open the host read-write |
 | `this transaction already modified database` | the transaction already wrote another attached database | commit first; host + its scenarios count as one database |
 | `Cannot change configuration option` | `SET` after `SET lock_configuration = true` | set options (telemetry opt-out) before locking |
 

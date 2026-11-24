@@ -439,6 +439,15 @@ bool ScenarioRegistry::Exists(ClientContext &context, Catalog &host_catalog) {
 	return GetRegistryTable(context, host_catalog) != nullptr;
 }
 
+void ScenarioRegistry::ThrowIfHostReadOnly(Catalog &host_catalog, const string &scenario_name) {
+	auto &host_db = host_catalog.GetAttached();
+	if (host_db.IsReadOnly()) {
+		throw InvalidInputException(
+		    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode", scenario_name,
+		    dc::Str(host_db.GetName()));
+	}
+}
+
 void ScenarioRegistry::EnsureExists(ClientContext &context, Catalog &host_catalog) {
 	if (Exists(context, host_catalog)) {
 		return;

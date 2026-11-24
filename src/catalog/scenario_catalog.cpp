@@ -349,12 +349,8 @@ void ScenarioCatalog::MarkHostWrite(ClientContext &context, DatabaseModification
 		throw InvalidInputException("Cannot write to scenario '%s': it is attached in read-only mode (as '%s')",
 		                            scenario_name, dc::Str(GetAttached().GetName()));
 	}
-	if (host_db.IsReadOnly()) {
-		// scenario writes physically land in the host database
-		throw InvalidInputException(
-		    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode", scenario_name,
-		    dc::Str(host_db.GetName()));
-	}
+	// scenario writes physically land in the host database
+	ScenarioRegistry::ThrowIfHostReadOnly(GetHostCatalog(context), scenario_name);
 	auto modified = meta.ModifiedDatabase();
 	if (modified && modified.get() != &host_db && modified.get() != &GetAttached()) {
 		// MetaTransaction would refuse this too, but naming only the host

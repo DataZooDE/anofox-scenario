@@ -470,12 +470,7 @@ void ScenarioCatalog::ThrowIfNotWritable(ClientContext &context, const char *ope
 		    "Cannot execute statement of type \"%s\" on database \"%s\" which is attached in read-only mode!",
 		    operation, dc::Str(GetAttached().GetName()));
 	}
-	auto &host_db = GetHostCatalog(context).GetAttached();
-	if (host_db.IsReadOnly()) {
-		throw InvalidInputException(
-		    "Cannot write to scenario '%s': its host database '%s' is attached in read-only mode", scenario_name,
-		    dc::Str(host_db.GetName()));
-	}
+	ScenarioRegistry::ThrowIfHostReadOnly(GetHostCatalog(context), scenario_name);
 	auto entry = ScenarioRegistry::LookupById(context, GetHostCatalog(context), scenario_id);
 	if (entry && entry->frozen) {
 		throw InvalidInputException(

@@ -72,7 +72,10 @@ SELECT * FROM ops.orders ORDER BY id;
 ## Read-only, frozen, concurrency
 
 Writes in a `READ ONLY` transaction, through a `READ_ONLY` attachment or to a frozen scenario
-fail when the statement executes, even if they would change zero rows. A transaction reads its
+fail when the statement executes, even if they would change zero rows. On a read-only host
+(attached `READ_ONLY`, or the instance opened read-only) the changing functions -
+`scenario_create/drop/freeze/unfreeze/merge/refresh/migrate` - fail the same way; `scenario_list`,
+the diffs, `scenario_merge_preview` and `ATTACH ... (TYPE scenario)` still work. A transaction reads its
 own snapshot of a scenario; two transactions changing the same keys get DuckDB's write-write
 conflict; two transactions making the *first* write to the same scenario table at once: the
 second gets a retryable `TransactionException`.
